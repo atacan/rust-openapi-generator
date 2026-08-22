@@ -5,13 +5,16 @@
 //! no syn/quote dependency, stable ordering everywhere, and never timestamps
 //! or file-system paths in output (main spec §50 tests 39–40).
 //!
-//! Phase 1 scope: shared schema models ([`models::generate_models`]). The
-//! client and server operation packages land later in Phase 1; their modules
-//! are declared now so the tree is stable for parallel work packages.
+//! Phase 1 scope: shared schema models ([`models::generate_models`]) plus the
+//! directional read/write view types enforcing companion §5 directionality at
+//! the type level ([`views::generate_views`]). The client and server
+//! operation packages land later in Phase 1; their modules are declared now
+//! so the tree is stable for parallel work packages.
 
 pub mod client;
 pub mod models;
 pub mod server;
+pub mod views;
 
 /// Indentation-aware line writer shared by the emitters: fixed four-space
 /// levels, append-only, fully determined by the call sequence.

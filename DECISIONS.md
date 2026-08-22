@@ -217,7 +217,12 @@ code never invents variants outside §36.
 ### D-impl-views-phase1 Directional views land in Phase 1
 Companion §5 is Decided and shapes generated public types, so read/write view generation ships
 with model codegen in Phase 1 rather than being retrofitted in Phase 2. Models without
-`readOnly`/`writeOnly` fields get no view types (identity).
+`readOnly`/`writeOnly` fields get no view types (identity). Addendum: §5 counts "has a default"
+as lossless for view→shared reconstruction; because Phase 1 models carry schema defaults as doc
+comments only (see D-impl-runtime-validation-timing), a declared default does not yet enable a
+reconstruction conversion — only genuinely optional fields do. This is strictly conservative:
+it can suppress a conversion, never fabricate a value; when defaults are materialized the
+conversions widen automatically.
 
 ### D-impl-async-trait Generated server traits use `async-trait`
 Spec examples annotate API traits with `#[async_trait::async_trait]`; dyn-dispatchable traits are

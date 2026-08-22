@@ -1,0 +1,105 @@
+# Fixture 08 — directional views (companion §5): readOnly/writeOnly markers
+# produce <Name>Write / <Name>Read view types while shared models keep every
+# field. Covers:
+#   (a) Account      — required writeOnly password + required directionless id
+#                      + optional directionless note (§5 Widget/password rule);
+#   (b) AuditEntry   — required readOnly createdAt + optional writeOnly
+#                      draftNote + optional nullable metadata;
+#   (c) SyncedRecord — mixes readOnly AND writeOnly (one direction lossless,
+#                      the other not);
+#   (d) PlainNote    — no markers at all: NO view types emitted (identity).
+openapi: 3.1.0
+info:
+  title: directional-views
+  version: "1"
+paths:
+  /accounts:
+    post:
+      operationId: createAccount
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Account'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+  /audit-entries:
+    get:
+      operationId: listAuditEntries
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEntry'
+  /synced-records:
+    post:
+      operationId: syncRecord
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SyncedRecord'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncedRecord'
+components:
+  schemas:
+    Account:
+      type: object
+      required: [id, password]
+      properties:
+        id:
+          type: string
+        password:
+          type: string
+          writeOnly: true
+        note:
+          type: string
+    AuditEntry:
+      type: object
+      required: [createdAt]
+      properties:
+        createdAt:
+          type: string
+          readOnly: true
+        draftNote:
+          type: string
+          writeOnly: true
+        metadata:
+          type: [string, 'null']
+    SyncedRecord:
+      type: object
+      required: [id, label]
+      properties:
+        id:
+          type: string
+          readOnly: true
+        label:
+          type: string
+        secretToken:
+          type: string
+          writeOnly: true
+        reviewedBy:
+          type: string
+          readOnly: true
+    PlainNote:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+        body:
+          type: string
