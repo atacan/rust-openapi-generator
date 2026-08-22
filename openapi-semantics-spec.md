@@ -182,6 +182,8 @@ Relative server URLs resolve deterministically against the URL of the document t
 
 **Proposed:** Schema constraints (patterns, min/max, format checks) attach to the IR as validation metadata. Defaults: server-side requests validate and reject via the main spec's `SchemaViolation` → `422` path; server responses trust application construction; client decoding is lenient by default with a strict mode behind configuration.
 
+**Decided:** Leniency applies **only to validation metadata** — pattern/min/max/format-style checks. Structural, type-shaping validation is always enforced in every mode and cannot be weakened by any configuration: `oneOf` exactly-one cardinality and exclusivity proofs (section 4.2), discriminator routing verdicts, and the presence/nullability matrix (section 2.1). A "lenient client mode" therefore never degrades composition correctness.
+
 ---
 
 ## 10. Naming
@@ -199,4 +201,6 @@ Relative server URLs resolve deterministically against the URL of the document t
 
 ## 11. Open question tracking
 
-All **Open** items above block Phase 1 completion, not Phase 0 start. They should be promoted to Decided/Proposed with rationale as implementation feedback arrives, mirroring the milestone structure of main spec section 52.
+All **Open** items that affect the IR or generated public types MUST be resolved by the end of Phase 0 and therefore block Phase 1 start — for example the JSON Schema keyword coverage matrix (section 2), free-form object representation (section 4.4), anchor refs (section 3), and framework-type naming collisions (section 10). Implementation-detail Open items may remain open until the relevant implementation phase.
+
+Open items should be promoted to Decided/Proposed with rationale as implementation feedback arrives, mirroring the milestone structure of main spec section 52.

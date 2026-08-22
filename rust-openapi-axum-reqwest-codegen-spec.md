@@ -2937,6 +2937,7 @@ These decisions shape generated public APIs, so they are locked before code gene
 - post-commit streaming failure contract and truncated-stream decode errors (section 40);
 - stream item-schema convention plus `x-rust-stream-item` override (section 18.1);
 - IR/normalization contract per the companion document: `$ref` resolution incl. external/cyclic refs, OpenAPI 3.0→3.1 normalization, composition keywords, discriminator handling, naming/keyword-collision rules;
+- companion Open items classified by its tracking rule (companion section 11): items affecting the IR or generated public types are resolved in this phase and block Phase 1 start; pure implementation details may follow;
 - deterministic-generation requirements (no timestamps, stable ordering) so golden tests are possible from day one.
 
 ### Phase 1 — core protocol shapes
