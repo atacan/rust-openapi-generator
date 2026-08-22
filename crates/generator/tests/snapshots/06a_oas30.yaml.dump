@@ -1,0 +1,83 @@
+openapi 3.0 (3.0.3)
+root-servers:
+  (none: operations default to `/`)
+schemas:
+  LegacyBytes -> type `LegacyBytes` (#2):
+    nullable=false
+    plain
+  LegacyEnvelope -> type `LegacyEnvelope` (#4):
+    nullable=false
+    plain
+  LegacyFileType -> type `LegacyFileType` (#3):
+    nullable=false
+    plain
+  NullableString -> type `NullableString` (#0):
+    nullable=true
+    plain
+  PositiveInt -> type `PositiveInt` (#1):
+    nullable=false
+    plain
+      validation: exclusive-minimum=5.0
+operations:
+  get /legacy:
+    method-name: get_legacy
+    response-enum: GetLegacyResponse
+    operation-id: getLegacy
+    effective-servers:
+      - url `/`
+    parameters:
+      (none)
+    request-body: (absent)
+    responses:
+      - status 200
+        content:
+          - `application/json` class=json schema=#9
+arena:
+  #0 string
+    resolved:
+      nullable=true
+      plain
+  #1 integer
+    resolved:
+      nullable=false
+      plain
+        validation: exclusive-minimum=5.0
+  #2 string BINARY
+    resolved:
+      nullable=false
+      plain
+  #3 string BINARY
+    resolved:
+      nullable=false
+      plain
+  #4 object props=4 additional=ignore
+    property `name` required=true -> #5
+    property `note` required=false -> #6
+    property `payload` required=false -> #7
+    property `count` required=false -> #8
+    resolved:
+      nullable=false
+      plain
+  #5 string
+    resolved:
+      nullable=false
+      plain
+  #6 string
+    resolved:
+      nullable=true
+      plain
+  #7 string:binary BINARY
+    resolved:
+      nullable=false
+      plain
+  #8 integer
+    resolved:
+      nullable=false
+      plain
+        validation: exclusive-minimum=1.0
+  #9 ref->#4
+    resolved:
+      nullable=false
+      alias -> #4
+diagnostics:
+  (none)

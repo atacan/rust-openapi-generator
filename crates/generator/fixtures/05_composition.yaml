@@ -1,0 +1,115 @@
+# Fixture 05 — composition resolution (companion §4):
+# - FullWidget: allOf of two objects → field-wise merge, required unions
+#   (companion §4.1).
+# - Slug: allOf of compatible scalars → one validated string carrying BOTH
+#   minLength and pattern (main spec §50 test 51).
+# - Pet: oneOf proven exclusive via contradictory const tags AND an explicit
+#   discriminator mapping with disjoint constants; native_serde_candidate
+#   must be computed honestly as true.
+# - Payment: anyOf of two object branches whose exclusivity cannot be
+#   proven → RawValueFallback with a Warning (MUST NOT be a choose-one
+#   enum, companion §4.2).
+# - TreeNode: recursion through properties → Boxed edges (companion §3).
+openapi: 3.1.0
+info:
+  title: composition shapes
+  version: "1"
+paths:
+  /pets:
+    post:
+      operationId: createPet
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Pet'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FullWidget'
+components:
+  schemas:
+    BaseWidget:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+    Timestamps:
+      type: object
+      required: [createdAt]
+      properties:
+        name:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+    FullWidget:
+      allOf:
+        - $ref: '#/components/schemas/BaseWidget'
+        - $ref: '#/components/schemas/Timestamps'
+    Slug:
+      allOf:
+        - type: string
+          minLength: 3
+        - type: string
+          pattern: '^[a-z]+$'
+    Dog:
+      type: object
+      required: [kind, bark]
+      properties:
+        kind:
+          type: string
+          enum: [dog]
+        bark:
+          type: boolean
+    Cat:
+      type: object
+      required: [kind, meow]
+      properties:
+        kind:
+          type: string
+          enum: [cat]
+        meow:
+          type: integer
+    Pet:
+      oneOf:
+        - $ref: '#/components/schemas/Dog'
+        - $ref: '#/components/schemas/Cat'
+      discriminator:
+        propertyName: kind
+        mapping:
+          dog: '#/components/schemas/Dog'
+          cat: '#/components/schemas/Cat'
+    Card:
+      type: object
+      required: [cardNumber]
+      properties:
+        cardNumber:
+          type: string
+    Cash:
+      type: object
+      required: [amount]
+      properties:
+        amount:
+          type: integer
+    Payment:
+      anyOf:
+        - $ref: '#/components/schemas/Card'
+        - $ref: '#/components/schemas/Cash'
+    TreeNode:
+      type: object
+      required: [value]
+      properties:
+        value:
+          type: string
+        left:
+          $ref: '#/components/schemas/TreeNode'
+        right:
+          $ref: '#/components/schemas/TreeNode'

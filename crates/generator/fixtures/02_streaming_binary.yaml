@@ -1,0 +1,75 @@
+# Fixture 02 — Examples 2+3 (main spec §9, §10): streaming binary upload and
+# download with typed response headers. Exercises companion §8 server
+# precedence: the root-level servers apply to putObject while getObject
+# overrides them at operation level.
+openapi: 3.1.0
+info:
+  title: object storage
+  version: "1"
+servers:
+  - url: https://{region}.api.example.com/v1
+    variables:
+      region:
+        default: us-east
+        enum: [us-east, eu-west]
+paths:
+  /objects/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    put:
+      operationId: putObject
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '201':
+          description: Stored
+        '400':
+          description: Invalid object
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+    get:
+      operationId: getObject
+      servers:
+        - url: /storage
+      responses:
+        '200':
+          description: Object bytes
+          headers:
+            ETag:
+              description: entity tag of the stored bytes
+              schema:
+                type: string
+            Content-Length:
+              schema:
+                type: integer
+                format: int64
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: Missing
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+components:
+  schemas:
+    ProblemDetails:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string

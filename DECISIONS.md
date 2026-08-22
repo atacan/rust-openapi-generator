@@ -174,3 +174,33 @@ Default installation is the silent no-op; client/server builders accept custom h
 Companion §4.2 offers raw/value representation or generation error as configuration alternatives.
 Default = **raw/value representation carrying validation metadata** (generation succeeds, verdicts
 stay exact). Configuration may switch to hard error.
+
+### D-impl-servers-empty Empty `servers` arrays at operation/path level
+Companion §8 defines the absent-or-empty rule explicitly only for the root-level array. Decision:
+a present-but-empty `servers: []` at operation or path level also falls through to the next level
+(op empty → path array → root array → `/`). Rationale: mirrors the root-level precedent; an empty
+override that disables all bases has no coherent meaning for client generation.
+
+### D-impl-allof-additional Schema-valued `additionalProperties` across `allOf` members
+Companion §4.1 requires lossless intersection or fallback/error. Intersecting two distinct
+schema-valued `additionalProperties` maps is not representable losslessly in the v1 typed model,
+so mixed/conflicting schema-valued `additionalProperties` across `allOf` members falls back to
+the raw/value representation with a Warning diagnostic (same default philosophy as
+D-impl-oneoffallback). Property-level constraint conflicts remain generation Errors exactly as
+§4.1 states.
+
+### D-impl-boxing Property-edge heap indirection is cycle-precise
+Companion §3: "Recursion through properties generates heap-indirected types (`Box<T>`)". Decision:
+`Indirection::Boxed` is recorded **only** on property edges whose target can reach back to the
+source through property/composition-only paths (i.e., edges that close a property-recursion
+cycle, computed by an SCC pass after loading); acyclic property edges stay direct, and container
+edges are always direct. Boxing every property edge would satisfy the letter of the recursion
+rule but pollutes every generated struct; precision here keeps generated public types faithful.
+
+### D-impl-msrv-pins MSRV 1.85 transitive dependency pins
+The MSRV job against the pinned §3.1 tuple surfaced that current `url` → `idna` → `idna_adapter`
+1.2.1 resolves `icu_*` 2.x, which requires rustc 1.88 — above the pinned MSRV 1.85. Decision: the
+workspace lockfile pins `url = 2.5.4`, `idna = 1.0.3`, `idna_adapter = 1.2.0` (icu 1.x family) so
+the pinned tuple builds cleanly; when Phase 1 emits generated-crate manifests, the generator ships
+a documented transitive-pin table (or equivalent guidance) so MSRV consumers resolve compatible
+versions deterministically rather than discovering breakage at lock time.

@@ -205,13 +205,140 @@ fn shared_component_refs_share_one_arena_id() {
         panic!("additionalProperties must carry a schema edge");
     };
     // Every edge — two properties plus additionalProperties — resolves to the
-    // single memoized arena id interned for `Thing`.
+    // single memoized arena id interned for `Thing`. The property edges are
+    // acyclic, so they stay direct after the cycle-precise pass
+    // (companion §3, D-impl-boxing).
     assert_eq!(resolved_target(&doc, extra_edge), thing_id);
     for prop in properties {
         assert_eq!(resolved_target(&doc, &prop.schema), thing_id);
-        assert_eq!(prop.schema.indirection, Indirection::Boxed);
+        assert_eq!(prop.schema.indirection, Indirection::None);
     }
     assert_eq!(widget.diagnostics, Vec::new());
+}
+
+/// D-impl-boxing: within one object, an edge closing a property-recursion
+/// cycle stays `Boxed` while its acyclic sibling property is direct.
+#[test]
+fn boxing_is_cycle_precise_recursive_boxed_acyclic_direct() {
+    let dir = TempDir::new("cycle-precise");
+    dir.write(
+        "root.yaml",
+        &doc_yaml(
+            "3.1.0",
+            r#"components:
+  schemas:
+    ListNode:
+      type: object
+      properties:
+        value:
+          type: string
+        next:
+          $ref: '#/components/schemas/ListNode'
+        label:
+          $ref: '#/components/schemas/Label'
+    Label:
+      type: string
+"#,
+        ),
+    );
+    let doc = load(dir.path(), "root.yaml").expect("loads");
+    let SchemaKind::Object { properties, .. } = &node(&doc, "ListNode").kind else {
+        panic!("ListNode must be an object");
+    };
+    let indirection_of = |name: &str| {
+        properties
+            .iter()
+            .find(|p| p.wire_name == name)
+            .unwrap_or_else(|| panic!("property `{name}`"))
+            .schema
+            .indirection
+    };
+    assert_eq!(
+        indirection_of("next"),
+        Indirection::Boxed,
+        "`next` closes the self-recursion cycle"
+    );
+    assert_eq!(
+        indirection_of("value"),
+        Indirection::None,
+        "acyclic scalar property stays direct"
+    );
+    assert_eq!(
+        indirection_of("label"),
+        Indirection::None,
+        "acyclic ref-property stays direct"
+    );
+}
+
+/// D-impl-boxing: a two-node property cycle boxes both participating edges
+/// while unrelated objects stay direct.
+#[test]
+fn two_node_property_cycle_boxes_both_participants() {
+    let dir = TempDir::new("cycle-pair");
+    dir.write(
+        "root.yaml",
+        &doc_yaml(
+            "3.1.0",
+            r#"components:
+  schemas:
+    Left:
+      type: object
+      properties:
+        right:
+          $ref: '#/components/schemas/Right'
+        name:
+          type: string
+    Right:
+      type: object
+      properties:
+        left:
+          $ref: '#/components/schemas/Left'
+    Standalone:
+      type: object
+      properties:
+        other:
+          $ref: '#/components/schemas/Standalone2'
+    Standalone2:
+      type: string
+"#,
+        ),
+    );
+    let doc = load(dir.path(), "root.yaml").expect("loads");
+    let SchemaKind::Object {
+        properties: left, ..
+    } = &node(&doc, "Left").kind
+    else {
+        panic!("Left must be an object");
+    };
+    let indirection_of = |properties: &[openapi_to_rust_generator::ir::schema::PropertyIr],
+                          name: &str| {
+        properties
+            .iter()
+            .find(|p| p.wire_name == name)
+            .unwrap_or_else(|| panic!("property `{name}`"))
+            .schema
+            .indirection
+    };
+    assert_eq!(indirection_of(left, "right"), Indirection::Boxed);
+    assert_eq!(indirection_of(left, "name"), Indirection::None);
+
+    let SchemaKind::Object {
+        properties: right, ..
+    } = &node(&doc, "Right").kind
+    else {
+        panic!("Right must be an object");
+    };
+    assert_eq!(indirection_of(right, "left"), Indirection::Boxed);
+
+    // Acyclic chain across components stays direct.
+    let SchemaKind::Object {
+        properties: standalone,
+        ..
+    } = &node(&doc, "Standalone").kind
+    else {
+        panic!("Standalone must be an object");
+    };
+    assert_eq!(indirection_of(standalone, "other"), Indirection::None);
 }
 
 // ----------------------------------------------------------------------

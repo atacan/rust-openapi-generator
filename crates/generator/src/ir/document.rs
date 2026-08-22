@@ -122,6 +122,9 @@ impl HttpMethod {
 pub struct OperationIr {
     /// Raw `operationId` before any naming pipeline runs (companion §10).
     pub operation_id: Option<String>,
+    /// Raw `tags`; sanitized to module names by the naming pipeline
+    /// (companion §10).
+    pub tags: Vec<String>,
     /// Operation-level parameters only; path-level ones live on
     /// [`PathEntry::parameters`] and are merged during normalization.
     pub parameters: Vec<ParameterIr>,

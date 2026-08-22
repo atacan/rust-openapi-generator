@@ -1,0 +1,80 @@
+openapi 3.1 (3.1.0)
+root-servers:
+  (none: operations default to `/`)
+schemas:
+  Coordinate -> type `Coordinate` (#3):
+    nullable=false
+    plain
+  MixedTypes31 -> type `MixedTypes31` (#2):
+    nullable=false
+    plain
+  ModernEnvelope -> type `ModernEnvelope` (#6):
+    nullable=false
+    plain
+  NullableInt31 -> type `NullableInt31` (#1):
+    nullable=true
+    plain
+  NullableString31 -> type `NullableString31` (#0):
+    nullable=true
+    plain
+operations:
+  get /modern:
+    method-name: get_modern
+    response-enum: GetModernResponse
+    operation-id: getModern
+    effective-servers:
+      - url `/`
+    parameters:
+      (none)
+    request-body: (absent)
+    responses:
+      - status 200
+        content:
+          - `application/json` class=json schema=#9
+arena:
+  #0 string
+    resolved:
+      nullable=true
+      plain
+  #1 integer
+    resolved:
+      nullable=true
+      plain
+  #2 not-supported(mixed-type-array)
+    resolved:
+      nullable=false
+      plain
+  #3 tuple prefix=[#4,#5]
+    prefix[0] -> #4
+    prefix[1] -> #5
+    resolved:
+      nullable=false
+      plain
+  #4 string
+    resolved:
+      nullable=false
+      plain
+  #5 integer
+    resolved:
+      nullable=false
+      plain
+  #6 object props=2 additional=ignore
+    property `label` required=true -> #7
+    property `position` required=false -> #8
+    resolved:
+      nullable=false
+      plain
+  #7 ref->#0
+    resolved:
+      nullable=true
+      alias -> #0
+  #8 ref->#3
+    resolved:
+      nullable=false
+      alias -> #3
+  #9 ref->#6
+    resolved:
+      nullable=false
+      alias -> #6
+diagnostics:
+  (none)

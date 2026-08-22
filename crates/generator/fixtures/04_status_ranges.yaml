@@ -1,0 +1,62 @@
+# Fixture 04 — Examples 16+17 (main spec §23, §24): explicit status beats
+# ranges (`200` vs `2XX`), plus a `default` response. Declaration order is
+# preserved through the IR into normalization.
+openapi: 3.1.0
+info:
+  title: status shapes
+  version: "1"
+paths:
+  /widgets/{id}:
+    get:
+      operationId: getWidget
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Normal result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Widget'
+        '2XX':
+          description: Other successful result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        default:
+          description: Undocumented API error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+components:
+  schemas:
+    Widget:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+    SuccessEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+    ProblemDetails:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string

@@ -1,0 +1,52 @@
+# Fixture 03 — Example 4 (main spec §11): one status with JSON OR binary
+# body (nested content enum) plus a problem+json 404.
+openapi: 3.1.0
+info:
+  title: artifacts
+  version: "1"
+paths:
+  /artifacts/{id}:
+    get:
+      operationId: getArtifact
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Artifact representation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtifactMetadata'
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: Missing artifact
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+components:
+  schemas:
+    ArtifactMetadata:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        size:
+          type: integer
+          format: int64
+    ProblemDetails:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string

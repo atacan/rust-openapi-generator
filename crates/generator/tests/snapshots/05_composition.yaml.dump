@@ -1,0 +1,217 @@
+openapi 3.1 (3.1.0)
+root-servers:
+  (none: operations default to `/`)
+schemas:
+  BaseWidget -> type `BaseWidget` (#0):
+    nullable=false
+    plain
+  Card -> type `Card` (#21):
+    nullable=false
+    plain
+  Cash -> type `Cash` (#23):
+    nullable=false
+    plain
+  Cat -> type `Cat` (#15):
+    nullable=false
+    plain
+  Dog -> type `Dog` (#12):
+    nullable=false
+    plain
+  FullWidget -> type `FullWidget` (#6):
+    nullable=false
+    merged-object additional=ignore
+      property `id` required=true -> #1
+      property `name` required=false -> #2
+      property `createdAt` required=true -> #5
+  Payment -> type `Payment` (#25):
+    nullable=false
+    raw-value-fallback reason=unproven-any-of native-serde-candidate=false
+  Pet -> type `Pet` (#18):
+    nullable=false
+    discriminator (explicit) property=`kind` mapping=[dog=>Dog, cat=>Cat]
+    closed-enum branches=[#19, #20] native-serde-candidate=true
+  Slug -> type `Slug` (#9):
+    nullable=false
+    intersected-scalar base=string
+      validation: pattern=/^[a-z]+$/ min-length=3
+  Timestamps -> type `Timestamps` (#3):
+    nullable=false
+    plain
+  TreeNode -> type `TreeNode` (#28):
+    nullable=false
+    plain
+operations:
+  post /pets:
+    method-name: create_pet
+    response-enum: CreatePetResponse
+    operation-id: createPet
+    effective-servers:
+      - url `/`
+    parameters:
+      (none)
+    request-body: required=true
+      content:
+        - `application/json` class=json schema=#32
+    responses:
+      - status 201
+        content:
+          - `application/json` class=json schema=#33
+arena:
+  #0 object props=2 additional=ignore
+    property `id` required=true -> #1
+    property `name` required=false -> #2
+    resolved:
+      nullable=false
+      plain
+  #1 string
+    resolved:
+      nullable=false
+      plain
+  #2 string
+    resolved:
+      nullable=false
+      plain
+  #3 object props=2 additional=ignore
+    property `name` required=false -> #4
+    property `createdAt` required=true -> #5
+    resolved:
+      nullable=false
+      plain
+  #4 string
+    resolved:
+      nullable=false
+      plain
+  #5 string:date-time
+    resolved:
+      nullable=false
+      plain
+  #6 all-of members=#7,#8
+    resolved:
+      nullable=false
+      merged-object additional=ignore
+        property `id` required=true -> #1
+        property `name` required=false -> #2
+        property `createdAt` required=true -> #5
+  #7 ref->#0
+    resolved:
+      nullable=false
+      alias -> #0
+  #8 ref->#3
+    resolved:
+      nullable=false
+      alias -> #3
+  #9 all-of members=#10,#11
+    resolved:
+      nullable=false
+      intersected-scalar base=string
+        validation: pattern=/^[a-z]+$/ min-length=3
+  #10 string
+    resolved:
+      nullable=false
+      plain
+        validation: min-length=3
+  #11 string
+    resolved:
+      nullable=false
+      plain
+        validation: pattern=/^[a-z]+$/
+  #12 object props=2 additional=ignore
+    property `kind` required=true -> #13
+    property `bark` required=true -> #14
+    resolved:
+      nullable=false
+      plain
+  #13 enum strings=[dog]
+    resolved:
+      nullable=false
+      plain
+  #14 boolean
+    resolved:
+      nullable=false
+      plain
+  #15 object props=2 additional=ignore
+    property `kind` required=true -> #16
+    property `meow` required=true -> #17
+    resolved:
+      nullable=false
+      plain
+  #16 enum strings=[cat]
+    resolved:
+      nullable=false
+      plain
+  #17 integer
+    resolved:
+      nullable=false
+      plain
+  #18 one-of members=#19,#20
+    resolved:
+      nullable=false
+      discriminator (explicit) property=`kind` mapping=[dog=>Dog, cat=>Cat]
+      closed-enum branches=[#19, #20] native-serde-candidate=true
+  #19 ref->#12
+    resolved:
+      nullable=false
+      alias -> #12
+  #20 ref->#15
+    resolved:
+      nullable=false
+      alias -> #15
+  #21 object props=1 additional=ignore
+    property `cardNumber` required=true -> #22
+    resolved:
+      nullable=false
+      plain
+  #22 string
+    resolved:
+      nullable=false
+      plain
+  #23 object props=1 additional=ignore
+    property `amount` required=true -> #24
+    resolved:
+      nullable=false
+      plain
+  #24 integer
+    resolved:
+      nullable=false
+      plain
+  #25 any-of members=#26,#27
+    resolved:
+      nullable=false
+      raw-value-fallback reason=unproven-any-of native-serde-candidate=false
+  #26 ref->#21
+    resolved:
+      nullable=false
+      alias -> #21
+  #27 ref->#23
+    resolved:
+      nullable=false
+      alias -> #23
+  #28 object props=3 additional=ignore
+    property `value` required=true -> #29
+    property `left` required=false -> #30 (boxed)
+    property `right` required=false -> #31 (boxed)
+    resolved:
+      nullable=false
+      plain
+  #29 string
+    resolved:
+      nullable=false
+      plain
+  #30 ref->#28
+    resolved:
+      nullable=false
+      alias -> #28
+  #31 ref->#28
+    resolved:
+      nullable=false
+      alias -> #28
+  #32 ref->#18
+    resolved:
+      nullable=false
+      alias -> #18
+  #33 ref->#6
+    resolved:
+      nullable=false
+      alias -> #6
+diagnostics:
+  - warning at #/components/schemas/Payment [anyof_unprovable]: mutual exclusivity of anyOf branches at #/components/schemas/Payment cannot be proven statically; falling back to raw/value carrying validation metadata (companion §4.2, D-impl-oneoffallback)

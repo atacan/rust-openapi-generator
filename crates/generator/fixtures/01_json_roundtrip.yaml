@@ -1,0 +1,58 @@
+# Fixture 01 — Example 1 shape (main spec §8): JSON request/response plus a
+# problem+json error response. No servers anywhere: every operation's
+# effective servers must default to `/` (companion §8 rule 3).
+openapi: 3.1.0
+info:
+  title: widgets
+  version: "1"
+paths:
+  /widgets:
+    post:
+      operationId: createWidget
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWidget'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Widget'
+        '400':
+          description: Invalid request
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+components:
+  schemas:
+    CreateWidget:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+    Widget:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+    ProblemDetails:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+        detail:
+          type: string

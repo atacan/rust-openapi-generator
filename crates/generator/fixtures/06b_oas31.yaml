@@ -1,0 +1,38 @@
+# Fixture 06b — OAS 3.1 JSON Schema forms (companion §2): type arrays
+# containing `"null"` and `prefixItems` tuples.
+openapi: 3.1.0
+info:
+  title: modern forms
+  version: "1"
+paths:
+  /modern:
+    get:
+      operationId: getModern
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModernEnvelope'
+components:
+  schemas:
+    NullableString31:
+      type: [string, "null"]
+    NullableInt31:
+      type: [integer, "null"]
+    MixedTypes31:
+      type: [string, integer]
+    Coordinate:
+      type: array
+      prefixItems:
+        - type: string
+        - type: integer
+    ModernEnvelope:
+      type: object
+      required: [label]
+      properties:
+        label:
+          $ref: '#/components/schemas/NullableString31'
+        position:
+          $ref: '#/components/schemas/Coordinate'

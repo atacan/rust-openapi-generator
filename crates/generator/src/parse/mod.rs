@@ -16,9 +16,12 @@
 //!    keywords are preserved as conjunction terms (`Ref.inline_constraints`)
 //!    for the normalization package.
 //!
-//! Cycle policy (companion §3): recursion through properties produces
-//! `Indirection::Boxed` edges, arrays/maps leave edges direct, and a cycle
-//! reached with no container break is an `UnbrokenSelfContainment` error.
+//! Cycle policy (companion §3, DECISIONS.md D-impl-boxing): recursion
+//! through properties produces `Indirection::Boxed` edges — refined after
+//! loading by an SCC pass so ONLY edges closing a property-recursion cycle
+//! stay boxed (acyclic property edges are direct) — arrays/maps leave edges
+//! direct, and a cycle reached with no container break is an
+//! `UnbrokenSelfContainment` error.
 
 mod raw;
 mod refs;
@@ -125,16 +128,175 @@ pub fn load_document(
 ) -> Result<IrDocument, Vec<Diagnostic>> {
     let mut loader = Loader::new(config.clone());
     match loader.open_root(root_yaml, root_dir) {
-        Ok(()) => loader.run(),
+        Ok(()) => {
+            let mut document = loader.run()?;
+            apply_cycle_precise_indirection(&mut document.arena);
+            Ok(document)
+        }
         Err(()) => Err(loader.diags.into_vec()),
     }
+}
+
+/// Cycle-precise heap indirection (companion §3; DECISIONS.md
+/// D-impl-boxing): recomputes every property edge's [`Indirection`] after
+/// loading completes.
+///
+/// Strongly-connected components are computed over the restricted edge set
+/// of property, composition, and `$ref` edges ONLY — array/tuple items,
+/// schema-valued `additionalProperties`, `patternProperties`, and `contains`
+/// are container positions that break recursion without boxing. A property
+/// edge carries [`Indirection::Boxed`] exactly when its source and target
+/// share an SCC (the edge closes a property-recursion cycle); every other
+/// edge ends up [`Indirection::None`]. All external-file schemas are interned
+/// into this single global arena, so one pass covers the whole document set.
+fn apply_cycle_precise_indirection(arena: &mut SchemaArena) {
+    let adjacency = recursion_adjacency(arena);
+    let components = tarjan_components(&adjacency);
+    for index in 0..arena.len() {
+        let id = SchemaId(index as u32);
+        let mut node = arena.get(id).clone();
+        if rewrite_property_indirection(&mut node.kind, components[index], &components) {
+            arena.complete(id, node);
+        }
+    }
+}
+
+/// Adjacency over the restricted (recursion-relevant) edge set: object
+/// properties plus composition/`$ref` targets. Container edges
+/// (`items`, `prefixItems`, schema-valued `additionalProperties`,
+/// `patternProperties`, `contains`) are excluded — they break cycles and are
+/// never boxed (companion §3).
+fn recursion_adjacency(arena: &SchemaArena) -> Vec<Vec<u32>> {
+    let mut adjacency: Vec<Vec<u32>> = vec![Vec::new(); arena.len()];
+    for (id, node) in arena.iter() {
+        let neighbors = &mut adjacency[id.0 as usize];
+        match &node.kind {
+            SchemaKind::Object { properties, .. } => {
+                for property in properties {
+                    neighbors.push(property.schema.target.0);
+                }
+            }
+            SchemaKind::Ref {
+                target,
+                inline_constraints,
+                ..
+            } => {
+                neighbors.push(target.0);
+                for constraint in inline_constraints {
+                    neighbors.push(constraint.target.0);
+                }
+            }
+            SchemaKind::AllOf { members, .. }
+            | SchemaKind::OneOf { members, .. }
+            | SchemaKind::AnyOf { members, .. } => {
+                for member in members {
+                    neighbors.push(member.target.0);
+                }
+            }
+            _ => {}
+        }
+    }
+    adjacency
+}
+
+/// Iterative Tarjan strongly-connected components (no recursion blowups);
+/// roots are visited in ascending arena-id order and neighbors in stored
+/// order so the numbering is deterministic. Only component equality matters
+/// downstream.
+fn tarjan_components(adjacency: &[Vec<u32>]) -> Vec<usize> {
+    let count = adjacency.len();
+    let mut discovered = vec![u32::MAX; count];
+    let mut lowlink = vec![0_u32; count];
+    let mut on_stack = vec![false; count];
+    let mut components = vec![usize::MAX; count];
+    let mut stack: Vec<u32> = Vec::new();
+    let mut frames: Vec<(u32, usize)> = Vec::new();
+    let mut next_index = 0_u32;
+    let mut next_component = 0_usize;
+
+    for root in 0..count {
+        if discovered[root] != u32::MAX {
+            continue;
+        }
+        discovered[root] = next_index;
+        lowlink[root] = next_index;
+        next_index += 1;
+        stack.push(root as u32);
+        on_stack[root] = true;
+        frames.push((root as u32, 0));
+        while let Some(frame) = frames.last() {
+            let node = frame.0 as usize;
+            let position = frame.1;
+            if position < adjacency[node].len() {
+                frames.last_mut().expect("frame checked above").1 += 1;
+                let successor = adjacency[node][position] as usize;
+                if discovered[successor] == u32::MAX {
+                    discovered[successor] = next_index;
+                    lowlink[successor] = next_index;
+                    next_index += 1;
+                    stack.push(successor as u32);
+                    on_stack[successor] = true;
+                    frames.push((successor as u32, 0));
+                } else if on_stack[successor] {
+                    lowlink[node] = lowlink[node].min(discovered[successor]);
+                }
+            } else {
+                frames.pop();
+                if let Some(&(parent, _)) = frames.last() {
+                    let parent = parent as usize;
+                    lowlink[parent] = lowlink[parent].min(lowlink[node]);
+                }
+                if lowlink[node] == discovered[node] {
+                    while let Some(top) = stack.pop() {
+                        on_stack[top as usize] = false;
+                        components[top as usize] = next_component;
+                        if top as usize == node {
+                            break;
+                        }
+                    }
+                    next_component += 1;
+                }
+            }
+        }
+    }
+    components
+}
+
+/// Rewrites one node's edge indirection flags in place: a property edge is
+/// boxed iff its target shares the source's SCC under the restricted edge
+/// set (D-impl-boxing); all other edges stay/become direct. Returns true
+/// when the node changed.
+fn rewrite_property_indirection(
+    kind: &mut SchemaKind,
+    source_component: usize,
+    components: &[usize],
+) -> bool {
+    let SchemaKind::Object { properties, .. } = kind else {
+        return false;
+    };
+    let mut changed = false;
+    for property in properties {
+        let boxed = components[property.schema.target.0 as usize] == source_component;
+        let desired = if boxed {
+            Indirection::Boxed
+        } else {
+            Indirection::None
+        };
+        if property.schema.indirection != desired {
+            property.schema.indirection = desired;
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Where a schema-valued edge sits inside its parent; decides cycle
 /// indirection policy (companion §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EdgeContext {
-    /// Object property: always boxed.
+    /// Object property: boxed at build time; the post-load SCC pass
+    /// ([`apply_cycle_precise_indirection`], D-impl-boxing) later keeps
+    /// `Boxed` only on edges closing a property-recursion cycle.
     Property,
     /// Array items / tuple items / additionalProperties / patternProperties /
     /// contains: containers break recursion without boxing.
@@ -147,6 +309,8 @@ enum EdgeContext {
 impl EdgeContext {
     fn base_indirection(self) -> Indirection {
         match self {
+            // Build-time default; refined cycle-precisely after loading
+            // (companion §3, D-impl-boxing).
             Self::Property => Indirection::Boxed,
             _ => Indirection::None,
         }
@@ -1906,6 +2070,7 @@ impl Loader {
     fn parse_operation(&mut self, value: &Yaml, doc: &str, path: &DocumentPath) -> OperationIr {
         let empty = OperationIr {
             operation_id: None,
+            tags: Vec::new(),
             parameters: Vec::new(),
             request_body: None,
             responses: Vec::new(),
@@ -1922,6 +2087,15 @@ impl Loader {
         };
         let operation_id = string_field(value, "operationId").map(ToOwned::to_owned);
         let deprecated = bool_field(value, "deprecated").unwrap_or(false);
+        let tags = mapping_get(mapping, "tags")
+            .and_then(Yaml::as_sequence)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
         let parameters = mapping_get(mapping, "parameters")
             .map(|parameters| self.parse_parameter_list(parameters, doc, &path.key("parameters")))
             .unwrap_or_default();
@@ -1950,6 +2124,7 @@ impl Loader {
             .map(|servers| self.parse_servers(servers, &path.key("servers")));
         OperationIr {
             operation_id,
+            tags,
             parameters,
             request_body,
             responses,

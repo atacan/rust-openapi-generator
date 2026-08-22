@@ -1,0 +1,46 @@
+# Fixture 06a — OAS 3.0 normalization rows (companion §2): `nullable: true`,
+# boolean `exclusiveMinimum`, and the deprecated `type: binary` form.
+openapi: 3.0.3
+info:
+  title: legacy forms
+  version: "1"
+paths:
+  /legacy:
+    get:
+      operationId: getLegacy
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LegacyEnvelope'
+components:
+  schemas:
+    NullableString:
+      type: string
+      nullable: true
+    PositiveInt:
+      type: integer
+      minimum: 5
+      exclusiveMinimum: true
+    LegacyBytes:
+      type: binary
+    LegacyFileType:
+      type: file
+    LegacyEnvelope:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        note:
+          nullable: true
+          type: string
+        payload:
+          type: string
+          format: binary
+        count:
+          type: integer
+          minimum: 1
+          exclusiveMinimum: true
