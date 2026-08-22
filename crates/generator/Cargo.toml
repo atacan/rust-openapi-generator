@@ -13,3 +13,6 @@ unsafe_code = "forbid"
 
 [dependencies]
 thiserror = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"

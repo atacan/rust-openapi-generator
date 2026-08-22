@@ -18,3 +18,4 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "rt"] }
 tokio-util = { version = "0.7", features = ["io"] }
 futures-core = "0.3"
 futures-util = "0.3"
+serde_yaml = "0.9"
