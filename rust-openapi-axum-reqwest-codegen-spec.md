@@ -24,7 +24,7 @@ The generator MUST make the memory behavior of every body representation predict
 - no generated large-body path may silently call an unbounded whole-body collector;
 - request and response variants are represented as Rust enums wherever OpenAPI describes multiple alternatives, forcing developers to handle documented alternatives explicitly.
 
-This document focuses on request/response body and response-status generation. Parameter serialization, authentication, callbacks, links, and schema-generation details are outside the core scope except where needed by examples.
+This document focuses on request/response body and response-status generation, together with the contract-boundary semantics that keep those invariants airtight: bounded serialization (section 34), pre-handler protocol rejections (section 39), post-commit stream failures (section 40), transport policies (section 30), and the body-presence state machine (section 28). Parameter serialization, authentication, callbacks, links, and schema-generation details are specified separately in the companion document [`openapi-semantics-spec.md`](./openapi-semantics-spec.md) and only referenced here where needed by examples.
 
 ---
 
@@ -228,7 +228,17 @@ tokio-util = { version = "...", optional = true, features = ["io", "codec"] }
 futures-util = { version = "...", optional = true }
 ```
 
-The generated `support` module SHOULD be small and contain only reusable helpers such as bounded collection, content-type matching, percent encoding, structured decode errors, and event-stream codecs. It MUST NOT define a parallel HTTP transport abstraction.
+The generated `support` module SHOULD be small and contain only reusable helpers such as bounded collection (`collect_limited`), bounded serialization (`serialize_json_limited`, `serialize_form_limited`, section 34), content-type matching, percent encoding, structured decode errors, protocol rejection types (section 39), stream-failure/encode-overflow hooks, and event-stream codecs. It MUST NOT define a parallel HTTP transport abstraction.
+
+### 3.1 Toolchain and dependency version policy
+
+Generated crates declare:
+
+- a generator-pinned **MSRV**, defaulting to the oldest stable Rust supported by the current minor releases of Axum and Reqwest at generation time;
+- caret version requirements for Axum (`0.8`), Reqwest (`0.12`), `http` (`1`), and `bytes` (`1`) by default, overridable through generator configuration;
+- no floating pre-release or path dependencies.
+
+The generator itself documents which Axum/Reqwest major versions it supports; generating for an unsupported combination is an error, not best-effort output, so that emitted code can rely on concrete framework APIs.
 
 ---
 
@@ -367,6 +377,8 @@ text/event-stream
 
 Representation: typed asynchronous event stream.
 
+The operation's schema describes the **type of each streamed item** (section 18.1); `x-rust-stream-item` overrides when the schema instead describes an envelope. SSE framing semantics — JSON-only `data:` fields, `id`/`event`/`retry`, comments, multi-line data, malformed events — are fixed in section 18.2.
+
 ### 5.7 Newline-delimited JSON
 
 Recognized aliases MAY include:
@@ -379,7 +391,7 @@ application/jsonl
 
 Representation: asynchronous stream of decoded items.
 
-Each logical JSON record is bounded independently; the entire body is not.
+Each logical JSON record is bounded independently by `max_stream_record_bytes`; the entire body is not. The schema describes the type of each streamed item (section 18.1).
 
 ### 5.8 JSON Text Sequences
 
@@ -388,6 +400,8 @@ application/json-seq
 ```
 
 Representation: asynchronous stream of decoded items framed according to JSON Text Sequences.
+
+The schema describes the type of each streamed item (section 18.1).
 
 ### 5.9 Optional codec families
 
@@ -527,9 +541,17 @@ impl Client {
         &self,
         body: &CreateWidget,
     ) -> Result<CreateWidgetResponse, ClientError> {
+        // Bounded request serialization (section 34). Reqwest's `.json(body)`
+        // convenience is deliberately not used because it buffers without a limit.
+        let payload = serialize_json_limited(
+            body,
+            self.limits.structured_encode_bytes,
+        )?;
+
         let response = self.http
             .post(self.url("/widgets")?)
-            .json(body)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(payload)
             .send()
             .await?;
 
@@ -575,25 +597,44 @@ pub trait WidgetsApi: Send + Sync + 'static {
 }
 ```
 
-Generated router logic performs bounded JSON extraction and then dispatches to the trait. Generated `IntoResponse` logic maps each enum variant to the documented status and media type.
+Generated router logic performs bounded JSON extraction (with the route's `DefaultBodyLimit` wired to `structured_request_bytes`) and then dispatches to the trait. Response encoding uses the generated limited serializers, never `axum::Json` directly:
 
 ```rust
-impl axum::response::IntoResponse for CreateWidgetResponse {
-    fn into_response(self) -> axum::response::Response {
+impl CreateWidgetResponse {
+    /// Infallible path used by the generated router; applies the
+    /// section 34 fallback on encode overflow.
+    pub fn into_response_with_limits(
+        self,
+        limits: &BodyLimits,
+    ) -> axum::response::Response {
         match self {
-            Self::Created201(body) => (
-                http::StatusCode::CREATED,
-                axum::Json(body),
-            ).into_response(),
+            Self::Created201(body) => {
+                match serialize_json_limited(&body, limits.structured_encode_bytes) {
+                    Ok(bytes) => (
+                        http::StatusCode::CREATED,
+                        [(http::header::CONTENT_TYPE, "application/json")],
+                        bytes,
+                    ).into_response(),
+                    Err(_) => fallback_internal_error(), // 500, empty body, hook fires
+                }
+            }
 
             Self::BadRequest400(body) => {
                 // Content-Type is application/problem+json, not generic application/json.
-                encode_problem_json(http::StatusCode::BAD_REQUEST, body)
+                encode_problem_json_limited(http::StatusCode::BAD_REQUEST, &body, limits)
             }
         }
     }
 }
+
+impl axum::response::IntoResponse for CreateWidgetResponse {
+    fn into_response(self) -> axum::response::Response {
+        self.into_response_with_limits(&BodyLimits::process_default())
+    }
+}
 ```
+
+The router invokes `into_response_with_limits` with its configured limits so that application-level composition through plain `IntoResponse` remains possible without losing the bound entirely.
 
 **Memory behavior:** bounded complete JSON document on both request and response paths.
 
@@ -1167,7 +1208,7 @@ pub enum DeleteWidgetResponse {
 }
 ```
 
-The generated response serializer MUST ensure the 204 variant does not emit a body.
+The generated response serializer MUST ensure the 204 variant does not emit a body. This is a special case of the general no-body rules in section 35, which also cover `205`, `304`, `HEAD`, and informational statuses.
 
 ---
 
@@ -1274,9 +1315,13 @@ pub async fn create_session(
     &self,
     form: &CreateSessionForm,
 ) -> Result<CreateSessionResponse, ClientError> {
+    // Bounded form serialization (section 34); Reqwest's `.form(form)` is not used.
+    let payload = serialize_form_limited(form, self.limits.structured_encode_bytes)?;
+
     let response = self.http
         .post(self.url("/sessions")?)
-        .form(form)
+        .header(http::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(payload)
         .send()
         .await?;
     // ...
@@ -1295,7 +1340,7 @@ pub trait SessionsApi {
 }
 ```
 
-The generated route may use Axum `Form<T>` when the operation accepts only this one request media type and the configured body limit has been applied. If content negotiation is required, the route decodes from the raw body after matching `Content-Type`.
+The generated route MAY use Axum `Form<T>` only when the operation accepts just this one request media type, the route's `DefaultBodyLimit` has been wired to `structured_request_bytes` (section 38), and the extractor's rejection is translated into the section 39 rejection mapping. If content negotiation is required, the route decodes from the raw body after matching `Content-Type`, using the same bounded collection path.
 
 ---
 
@@ -1405,6 +1450,23 @@ pub struct UploadDocumentRequest {
 
 **Memory behavior:** bounded metadata field, streaming file field.
 
+### 17.1 Multipart resource and cardinality limits
+
+`multipart_scalar_part_bytes` bounds individual parts but not the number of parts. An attacker must not be able to send millions of tiny parts without violating any configured limit, so the generated parser enforces the full cardinality set from section 33:
+
+- `max_multipart_parts`: total fields per request; exceeding it is a protocol rejection;
+- `max_part_header_bytes`: per-part header block (including `Content-Disposition`, `Content-Type`, and extension headers); oversized part headers are a rejection before any part payload is read;
+- `max_field_name_bytes` / `max_file_name_bytes`: `name=` and `filename=` lengths are checked during header parsing.
+
+Field-matching semantics:
+
+- **Missing required fields** (per the OpenAPI schema) are detected when the part stream ends without them and produce a `422` protocol rejection; the application handler is not invoked.
+- **Duplicate scalar/JSON-typed fields**: a repeated `name` that maps to a single-valued schema property is a `422` protocol rejection. Repeated fields whose schema is an array collect in wire order.
+- **Unknown fields**: by default ignored for forward compatibility, matching Serde's default; generator configuration MAY switch to strict rejection.
+- **Nesting depth**: nested multipart bodies beyond depth 1 are treated as opaque streaming parts unless a codec plugin handles them; a configurable `max_multipart_depth` guards pathological recursion in framing parsers.
+
+All cardinality checks run incrementally while streaming; none requires buffering part payloads.
+
 ---
 
 ## 18. Example 11 — Server-Sent Events
@@ -1475,6 +1537,30 @@ pub enum StreamEventsResponse {
 ```
 
 Generated `IntoResponse` maps `Ok200` to Axum SSE events and `Content-Type: text/event-stream`.
+
+### 18.1 Stream item typing convention
+
+The schema under a stream-typed media type (`text/event-stream`, NDJSON aliases, `application/json-seq`) is interpreted as **the type of each streamed item**, which is what the `$ref: Event` in this example means. Documents that instead describe an envelope may override the interpretation with:
+
+```yaml
+x-rust-stream-item:
+  $ref: '#/components/schemas/Event'
+```
+
+The extension wins when present; otherwise the item-schema convention applies. This convention is normative for the generator and documented in section 5.6.
+
+### 18.2 SSE framing semantics
+
+For SSE, the generated decoder defines precisely how the wire format maps to items:
+
+- `data:` payloads MUST be JSON (per RFC/WHATWG plus this specification's item-schema convention); each event's data is parsed as one item of type `Event`;
+- multi-line `data:` fields are joined with `\n` before parsing;
+- `id:` and `event:` are ignored by default because the generated item is the bare `Event` value; generator configuration MAY switch to an envelope representation carrying them;
+- `retry:` is surfaced through configuration only; automatic reconnection is out of scope for generated clients;
+- comment lines (`:` prefix) are ignored;
+- malformed events (invalid JSON, oversized per `max_stream_record_bytes`) yield `SseDecodeError` without collecting the rest of the stream.
+
+Server-side encoding writes one JSON document per event with no `event:`/`id:` fields unless the configured envelope mode says otherwise. Failures raised by the application's event stream after commit follow section 40.
 
 ---
 
@@ -1843,7 +1929,7 @@ For multiple request media types:
 Option<PatchWidgetRequestBody>
 ```
 
-Absence of a body is different from a JSON body containing `null` and MUST be modeled separately.
+Absence of a body is different from a JSON body containing `null` and MUST be modeled separately. The precise empty-body and missing-`Content-Type` interactions are defined in sections 28.2 and 28.3.
 
 ---
 
@@ -1873,9 +1959,9 @@ These are not interchangeable.
 
 ---
 
-## 28. Content-Type dispatch rules
+## 28. Body presence and Content-Type dispatch rules
 
-For request decoding and client response decoding:
+Media-type matching precedence, for request decoding and client response decoding:
 
 1. Parse the media type without treating parameters such as `charset=utf-8` as a different base type.
 2. Prefer exact OpenAPI content entries.
@@ -1894,25 +1980,90 @@ matches `application/problem+json` exactly.
 
 A JSON-family policy may also recognize `application/vnd.foo+json` when the OpenAPI declaration is an appropriate JSON media range, but generated exact declarations remain authoritative.
 
+### 28.1 Malformed and duplicate Content-Type headers
+
+- A syntactically unparseable `Content-Type` value is never ignored or defaulted: it is a `400` protocol rejection on the server and a decode error on the client.
+- Multiple conflicting `Content-Type` headers on one message are equally ambiguous and produce the same `400` rejection; generated code does not pick one arbitrarily.
+
+### 28.2 Missing Content-Type versus body presence
+
+| Situation | Server behavior | Client behavior |
+|---|---|---|
+| Required body, nonempty bytes, no `Content-Type` | `415` rejection | `ClientError::UnexpectedContentType` |
+| Required body, empty bytes, no `Content-Type` | `400` rejection (missing required body) | decode error |
+| Optional body, empty bytes | decoded as absent (`None`), regardless of headers | absent variant |
+| Optional body, nonempty bytes, no `Content-Type` | `415` rejection; generated code does not sniff bytes to guess | `ClientError::UnexpectedContentType` |
+
+### 28.3 Empty bodies with Content-Type present
+
+- An empty body on an optional-body operation is absent (`None`) even when a well-formed matching `Content-Type` is present. Header presence does not fabricate a value; absence of body bytes wins.
+- A required body that is empty is a `400` rejection even when `Content-Type` matches a documented entry: an empty byte sequence is not JSON `null` (section 27).
+- A documented JSON response status received with an empty body is a client decode error, never `Ok200` of some default value. Generated servers cannot emit this state because bounded encoders either write a document or fail through the section 34 fallback path.
+
+### 28.4 Charset handling for textual media
+
+- JSON-family decoding is UTF-8 per RFC 8259; a `charset` parameter is tolerated when it declares UTF-8 family encodings and otherwise yields a decode error.
+- Plain-text families default to UTF-8 and honor a supported `charset` parameter via the codec layer; unsupported charsets produce decode errors rather than replacement-character corruption.
+- Form bodies percent-decode as UTF-8 per the HTML form specification.
+
+### 28.5 Wildcards in incoming requests
+
+The precedence list above governs matching *documented* entries against concrete incoming types. Conversely, a wildcard *sent by the client* (for example `*/*` as request `Content-Type`) does not select among multiple documented request entries: the server rejects it with `415` unless exactly one entry exists, in which case the match MAY be accepted. Client-side response decoding is unaffected because servers may legitimately send any documented representation.
+
 ---
 
 ## 29. `Accept` generation
 
-When a response status can use multiple media types, the Reqwest client SHOULD send an `Accept` header listing supported representations in deterministic order.
+The request is sent before any response status is known, so `Accept` cannot depend on which status will occur. It is therefore defined **operation-wide**, not per response status:
 
-For example:
+- the candidate set is the deterministic union of every media type the operation can decode across **all** documented response statuses, including ranges expanded to concrete entries and `default`;
+- ordering is deterministic: configured preference order first, then OpenAPI declaration order;
+- duplicates collapse and quality values (`q=`) are not emitted by default;
+- an operation admitting exactly one decodable media type sends that single entry explicitly.
+
+Example for an operation whose responses admit JSON, problem JSON, and binary:
 
 ```http
-Accept: application/json, application/octet-stream
+Accept: application/json, application/problem+json, application/octet-stream
 ```
 
-Generator configuration MAY provide preference ordering. The type system must still handle every media type documented for the status because the server may legitimately choose any negotiated representation.
+Because a server may ignore `Accept`, the type system must still handle every media type documented for every status.
 
-For server routing, generated code SHOULD validate request `Content-Type`; response content selection is controlled by the returned nested enum variant. Optional automatic `Accept` negotiation may be added later, but explicit enum construction remains the core server API.
+On the server, returning an enum representation incompatible with the request's `Accept` is **the application's responsibility**: the generated router does not validate `Accept`, does not generate `406 Not Acceptable`, and treats the constructed variant as authoritative. Explicit enum construction remains the core server API. A future opt-in Tower middleware MAY add strict `Accept` enforcement without changing trait signatures.
 
 ---
 
-## 30. Streaming request ergonomics
+## 30. Generated client transport policies
+
+Reqwest exposes transport behaviors that can silently alter protocol semantics. Because the generated client promises that documented statuses are observable through exhaustive enums, these behaviors MUST be pinned down instead of inheriting defaults accidentally.
+
+### 30.1 Redirects
+
+The generated client constructs its `reqwest::Client` with `reqwest::redirect::Policy::none()` by default.
+
+Rationale:
+
+- a documented `301`, `302`, `303`, `307`, or `308` must reach the caller as the corresponding exhaustive enum variant;
+- transparent following would make those variants unreachable and would hide redirect outcomes from the caller;
+- following a redirect mid-upload requires replaying a consumed streaming body, which Reqwest cannot do safely (section 31).
+
+Callers who want automatic following opt in explicitly via a generated builder hook (for example `ClientBuilder::follow_redirects(policy)`). Even then, generated code does not buffer bodies to enable replay: a redirect encountered while a one-shot body is partially sent surfaces as `ClientError::RedirectRequiresReplayableBody`. With redirects disabled, an undocumented 3xx becomes `ClientError::UndocumentedStatus` unless a documented variant, range, or `default` matches.
+
+### 30.2 Decompression and content coding
+
+Transparent decompression (`gzip`, `br`, `deflate`, `zstd`) MAY be enabled via generator configuration. The policy is:
+
+- structured-body limits count **decoded** bytes: `collect_reqwest_limited` measures the stream after content coding is removed. Decoded size is the real memory exposure and the meaningful bound against decompression bombs;
+- streaming raw bodies pass through whatever Hyper/Reqwest provide, without total-size accounting; applications needing transfer caps while streaming count chunks themselves;
+- generated code never branches on `Content-Encoding`: media-type classification (section 5) is orthogonal to content coding.
+
+### 30.3 Other transport knobs
+
+Timeouts, proxies, connection pooling, and TLS configuration are out of scope for this specification. The generated builder MAY expose them pass-through, but their defaults are Reqwest defaults, deliberately not overridden by the generator.
+
+---
+
+## 31. Streaming request ergonomics
 
 The core client signature for a streaming body is:
 
@@ -1933,7 +2084,7 @@ A replayable request body is a separate concern. Reqwest streaming bodies are ge
 
 ---
 
-## 31. Streaming response ergonomics
+## 32. Streaming response ergonomics
 
 For raw streaming response content, the client SHOULD preserve ownership of `reqwest::Response` because this retains:
 
@@ -1966,7 +2117,7 @@ Using the raw `reqwest::Response` directly is also acceptable and keeps generate
 
 ---
 
-## 32. Structured body limits
+## 33. Structured body limits
 
 Generated configuration SHOULD separate limits by purpose:
 
@@ -1975,11 +2126,20 @@ pub struct BodyLimits {
     pub structured_request_bytes: usize,
     pub structured_response_bytes: usize,
     pub error_response_bytes: usize,
+    pub structured_encode_bytes: usize,   // bounded serialization (section 34)
     pub text_body_bytes: usize,
     pub multipart_scalar_part_bytes: usize,
     pub max_stream_record_bytes: usize,
+
+    // Multipart cardinality (section 17.1)
+    pub max_multipart_parts: usize,
+    pub max_part_header_bytes: usize,
+    pub max_field_name_bytes: usize,
+    pub max_file_name_bytes: usize,
 }
 ```
+
+Structured-body limits apply to **decoded** representations (section 30.2): a compressed transfer that decompresses beyond the limit is rejected even though its wire size was smaller.
 
 Binary/raw streams have no total-size memory limit because they are not accumulated. Applications may impose independent transfer-size limits for security/business reasons, but those limits should count bytes while streaming rather than buffer them.
 
@@ -1987,7 +2147,61 @@ A client/server may therefore reject a 20 MiB JSON document while still safely t
 
 ---
 
-## 33. Errors versus documented responses
+## 34. Bounded serialization
+
+Decoding is not the only unbounded path: encoding a large value into an unrestricted `Vec<u8>` violates the same invariant. Generated code therefore never calls `serde_json::to_vec`, `serde_json::to_string`, `serde_urlencoded::to_string`, or Axum's `Json<T>`/`Form<T>` responders directly for documented finite bodies. It uses support helpers that stop as soon as the encoded output exceeds the configured limit:
+
+```rust
+pub fn serialize_json_limited<T: serde::Serialize>(
+    value: &T,
+    limit: usize,
+) -> Result<bytes::Bytes, EncodeTooLarge>;
+
+pub fn serialize_form_limited<T: serde::Serialize>(
+    value: &T,
+    limit: usize,
+) -> Result<bytes::Bytes, EncodeTooLarge>;
+```
+
+Implementation requirement: the limit MUST fail fast during serialization — a counting writer that errors once `limit` bytes have been produced — rather than serializing into memory first and checking afterward.
+
+These helpers are used:
+
+- on the server, for every bounded response encoding: JSON, problem JSON, forms, and multipart scalar/JSON metadata parts;
+- on the client, for request encoding; Reqwest's `.json(body)` and `.form(form)` conveniences are NOT used by generated code because they buffer without a bound;
+- by multipart builders when emitting bounded metadata parts (section 17).
+
+### 34.1 Server encode overflow
+
+`IntoResponse` construction stays infallible by design. If bounded serialization of a documented response exceeds `structured_encode_bytes`:
+
+1. partial output is discarded; nothing partial is written to the wire;
+2. the encoder emits the fixed protocol-safe fallback response: `500 InternalServerError` with an empty body;
+3. the configured encode-overflow hook fires with the operation id, variant, and limit, so operators can observe the condition.
+
+The fallback 500 may itself be undocumented by the OpenAPI operation. This is the single sanctioned deviation from "the enum describes everything on the wire", chosen deliberately over fallible handler signatures (section 48). Applications wanting explicit control can use generated checked constructors such as `try_into_response()`, which return `Err(EncodeTooLarge)` instead of producing the fallback internally.
+
+### 34.2 Client request encode overflow
+
+If serializing a request body exceeds the encode limit, the client method returns `ClientError::BodyTooLarge { direction: Encode, limit }` without sending anything.
+
+---
+
+## 35. Bodies that must not exist
+
+Beyond the 204 rule in section 14, several statuses and methods have wire-level body semantics that differ from ordinary status/content generation. Generated code enforces all of them:
+
+| Case | Generated server encoder | Generated client decoder |
+|---|---|---|
+| `204 No Content`, `205 Reset Content`, `304 Not Modified` | never writes a body; omits body framing headers it does not need | treats the body as empty even if bytes arrive; documented body schemas are ignored |
+| `HEAD` requests | Axum/Hyper suppresses response bodies automatically; typed header fields are still written | decodes typed headers only; never reads or validates a body, even when `Content-Length` describes one |
+| `1xx` informational | never produced by application code | never surfaces as an enum variant; handled below the operation layer |
+
+A `HEAD` operation in OpenAPI typically documents the metadata (headers, media type, length) of the representation a `GET` would return while having no body to decode. The generated HEAD decoder therefore produces the status variant with typed headers and no body field, regardless of any documented content entry.
+
+---
+
+## 36. Errors versus documented responses
 
 Generated client methods use two levels:
 
@@ -2018,7 +2232,7 @@ This distinction is one of the primary design requirements.
 
 ---
 
-## 34. Server errors
+## 37. Server errors
 
 The generated API trait SHOULD return the documented response enum directly for normal protocol outcomes.
 
@@ -2045,7 +2259,7 @@ Mode A is the simplest and most protocol-exhaustive default.
 
 ---
 
-## 35. Request validation before handler invocation
+## 38. Request validation before handler invocation
 
 Generated server routing SHOULD validate before calling application code:
 
@@ -2056,13 +2270,72 @@ Generated server routing SHOULD validate before calling application code:
 - JSON/form syntax;
 - required structured fields through Serde/schema validation policy.
 
+Wiring requirements:
+
+- every route installs `axum::extract::DefaultBodyLimit::max(...)` matching the purpose-specific limit for that operation (`structured_request_bytes` for buffered bodies); streaming-body operations are exempt because nothing aggregates them;
+- extractor rejections are never surfaced as Axum's default text/plain responses: they are translated into the canonical `ProtocolRejection` mapping of section 39;
+- multipart routes enforce the cardinality limits of section 17.1 during parsing.
+
 Raw streaming bodies cannot be fully semantically validated before the application consumes them. Validation that depends on the complete streamed payload must therefore be incremental or application-owned.
 
 The generator MUST NOT buffer a raw body merely to claim complete validation.
 
 ---
 
-## 36. Response serialization
+## 39. Pre-handler protocol rejections
+
+Validation failures detected before handler invocation (section 38) are reported through a generated `ProtocolRejection` type, not through the operation's documented response enum:
+
+```rust
+pub struct ProtocolRejection {
+    pub kind: RejectionKind,
+    // diagnostic detail for logs/observation; not guaranteed on the wire
+}
+
+pub enum RejectionKind {
+    InvalidParameter,     // path/query/header syntax, missing required parameter
+    MalformedBody,        // syntactically invalid JSON/form/multipart framing
+    SchemaViolation,      // well-formed body violating the schema
+    BodyTooLarge,         // bounded collection limit exceeded
+    UnsupportedMediaType, // missing/unmatched Content-Type where a body is admitted
+}
+```
+
+Canonical status mapping:
+
+| Condition | Status |
+|---|---|
+| Invalid or missing required path/query/header parameter | `400` |
+| Syntactically malformed JSON/form/multipart framing | `400` |
+| Body exceeding the configured structured limit | `413` |
+| Missing, unparsable, wildcard, or unmatched `Content-Type` on a body-bearing request | `415` |
+| Well-formed body failing Serde/schema validation (e.g. missing required fields) | `422` |
+
+Contract-boundary rules:
+
+1. Rejections live **outside the documented operation enum**. The router emits them directly; the handler never observes them. Generated code never synthesizes instances of documented body types to fill a matching documented variant, because it cannot invent valid domain data.
+2. A rejection may therefore produce a status the operation never documents. The claim that "the Rust enum exposes the API contract" holds for application-produced responses; infrastructure-level input validation sits below the operation layer, symmetric with `404 Unknown Route` and `405 Method Not Allowed`.
+3. By default a rejection response carries only the canonical status with an empty body, keeping invented schemas off the wire. Generator configuration MAY switch rejections to a canned minimal RFC 9457 problem document under `application/problem+json`; this remains generator-owned and never uses application schema types.
+4. The client side needs no special casing: whatever the server actually sends decodes normally, so a peer-generated rejection still matches a documented variant, range, or `default` when one exists, and otherwise surfaces as `ClientError::UndocumentedStatus`.
+
+---
+
+## 40. Failures after a streaming response has started
+
+Server streams for SSE, NDJSON, JSON Sequences, and binary bodies yield `Result<_, ServerStreamError>` items. Once the encoder has committed the response — status and headers written, first body bytes flushed — the HTTP status can no longer change. The generated contract is:
+
+1. **No fabricated statuses.** The encoder MUST NOT upgrade a committed response to `InternalServerError500` and MUST NOT inject in-band error frames: SSE, NDJSON, and JSON Text Sequences define no standard in-scope error representation.
+2. **Terminate abruptly.** A stream item error ends the body immediately; the encoder aborts the connection so clients observe truncation rather than clean EOF.
+3. **Observe.** The configured stream-failure hook fires with the operation id and error before the stream is dropped.
+4. **Prefer pre-commit failure.** Errors known before returning the stream variant should be modeled as documented error variants instead; stream variants exist for failures that occur during production.
+
+Client-visible effect: premature termination surfaces as an explicit truncated-stream decode error (`SseDecodeError::Truncated`, `NdjsonDecodeError::Truncated`, `JsonSeqDecodeError::Truncated`) — distinguishable from clean end-of-stream so callers never mistake truncation for success. Raw binary streams follow the same rule: an `Err` chunk from an `axum::body::Body` aborts the response abnormally.
+
+This is the streaming counterpart of the bounded-encode fallback in section 34: both exist because HTTP forbids changing a committed response.
+
+---
+
+## 41. Response serialization
 
 The server encoder follows the response enum in two stages:
 
@@ -2079,17 +2352,19 @@ operation response enum
 Examples:
 
 ```text
-Ok200(Json(widget))        -> 200 + application/json + bounded JSON serialization
+Ok200(Json(widget))        -> 200 + application/json + bounded JSON serialization (section 34)
 Ok200(OctetStream(body))   -> 200 + application/octet-stream + body unchanged
 NotFound404(problem)       -> 404 + application/problem+json
-NoContent204               -> 204 + empty body
+NoContent204               -> 204 + empty body (section 35)
 ```
+
+Bounded encoders stop at `structured_encode_bytes` and fall back per section 34.1 rather than writing partial bodies. Streaming variants encode incrementally and follow the post-commit failure contract of section 40.
 
 For very large JSON generation, a future optional streaming JSON encoder may be supported for schemas that map naturally to sequences, but ordinary object-shaped JSON remains a finite document by default.
 
 ---
 
-## 37. Multiple response media types plus multiple status codes
+## 42. Multiple response media types plus multiple status codes
 
 This produces two levels of enums, never a flattened cross-product unless configured otherwise.
 
@@ -2149,7 +2424,7 @@ second: which representation for that status?
 
 ---
 
-## 38. Requests with multiple media types and optionality
+## 43. Requests with multiple media types and optionality
 
 ### OpenAPI input
 
@@ -2201,7 +2476,7 @@ async fn execute(
 
 ---
 
-## 39. Generic textual and binary schemas
+## 44. Generic textual and binary schemas
 
 OpenAPI schema metadata does not override the actual media type's transport semantics.
 
@@ -2247,7 +2522,7 @@ or a generator-side override without requiring changes to the OpenAPI document.
 
 ---
 
-## 40. Optional typed codecs
+## 45. Optional typed codecs
 
 The media-type classifier should be extensible.
 
@@ -2277,7 +2552,7 @@ The fallback remains raw streaming, so unsupported content is never silently dis
 
 ---
 
-## 41. Recommended generated API example in one view
+## 46. Recommended generated API example in one view
 
 Given:
 
@@ -2380,7 +2655,7 @@ This example captures the core design of the generator.
 
 ---
 
-## 42. Compile-time exhaustiveness guarantee
+## 47. Compile-time exhaustiveness guarantee
 
 The generated enums are intentionally not marked `#[non_exhaustive]` by default.
 
@@ -2398,7 +2673,7 @@ For library authors who require semver-friendly generated crates, the generator 
 
 ---
 
-## 43. Generated response conversion should be infallible where practical
+## 48. Generated response conversion should be infallible where practical
 
 On the server, constructing a documented response variant should make protocol serialization as close to infallible as reasonable.
 
@@ -2428,9 +2703,11 @@ impl GetWidgetResponse {
 
 This prevents an invalid `404` from being accidentally placed in a `Success2xx` variant.
 
+Infallibility has exactly one sanctioned exception: encode overflow (section 34.1) cannot fail the constructor without reintroducing fallible signatures, so the generated encoder discards the partial output, emits the fixed empty-bodied `500` fallback, and fires the overflow hook. Checked constructors such as `try_into_response()` remain available for applications that prefer explicit handling of that case.
+
 ---
 
-## 44. What generated code MUST NOT do
+## 49. What generated code MUST NOT do
 
 The following patterns are forbidden for potentially unbounded bodies:
 
@@ -2448,11 +2725,26 @@ The following is also forbidden unless a configured finite bound is applied:
 serde_json::from_slice(&response.bytes().await?)
 ```
 
+Unbounded serialization is equally forbidden on documented finite-body paths:
+
+```rust
+// Forbidden: buffers the full document before any size check
+serde_json::to_vec(&value)?
+serde_urlencoded::to_string(&form)?          // same
+axum::Json(value)                            // same, on the server responder path
+```
+
 Preferred structured pattern:
 
 ```rust
 let bytes = collect_limited(response, configured_limit).await?;
 let value = serde_json::from_slice(&bytes)?;
+```
+
+Bounded encode counterpart (section 34):
+
+```rust
+let payload = serialize_json_limited(&value, limits.structured_encode_bytes)?;
 ```
 
 Preferred streaming pattern:
@@ -2472,7 +2764,7 @@ let mut stream = body.into_data_stream();
 
 ---
 
-## 45. Tests the generator MUST have
+## 50. Tests the generator MUST have
 
 The generator/runtime support test suite should cover at least:
 
@@ -2499,22 +2791,50 @@ The generator/runtime support test suite should cover at least:
 21. 204 never writes a response body.
 22. Optional body distinguishes absent body from JSON `null`.
 
+Contract-boundary tests:
+
+23. Bounded serialization stops early: `serialize_json_limited` on an oversized value allocates memory bounded by the limit, not by the encoded size.
+24. Server encode overflow produces the fixed empty-bodied 500 fallback, fires the hook, and never writes partial output.
+25. Client request encode overflow returns `ClientError::BodyTooLarge` without sending.
+26. Rejection matrix: each `RejectionKind` maps to its canonical status (400/413/415/422); handler is not invoked; documented enum is not synthesized.
+27. Malformed and duplicate `Content-Type` headers produce 400 rejections / decode errors per section 28.1.
+28. Missing `Content-Type` with nonempty required body yields 415; with optional body and no bytes yields absent; with nonempty bytes yields 415 (section 28.2).
+29. Empty 200 `application/json` response decodes as an error, not a default value (section 28.3).
+30. Charset handling: UTF-8 JSON passes; unsupported charsets error instead of corrupting (section 28.4).
+31. Redirect policy defaults to none: a documented 307 reaches its enum variant; opt-in following surfaces `RedirectRequiresReplayableBody` for consumed streams.
+32. Body limits count decoded bytes: a gzip bomb exceeding `structured_response_bytes` decoded is rejected despite small wire size.
+33. Post-commit stream failure terminates the connection abruptly; client observes `Truncated`, distinct from clean EOF; hook fires (section 40).
+34. No-body statuses: 205/304/HEAD carry no body in both directions; HEAD decodes typed headers only (section 35).
+35. Operation-wide `Accept` header equals the deterministic union across all statuses (section 29).
+36. Multipart cardinality: part-count limit, part-header limit, field/file-name limits enforced incrementally; duplicate scalar fields reject 422; repeated array fields collect in order (section 17.1).
+37. SSE framing: multi-line data joins before parse; comments ignored; malformed events yield `SseDecodeError`; oversized events yield per-record errors (section 18.2).
+
+Reproducibility and conformance testing:
+
+38. Generated code compiles under `cargo check`/`clippy -D warnings` for every fixture spec; compile-failure fixtures use `trybuild`.
+39. Generation is deterministic byte-for-byte: no timestamps, paths, or map-iteration order in output; golden/snapshot files cover every example section of this document.
+40. Generated output is `rustfmt`-clean.
+41. Fuzz targets for malformed JSON/form/multipart/SSE input assert bounded memory and rejection without panics.
+42. Property tests decode NDJSON/JSON-seq/SSE bodies split at every possible chunk boundary against unsplit decoding.
+43. Differential round trips: generated client against generated server over a real listener must reproduce identical values for every operation in the fixture corpus.
+44. MSRV build: CI builds generated crates on the pinned MSRV toolchain.
+
 Memory tests should use a synthetic producer that generates far more bytes than allowed by process memory, proving behavior rather than relying only on code inspection.
 
 ---
 
-## 46. Open design questions
+## 51. Open design questions
 
 The following details should be decided before implementation stabilizes:
 
-### 46.1 Should binary client responses expose raw `reqwest::Response` or a generated wrapper?
+### 51.1 Should binary client responses expose raw `reqwest::Response` or a generated wrapper?
 
 **Raw response advantages:** zero abstraction, fewer generated types, direct Reqwest API.  
 **Wrapper advantages:** typed documented headers, consistent methods, hides unrelated Reqwest methods.
 
 Recommended initial choice: generated status wrapper containing typed headers plus the raw `reqwest::Response` when needed.
 
-### 46.2 Should single-status operations still use a response enum?
+### 51.2 Should single-status operations still use a response enum?
 
 Two reasonable policies:
 
@@ -2523,7 +2843,7 @@ Two reasonable policies:
 
 Recommended choice: **always generate a response enum** for public operation results. This preserves status semantics and makes later API expansion mechanically consistent.
 
-### 46.3 Should request content enums own or borrow JSON values?
+### 51.3 Should request content enums own or borrow JSON values?
 
 Owning enums are easiest:
 
@@ -2535,13 +2855,13 @@ but can cause moves/clones. A borrowing generated request enum adds lifetimes an
 
 Recommended initial choice: own operation request enums; provide convenience methods taking references for single-content JSON operations.
 
-### 46.4 Multipart server API shape
+### 51.4 Multipart server API shape
 
 This is likely the most technically sensitive API because multipart fields are sequential and parser implementations may tie a field lifetime to the parent multipart parser.
 
 The design MUST prioritize streaming correctness over pretending multipart is a normal in-memory Rust struct.
 
-### 46.5 XML and other codecs
+### 51.5 XML and other codecs
 
 Recommended initial implementation scope:
 
@@ -2560,7 +2880,20 @@ Other formats use streaming raw-body fallback until codec plugins are added.
 
 ---
 
-## 47. Initial implementation milestones
+## 52. Initial implementation milestones
+
+### Phase 0 — invariants and normalization
+
+These decisions shape generated public APIs, so they are locked before code generation begins:
+
+- bounded serializer helpers (`serialize_json_limited`, `serialize_form_limited`, counting-writer contract) and the encode-overflow fallback/hook policy (section 34);
+- protocol rejection type, canonical status mapping, and the outside-the-enum rule (section 39);
+- body-presence / Content-Type state machine including empty-body, malformed-header, and charset rules (section 28);
+- client transport policies: redirects off by default, decompression with decoded-byte accounting (section 30);
+- post-commit streaming failure contract and truncated-stream decode errors (section 40);
+- stream item-schema convention plus `x-rust-stream-item` override (section 18.1);
+- IR/normalization contract per the companion document: `$ref` resolution incl. external/cyclic refs, OpenAPI 3.0→3.1 normalization, composition keywords, discriminator handling, naming/keyword-collision rules;
+- deterministic-generation requirements (no timestamps, stable ordering) so golden tests are possible from day one.
 
 ### Phase 1 — core protocol shapes
 
@@ -2597,7 +2930,7 @@ Other formats use streaming raw-body fallback until codec plugins are added.
 
 ---
 
-## 48. Normative design summary
+## 53. Normative design summary
 
 The generator SHOULD behave according to these concise rules:
 
@@ -2615,13 +2948,20 @@ The generator SHOULD behave according to these concise rules:
 12. **Exact media types/statuses take precedence over wildcard media types/status ranges.**
 13. **A `default` response becomes a status-carrying enum variant.**
 14. **Generated server response variants determine status and content type explicitly.**
-15. **Generated code never performs unbounded whole-body collection.**
+15. **Generated code never performs unbounded whole-body collection or unbounded serialization.**
+16. **Bounded encoders stop at the configured limit; server overflow yields a fixed empty-bodied 500 plus an observable hook, client overflow yields `BodyTooLarge`.**
+17. **Pre-handler protocol rejections use canonical statuses (400/413/415/422) and stay outside the documented operation enum.**
+18. **After a streaming response is committed, failures terminate the body, fire a hook, and surface as truncated-stream errors — never as fabricated statuses.**
+19. **Redirects default to off; decompression limits account for decoded bytes.**
+20. **`Accept` is computed per operation as a deterministic union; server-side representation choice is application-authoritative.**
+21. **204/205/304/HEAD/1xx carry no body in either direction; HEAD decodes headers only.**
+22. **Stream-typed media types interpret their schema as the per-item type unless `x-rust-stream-item` overrides it.**
 
 The intended developer experience is that the OpenAPI contract is visible directly in Rust's type system while large HTTP bodies retain the natural streaming and backpressure behavior already provided by Reqwest/Hyper and Axum/Hyper.
 
 ---
 
-## 49. Research basis
+## 54. Research basis
 
 This draft is based on the behavior and APIs of the current Rust HTTP ecosystem and OpenAPI response/content semantics, including:
 
