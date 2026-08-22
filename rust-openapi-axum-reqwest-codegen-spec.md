@@ -2154,6 +2154,10 @@ pub struct BodyLimits {
     pub max_part_header_bytes: usize,
     pub max_field_name_bytes: usize,
     pub max_file_name_bytes: usize,
+
+    // Framing and presence detection (sections 28.2, 17.1)
+    pub peek_buffer_bytes: usize,   // first-frame peek cap for optional-body presence detection
+    pub max_multipart_depth: usize, // nested multipart framing depth guard
 }
 ```
 
@@ -2855,6 +2859,9 @@ Reproducibility and conformance testing:
 46. Optional-body presence detection works without `Content-Length` (chunked transfer): presence decided by first-frame peek and peeked bytes are delivered exactly once downstream (section 28.2).
 47. Presence/nullability matrix: a missing required-nullable property fails validation; an explicit `null` on an optional non-nullable property fails (companion section 2.1).
 48. `oneOf` ambiguity: a document validating more than one branch is rejected rather than resolved by declaration order (companion section 4.2).
+49. Discriminator-selected `oneOf`: a document matching the selected branch AND another branch still fails exactly-one validation; selection does not weaken the verdict (companion section 4.2).
+50. Directional view requiredness: a required `writeOnly` field is mandatory when encoding requests and absent from decoded responses; a required `readOnly` field is mandatory in responses and omitted from requests (companion section 5).
+51. Scalar `allOf` intersection: `minLength` plus `pattern` constraints on strings combine into one validated string type, not nested values (companion section 4.1).
 
 Memory tests should use a synthetic producer that generates far more bytes than allowed by process memory, proving behavior rather than relying only on code inspection.
 

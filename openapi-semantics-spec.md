@@ -66,8 +66,8 @@ Notes:
 - Reference targets: any component type the generator consumes (schemas, parameters, request bodies, responses, security schemes).
 - JSON Pointer escaping (`~0`, `~1`) handled per RFC 6901.
 - Sibling semantics are version- and context-dependent, matching the OAS distinction between Reference Objects and Schema Objects that merely contain a `$ref` keyword:
-  - OAS 3.0 **Reference Object**: `$ref` plus the permitted `summary`/`description` siblings; any other sibling keys are ignored with a warning and never merged;
-  - OAS 3.1+/3.2 **Reference Object**: same permitted set; `summary`/`description` are recognized and carried into the IR as reference metadata;
+  - OAS 3.0 **Reference Object**: only `$ref` exists; every sibling key is ignored with a warning (`summary`/`description` were added to Reference Objects in 3.1);
+  - OAS 3.1+/3.2 **Reference Object**: `$ref`, `summary`, `description`; these siblings are recognized and carried into the IR as reference metadata;
   - OAS 3.1+/3.2 **Schema Object containing a `$ref` keyword**: this is not a Reference Object; sibling schema keywords are preserved and evaluated together with the referenced schema per JSON Schema 2020-12 conjunction semantics.
 - The parser classifies each node by document version and context before normalization so these three cases never collapse into a single rule.
 - Cycle policy: the IR is graph-aware. Recursion through properties generates heap-indirected types (`Box<T>`); recursion broken by arrays/maps is direct. A schema requiring unbroken self-containment (a value must contain itself) is a generation error.
@@ -83,7 +83,11 @@ Notes:
 
 ### 4.1 `allOf`
 
-**Proposed:** Members that are plain objects merge field-wise into one struct. Merge conflicts (same property, incompatible schemas) are generation errors; identical constraints collapse; `required` unions. Non-object members fall back to composition-by-nesting with `serde(flatten)`.
+**Decided:** The IR defines `allOf` as **schema intersection first**; object merging is merely a codegen optimization applied when proven safe.
+
+- Object members merge field-wise into one struct: identical constraints collapse, `required` unions, and conflicting constraints for the same property are generation errors.
+- Scalar/array members intersect compatible type and validation constraints into a single type (for example two string schemas with `minLength: 3` and a `pattern` become one validated string carrying both checks). `serde(flatten)` is object/map-oriented and MUST NOT be used as a fallback for non-object members.
+- Intersections that cannot be represented losslessly in generated types fall back to a raw/value representation with retained validation metadata, or are generation errors listing schema paths — the same conservative philosophy as unrepresentable `oneOf`/`anyOf`.
 
 ### 4.2 `oneOf` / `anyOf`
 
@@ -94,9 +98,9 @@ Notes:
 - `anyOf` ("at least one") generates a Rust enum ONLY when the generator can prove the branches are mutually exclusive, using the same proof standard as above. Otherwise it falls back to a raw/value representation with retained validation metadata. The generator MUST NOT emit a choose-one enum for `anyOf`.
 - The discriminator is a selection hint only (per OAS): it may route decoding but never changes a `oneOf` validation verdict.
 
-**Decided (discriminator architecture):** the default is **inspect-select-validate** — read the discriminator property from the raw document, select the candidate branch schema, then deserialize and validate that candidate alone. Collapsing this into native Serde internally-tagged enums is permitted only when static analysis proves wire-shape equivalence: every branch carries the constant tag property with its expected value(s) and no branch has conflicting tag constraints. Otherwise the two-phase codec is emitted even though it is less idiomatic; correctness outranks ergonomics.
+**Decided (discriminator architecture):** the default is **inspect-select-validate** — read the discriminator property from the raw document, select the candidate branch schema, then deserialize that candidate. Discriminator selection may optimize **deserialization only**; it never changes the validation verdict. Unless mutual exclusivity of all branches has been proven statically, exactly-one validation must still demonstrate that every other branch fails for the document; when exclusivity IS proven, validating only the selected branch is safe. Collapsing the pipeline into native Serde internally-tagged enums is permitted only when static analysis proves wire-shape equivalence AND exclusivity: every branch carries the constant tag property with its expected value(s), no branch has conflicting tag constraints. Otherwise the two-phase codec is emitted even though it is less idiomatic; correctness outranks ergonomics.
 
-With an explicit `mapping`, mapping entries select their targeted schemas directly during the inspect phase.
+With an explicit `mapping`, mapping entries select their targeted schemas directly during the inspect phase; the validation rule above is unchanged.
 
 ### 4.3 Enumerations
 
@@ -122,17 +126,28 @@ With an explicit `mapping`, mapping entries select their targeted schemas direct
 
 **Decided:** Shared models keep every field; directionality is enforced by generated **directional view types** used by operation codecs.
 
-- for each schema carrying `readOnly`/`writeOnly` fields that appears in message positions, the generator emits thin projection views (for example `WidgetWrite` for encoding requests, `WidgetRead` for decoding responses);
-- request codecs serialize through the write view: `readOnly` fields are omitted from output;
-- response codecs deserialize through the read view: `writeOnly` fields are treated as absent;
-- views convert to and from the shared model cheaply (borrowing field data where possible), so application code keeps operating on shared types;
-- derived Serde impls on the shared model remain untouched — the view boundary makes directionality a compile-time-visible property of generated codecs instead of a runtime filter or schema validation afterthought.
+Transport directions are explicit:
+
+- client request encode and server request decode use the **write view** (`readOnly` fields omitted from the wire);
+- server response encode and client response decode use the **read view** (`writeOnly` fields treated as absent on the wire).
+
+Requiredness is directional, matching the schema's meaning in each direction:
+
+- required + `readOnly` is required only in the read/response direction;
+- required + `writeOnly` is required only in the write/request direction (for example a required write-only `password` exists in `WidgetWrite` but not in `WidgetRead`);
+
+Conversion between shared models and views is intentionally **asymmetric**:
+
+- projecting **shared model → directional view** is always generated where fields are borrowable;
+- converting a **decoded directional view → shared model** is generated only when it can be lossless (every missing-in-view field has a default or is `Option`); otherwise it is either a `TryFrom` conversion requiring an application-supplied completion step for the absent fields, or it is not generated at all. A read view of `Widget { password: String }` cannot fabricate the password; the generator never invents values to force a lossless-looking API.
+
+Derived Serde impls on the shared model remain untouched — the view boundary makes directionality a compile-time-visible property of generated codecs instead of a runtime filter or validation afterthought.
 
 ---
 
 ## 6. Parameters
 
-**Decided:** Full `style` × `explode` matrix implemented per OAS defaults (form+explode for query/cookie, simple for path/header). `deepObject` supported for query. Unknown style/location combinations are generation errors.
+**Decided:** Full `style` × `explode` matrix implemented per OAS defaults (form+explode for query/cookie, simple for path/header). `deepObject` supported for query. Query `allowReserved` is honored per OAS. Unknown style/location combinations are generation errors. OAS 3.2's `in: querystring` parameter location is **rejected in v1** with a clear generation diagnostic, consistent with the conservative fallback philosophy of section 4.2; support MAY be added later.
 
 **Proposed:** Cookie parameters: client sends them as `Cookie` headers built from values; server extracts from the `Cookie` header without requiring a cookie jar. No automatic cookie store in v1.
 
@@ -152,7 +167,14 @@ With an explicit `mapping`, mapping entries select their targeted schemas direct
 
 ## 8. Servers and base URLs
 
-**Decided:** The first `servers` entry is the default base URL; all entries generate constructors. Server variables (`{region}`) become builder parameters with declared defaults and `enum` validation. Path parameters percent-encode using RFC 3986 unreserved set; query parameter serialization order is declaration order for deterministic output.
+**Decided:** Server selection follows OAS precedence:
+
+1. an operation-level `servers` array overrides the path-level array;
+2. a path-level array overrides the root-level array;
+3. an absent or empty root-level array implies `/`, resolved against the document's own location;
+4. within the effective array, the first entry is the default base URL and all entries generate constructors.
+
+Relative server URLs resolve deterministically against the URL of the document that declared them. Server variables (`{region}`) become builder parameters with declared defaults and `enum` validation. Path parameters percent-encode using RFC 3986 unreserved set; query parameter serialization order is declaration order for deterministic output.
 
 ---
 
