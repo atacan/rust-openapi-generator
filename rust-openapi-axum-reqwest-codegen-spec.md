@@ -24,7 +24,7 @@ The generator MUST make the memory behavior of every body representation predict
 - no generated large-body path may silently call an unbounded whole-body collector;
 - request and response variants are represented as Rust enums wherever OpenAPI describes multiple alternatives, forcing developers to handle documented alternatives explicitly.
 
-This document focuses on request/response body and response-status generation, together with the contract-boundary semantics that keep those invariants airtight: bounded serialization (section 34), pre-handler protocol rejections (section 39), post-commit stream failures (section 40), transport policies (section 30), and the body-presence state machine (section 28). Parameter serialization, authentication, callbacks, links, and schema-generation details are specified separately in the companion document [`openapi-semantics-spec.md`](./openapi-semantics-spec.md) and only referenced here where needed by examples.
+This document focuses on request/response body and response-status generation, together with the contract-boundary semantics that keep those invariants airtight: bounded serialization (section 34), pre-handler protocol rejections (section 39), post-commit stream failures (section 40), transport policies (section 30), and the body-presence state machine (section 28). Parameter serialization, authentication, and schema-generation details are specified separately in the companion document [`openapi-semantics-spec.md`](./openapi-semantics-spec.md) and only referenced here where needed by examples. Callbacks, links, and webhooks remain outside the scope of both documents.
 
 ---
 
@@ -232,13 +232,15 @@ The generated `support` module SHOULD be small and contain only reusable helpers
 
 ### 3.1 Toolchain and dependency version policy
 
+Each released generator version embeds its supported framework tuple and toolchain floor as versioned metadata — for example: *generator 0.x targets Axum `0.8.x`, Reqwest `0.12.x`, `http` `1.x`, `bytes` `1.x`, MSRV 1.85*. Supported versions are a property of the generator release, never computed from ecosystem state at generation time; this keeps output deterministic across machines and points in time.
+
 Generated crates declare:
 
-- a generator-pinned **MSRV**, defaulting to the oldest stable Rust supported by the current minor releases of Axum and Reqwest at generation time;
-- caret version requirements for Axum (`0.8`), Reqwest (`0.12`), `http` (`1`), and `bytes` (`1`) by default, overridable through generator configuration;
+- caret version requirements matching the generator release's embedded tuple, overridable through generator configuration;
+- the pinned MSRV in `rust-version`;
 - no floating pre-release or path dependencies.
 
-The generator itself documents which Axum/Reqwest major versions it supports; generating for an unsupported combination is an error, not best-effort output, so that emitted code can rely on concrete framework APIs.
+Generating against an unsupported framework combination is an error, not best-effort output, so emitted code can rely on concrete framework APIs.
 
 ---
 
@@ -1043,7 +1045,15 @@ impl Client {
         let request = self.http.post(self.url("/imports")?);
 
         let request = match body {
-            CreateImportRequestBody::Json(value) => request.json(&value),
+            CreateImportRequestBody::Json(value) => {
+                // Bounded request serialization (section 34); Reqwest's `.json()`
+                // convenience is deliberately not used.
+                let payload =
+                    serialize_json_limited(&value, self.limits.structured_encode_bytes)?;
+                request
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(payload)
+            }
             CreateImportRequestBody::OctetStream(body) => request
                 .header(http::header::CONTENT_TYPE, "application/octet-stream")
                 .body(body),
@@ -1994,6 +2004,8 @@ A JSON-family policy may also recognize `application/vnd.foo+json` when the Open
 | Optional body, empty bytes | decoded as absent (`None`), regardless of headers | absent variant |
 | Optional body, nonempty bytes, no `Content-Type` | `415` rejection; generated code does not sniff bytes to guess | `ClientError::UnexpectedContentType` |
 
+Implementation invariant (peek-and-preserve): body emptiness cannot be inferred from `Content-Length`, which may be absent on chunked HTTP/1.1 and HTTP/2 transfers. For optional-body operations the generated router therefore decides presence by awaiting the first body data frame, subject to a small bounded peek cap (`peek_buffer_bytes`). When bytes arrive, the router preserves the peeked frame by re-prepending it to the stream passed onward for decoding; it never collects the whole body to determine emptiness and never discards buffered frames.
+
 ### 28.3 Empty bodies with Content-Type present
 
 - An empty body on an optional-body operation is absent (`None`) even when a well-formed matching `Content-Type` is present. Header presence does not fabricate a value; absence of body bytes wins.
@@ -2033,7 +2045,7 @@ On the server, returning an enum representation incompatible with the request's 
 
 ---
 
-## 30. Generated client transport policies
+## 30. Transport policies
 
 Reqwest exposes transport behaviors that can silently alter protocol semantics. Because the generated client promises that documented statuses are observable through exhaustive enums, these behaviors MUST be pinned down instead of inheriting defaults accidentally.
 
@@ -2060,6 +2072,12 @@ Transparent decompression (`gzip`, `br`, `deflate`, `zstd`) MAY be enabled via g
 ### 30.3 Other transport knobs
 
 Timeouts, proxies, connection pooling, and TLS configuration are out of scope for this specification. The generated builder MAY expose them pass-through, but their defaults are Reqwest defaults, deliberately not overridden by the generator.
+
+### 30.4 Server-side request content coding
+
+Inbound requests are the more security-sensitive decompression path because attackers control them directly. For v1 the policy is **identity-only**: the generated router accepts requests whose `Content-Encoding` is absent or `identity`; any other coding yields a `415` `ProtocolRejection` (`UnsupportedContentCoding`) before any body byte is decoded. This closes the request-direction decompression-bomb path entirely.
+
+Transparent request decompression with post-decompression `structured_request_bytes` accounting MAY be added later as an explicit opt-in generator feature; it MUST NOT run by default.
 
 ---
 
@@ -2199,6 +2217,8 @@ Beyond the 204 rule in section 14, several statuses and methods have wire-level 
 
 A `HEAD` operation in OpenAPI typically documents the metadata (headers, media type, length) of the representation a `GET` would return while having no body to decode. The generated HEAD decoder therefore produces the status variant with typed headers and no body field, regardless of any documented content entry.
 
+Consistency rule: informational statuses are transport-layer events, never operation outcomes. OpenAPI response entries that attempt to model them as ordinary operation results (`'100'`–`'199'` keys or `1XX` ranges) are rejected at parse/normalization time with a diagnostic rather than being emitted as unreachable enum variants. This is the explicit exception to "every documented response status becomes an enum variant" (section 53).
+
 ---
 
 ## 36. Errors versus documented responses
@@ -2217,14 +2237,24 @@ Result<OperationResponse, ClientError>
 pub enum ClientError {
     Transport(reqwest::Error),
     InvalidUrl(...),
-    BodyTooLarge { limit: usize },
+    BodyTooLarge { direction: BodyLimitDirection, limit: usize },
+    RedirectRequiresReplayableBody,
     Decode { content_type: Option<mime::Mime>, source: ... },
     MissingRequiredHeader { name: http::HeaderName },
     InvalidHeader { name: http::HeaderName, source: ... },
     UnexpectedContentType { expected: ..., actual: ... },
     UndocumentedStatus { status: http::StatusCode },
 }
+
+pub enum BodyLimitDirection {
+    /// Request serialization exceeded `structured_encode_bytes` (section 34.2).
+    Encode,
+    /// Response collection exceeded a decode limit.
+    Decode,
+}
 ```
+
+This section is the single authoritative definition of `ClientError`. Every other section of this specification references variants defined here; generated code MUST NOT invent ad-hoc client error shapes outside this enum.
 
 A documented `404` is NOT `ClientError`; it is an enum variant.
 
@@ -2266,6 +2296,7 @@ Generated server routing SHOULD validate before calling application code:
 - path/query/header parameter syntax;
 - required parameters;
 - `Content-Type` compatibility;
+- request `Content-Encoding` is absent or `identity` (section 30.4);
 - bounded structured body size;
 - JSON/form syntax;
 - required structured fields through Serde/schema validation policy.
@@ -2298,6 +2329,7 @@ pub enum RejectionKind {
     SchemaViolation,      // well-formed body violating the schema
     BodyTooLarge,         // bounded collection limit exceeded
     UnsupportedMediaType, // missing/unmatched Content-Type where a body is admitted
+    UnsupportedContentCoding, // request Content-Encoding other than absent/identity (section 30.4)
 }
 ```
 
@@ -2309,6 +2341,7 @@ Canonical status mapping:
 | Syntactically malformed JSON/form/multipart framing | `400` |
 | Body exceeding the configured structured limit | `413` |
 | Missing, unparsable, wildcard, or unmatched `Content-Type` on a body-bearing request | `415` |
+| Request `Content-Encoding` other than absent/`identity` | `415` |
 | Well-formed body failing Serde/schema validation (e.g. missing required fields) | `422` |
 
 Contract-boundary rules:
@@ -2818,6 +2851,10 @@ Reproducibility and conformance testing:
 42. Property tests decode NDJSON/JSON-seq/SSE bodies split at every possible chunk boundary against unsplit decoding.
 43. Differential round trips: generated client against generated server over a real listener must reproduce identical values for every operation in the fixture corpus.
 44. MSRV build: CI builds generated crates on the pinned MSRV toolchain.
+45. Identity-only inbound content coding: a gzipped request body yields `415` before any decoding (section 30.4).
+46. Optional-body presence detection works without `Content-Length` (chunked transfer): presence decided by first-frame peek and peeked bytes are delivered exactly once downstream (section 28.2).
+47. Presence/nullability matrix: a missing required-nullable property fails validation; an explicit `null` on an optional non-nullable property fails (companion section 2.1).
+48. `oneOf` ambiguity: a document validating more than one branch is rejected rather than resolved by declaration order (companion section 4.2).
 
 Memory tests should use a synthetic producer that generates far more bytes than allowed by process memory, proving behavior rather than relying only on code inspection.
 
@@ -2936,7 +2973,7 @@ The generator SHOULD behave according to these concise rules:
 
 1. **Generate directly for Reqwest and Axum.**
 2. **Share schema models, not HTTP body abstractions.**
-3. **Every documented response status becomes an enum variant.**
+3. **Every documented final response status becomes an enum variant.** Informational (1xx) statuses are transport-layer events, never operation outcomes, and entries modeling them are rejected at parse time (section 35).
 4. **Every set of alternative content types becomes a nested enum.**
 5. **Documented HTTP outcomes are values, not `Result::Err`.**
 6. **Transport/decode/protocol failures use `Result::Err`.**

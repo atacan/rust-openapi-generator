@@ -20,7 +20,7 @@ The main specification defines generated request/response bodies, status/content
 - server/base-URL handling;
 - naming collisions and Rust keywords.
 
-Each subsection is marked **Decided**, **Proposed**, or **Open**. Nothing here may contradict the main specification; where interaction occurs, the main document's contract-boundary sections (28, 34, 39, 40) win.
+Callbacks, links, and webhooks are out of scope for both documents (main spec section 1). Each subsection below is marked **Decided**, **Proposed**, or **Open**. Nothing here may contradict the main specification; where interaction occurs, the main document's contract-boundary sections (28, 34, 39, 40) win.
 
 ---
 
@@ -32,11 +32,28 @@ Normalization table (initial):
 
 | 3.0 construct | IR representation |
 |---|---|
-| `nullable: true` on a schema | null-capable union (`Option<T>` at property level) |
+| `nullable: true` on a schema | nullability dimension recorded alongside the presence dimension (section 2.1) |
 | boolean `exclusiveMinimum`/`exclusiveMaximum` | numeric comparison metadata |
 | `example` (singular) | example metadata |
 | `type: string, format: binary` | binary payload marker (main spec section 5.3) |
 | deprecated `binary`/`file` type forms | normalized to string+binary |
+
+### 2.1 Property presence versus value nullability
+
+Serde's plain `Option<T>` conflates a missing property with an explicit JSON `null`. Because required-but-nullable and optional-but-non-nullable properties have different contract meanings, the IR records **two independent dimensions** per property — presence and nullability — and the generator maps them explicitly:
+
+| Presence | Nullability | Generated representation |
+|---|---|---|
+| required | non-nullable | `T` — missing key and explicit `null` both fail deserialization |
+| required | nullable | `Option<T>` decoded through a presence-aware adapter — explicit `null` yields `None`; a missing key is a schema violation |
+| optional | non-nullable | support wrapper `OptionalField<T>` (`Absent` / `Present(T)`) — missing key yields `Absent`; explicit `null` is a decode error |
+| optional | nullable | `Option<T>` — absence and `null` both yield `None` |
+
+Notes:
+
+- generated structs therefore cannot rely on bare derived `Option` behavior where the contract distinguishes the cases; presence-aware adapters and wrapper types live in the generated support module;
+- the optional+nullable conflation matches most contracts; PATCH-style semantics that must distinguish "absent" from "explicit null" can enable a tri-state mode (**Open**: exact shape TBD);
+- this is the schema-level counterpart of the absent-body-versus-JSON-null rule in main spec sections 26–27.
 
 **Open:** 3.1 JSON Schema keyword coverage matrix (`contains`, `unevaluatedProperties`, `prefixItems`, ...): which keywords affect generated types versus being validation-only metadata. Initial position: type-shaping keywords map to code; pure validation keywords attach as runtime-validation metadata per section 9.
 
@@ -48,7 +65,11 @@ Normalization table (initial):
 
 - Reference targets: any component type the generator consumes (schemas, parameters, request bodies, responses, security schemes).
 - JSON Pointer escaping (`~0`, `~1`) handled per RFC 6901.
-- Sibling keys next to `$ref`: ignored with a warning (3.0 behavior); never merged.
+- Sibling semantics are version- and context-dependent, matching the OAS distinction between Reference Objects and Schema Objects that merely contain a `$ref` keyword:
+  - OAS 3.0 **Reference Object**: `$ref` plus the permitted `summary`/`description` siblings; any other sibling keys are ignored with a warning and never merged;
+  - OAS 3.1+/3.2 **Reference Object**: same permitted set; `summary`/`description` are recognized and carried into the IR as reference metadata;
+  - OAS 3.1+/3.2 **Schema Object containing a `$ref` keyword**: this is not a Reference Object; sibling schema keywords are preserved and evaluated together with the referenced schema per JSON Schema 2020-12 conjunction semantics.
+- The parser classifies each node by document version and context before normalization so these three cases never collapse into a single rule.
 - Cycle policy: the IR is graph-aware. Recursion through properties generates heap-indirected types (`Box<T>`); recursion broken by arrays/maps is direct. A schema requiring unbroken self-containment (a value must contain itself) is a generation error.
 - Inline expansion depth cap (configurable) guards pathological nesting; hitting it is an error, not silent truncation.
 
@@ -66,11 +87,16 @@ Normalization table (initial):
 
 ### 4.2 `oneOf` / `anyOf`
 
-**Proposed:** Generated as Rust enums.
+**Decided:**
 
-- With a `discriminator` (property name or mapping): internally tagged enum (`#[serde(tag = "...")]`), mapping entries become explicit variant names.
-- Without: untagged enum (`#[serde(untagged)]`); if two variants can decode the same document, ordering follows declaration order and a warning is emitted.
-- `anyOf` additionally permits intersection documents; initial position treats it identically to `oneOf` for typing purposes, documented as a lossy approximation.
+- `oneOf` means **exactly-one validation**. Generated decoders attempt every branch and fail when zero or more than one branch validates. A document matching multiple branches is a data-level schema violation (main spec `SchemaViolation` → `422` path), never silently resolved by declaration order.
+- Branch sets whose disjointness cannot be proven statically fall back per configuration: either a raw/value representation carrying validation metadata, or a generation error listing the offending schema paths. Silent choose-one enums are forbidden for ambiguous `oneOf`.
+- `anyOf` ("at least one") generates a Rust enum ONLY when the generator can prove the branches are mutually exclusive, using the same proof standard as above. Otherwise it falls back to a raw/value representation with retained validation metadata. The generator MUST NOT emit a choose-one enum for `anyOf`.
+- The discriminator is a selection hint only (per OAS): it may route decoding but never changes a `oneOf` validation verdict.
+
+**Decided (discriminator architecture):** the default is **inspect-select-validate** — read the discriminator property from the raw document, select the candidate branch schema, then deserialize and validate that candidate alone. Collapsing this into native Serde internally-tagged enums is permitted only when static analysis proves wire-shape equivalence: every branch carries the constant tag property with its expected value(s) and no branch has conflicting tag constraints. Otherwise the two-phase codec is emitted even though it is less idiomatic; correctness outranks ergonomics.
+
+With an explicit `mapping`, mapping entries select their targeted schemas directly during the inspect phase.
 
 ### 4.3 Enumerations
 
@@ -81,7 +107,7 @@ Normalization table (initial):
 **Decided:**
 
 - `false` → `#[serde(deny_unknown_fields)]`;
-- absent/`true` → unknown keys ignored;
+- absent/`true` → unknown keys ignored. This is an explicit **lossy model** policy choice, not a claim about OpenAPI semantics: valid extension properties cannot be preserved by the typed model and disappear in round trips. Applications that must preserve them use the schema-valued form or the raw/value fallback;
 - schema-valued → `#[serde(flatten)] additional: HashMap<String, T>` alongside named properties.
 
 **Open:** Free-form object (`type: object` with no properties, no constraint) defaults to `serde_json::Value` vs `Map<String, Value>`.
@@ -94,7 +120,13 @@ Normalization table (initial):
 
 ## 5. Read-only and write-only
 
-**Proposed:** Shared models include all fields. `readOnly` fields carry `#[serde(skip_deserializing)]`-style directionality only in generated operation codecs, not in the shared model, preserving model reuse (main spec section 2.6). Strict directional views are a future opt-in.
+**Decided:** Shared models keep every field; directionality is enforced by generated **directional view types** used by operation codecs.
+
+- for each schema carrying `readOnly`/`writeOnly` fields that appears in message positions, the generator emits thin projection views (for example `WidgetWrite` for encoding requests, `WidgetRead` for decoding responses);
+- request codecs serialize through the write view: `readOnly` fields are omitted from output;
+- response codecs deserialize through the read view: `writeOnly` fields are treated as absent;
+- views convert to and from the shared model cheaply (borrowing field data where possible), so application code keeps operating on shared types;
+- derived Serde impls on the shared model remain untouched — the view boundary makes directionality a compile-time-visible property of generated codecs instead of a runtime filter or schema validation afterthought.
 
 ---
 
