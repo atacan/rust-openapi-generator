@@ -1,0 +1,82 @@
+# Fixture 07 — companion §2.1 presence/nullability matrix plus enum flavors
+# and additionalProperties policies on one document:
+# - MatrixRecord exercises ALL FOUR cells (companion §2.1):
+#     req_plain     required + non-nullable  -> `T`
+#     req_nullable  required + nullable      -> Option<T> via the
+#                     presence-aware adapter (missing key = schema violation)
+#     opt_plain     optional + non-nullable  -> OptionalField<T>
+#     opt_nullable  optional + nullable      -> Option<T> with default
+# - int32 format maps to i32; any other/absent integer format maps to i64.
+# - StringEnum / IntCode / MixedScalar pin string, integer (manual bare-number
+#   codec), and mixed (untagged + Other catch-all) enumerations.
+# - StrictRecord pins additionalProperties: false → deny_unknown_fields.
+# - TaggedBag pins schema-valued additionalProperties → flattened BTreeMap.
+openapi: 3.1.0
+info:
+  title: matrix shapes
+  version: "1"
+paths:
+  /records:
+    post:
+      operationId: createRecord
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MatrixRecord'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatrixRecord'
+components:
+  schemas:
+    MatrixRecord:
+      type: object
+      required: [req_plain, req_nullable]
+      properties:
+        req_plain:
+          type: string
+        req_nullable:
+          type: [string, 'null']
+        opt_plain:
+          type: integer
+          format: int32
+        opt_nullable:
+          type: [integer, 'null']
+        status:
+          $ref: '#/components/schemas/StringStatus'
+        code:
+          $ref: '#/components/schemas/IntCode'
+        anything:
+          $ref: '#/components/schemas/MixedScalar'
+        strict:
+          $ref: '#/components/schemas/StrictRecord'
+        tags:
+          $ref: '#/components/schemas/TaggedBag'
+    StringStatus:
+      type: string
+      enum: [draft, in_review]
+    IntCode:
+      type: integer
+      enum: [1, 2, 4]
+    MixedScalar:
+      enum: ['text', 7, true]
+    StrictRecord:
+      type: object
+      additionalProperties: false
+      required: [key]
+      properties:
+        key:
+          type: string
+    TaggedBag:
+      type: object
+      required: [label]
+      properties:
+        label:
+          type: string
+      additionalProperties:
+        type: string

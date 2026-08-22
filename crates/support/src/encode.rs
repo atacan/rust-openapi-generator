@@ -684,8 +684,9 @@ impl<'a, W: io::Write> ser::Serializer for FormKeyStager<'a, W> {
     }
 }
 
-/// WHATWG application/x-www-form-urlencoded serializer rules.
-fn push_percent_encoded(out: &mut Vec<u8>, value: &str) {
+/// WHATWG application/x-www-form-urlencoded serializer rules; shared with
+/// [`crate::percent::encode_query_component`].
+pub(crate) fn push_percent_encoded(out: &mut Vec<u8>, value: &str) {
     const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
     for &byte in value.as_bytes() {
         match byte {

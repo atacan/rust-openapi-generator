@@ -204,3 +204,54 @@ workspace lockfile pins `url = 2.5.4`, `idna = 1.0.3`, `idna_adapter = 1.2.0` (i
 the pinned tuple builds cleanly; when Phase 1 emits generated-crate manifests, the generator ships
 a documented transitive-pin table (or equivalent guidance) so MSRV consumers resolve compatible
 versions deterministically rather than discovering breakage at lock time.
+
+---
+
+## D. Phase 1 implementation choices
+
+### D-impl-clienterror-location Single authoritative `ClientError`
+`ClientError` and `BodyLimitDirection` (main spec §36, "the single authoritative definition") live
+in `openapi-support` behind the `client` feature and generated clients re-export them. Generated
+code never invents variants outside §36.
+
+### D-impl-views-phase1 Directional views land in Phase 1
+Companion §5 is Decided and shapes generated public types, so read/write view generation ships
+with model codegen in Phase 1 rather than being retrofitted in Phase 2. Models without
+`readOnly`/`writeOnly` fields get no view types (identity).
+
+### D-impl-async-trait Generated server traits use `async-trait`
+Spec examples annotate API traits with `#[async_trait::async_trait]`; dyn-dispatchable traits are
+required for router construction over an application-supplied trait object. Dependency authorized:
+`async-trait = "0.1"`.
+
+### D-impl-codegen-emission String-template emission verified by rustfmt
+Codegen emits source as deterministic strings (no syn/quote dependency); the verification suite
+asserts emitted output is `rustfmt`-clean (main spec §50 test 40) by invoking the installed
+`rustfmt` binary in tests.
+
+### D-impl-server-mode-a Mode A is the generated server default
+Trait methods return the documented response enum directly (main spec §37 Mode A). Mode B
+(`AppError` hook) is deferred until a phase that scopes it.
+
+### D-impl-charset-rejection Unsupported charsets map to `MalformedBody`
+Main spec §28.4: textual bodies with a `charset` outside the UTF-8 family yield decode errors.
+Server-side this is a `ProtocolRejection` with kind `MalformedBody` (400); client-side it surfaces
+as `ClientError::Decode`.
+
+### D-impl-relative-servers Relative server URLs stay relative in generated defaults
+Resolving relative `servers` entries against the declaring document's file location would embed
+machine-specific paths into generated output and violate byte-for-byte reproducibility (main spec
+§50 test 39). Decision: absolute server URLs are baked as the default base; relative entries are
+emitted verbatim and the generated `ClientBuilder` requires an explicit base URL when no absolute
+default exists. Server-variable substitution follows companion §8 (builder parameters, declared
+defaults, enum validation).
+
+### D-impl-runtime-validation-timing Bucket-2 runtime validators ship in Phase 2
+Phase 1 enforces structural validation only (types, required fields — via Serde decode failures,
+translated per §39: syntax → `MalformedBody` 400, data errors → `SchemaViolation` 422).
+Constraint metadata (pattern/min/max/format, companion §9 bucket 2) is carried in the IR and
+doc-comments but enforced at runtime starting Phase 2.
+
+### D-impl-flatten-map-deterministic Schema-valued additionalProperties uses `BTreeMap`
+`#[serde(flatten)]` maps serialize in iteration order; `BTreeMap<String, T>` keeps runtime wire
+bytes deterministic (sorted keys) consistent with the D-§4.4 sorted-key choice.
