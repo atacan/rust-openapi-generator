@@ -1,0 +1,15 @@
+[package]
+name = "openapi-to-rust-generator"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "openapi-to-rust"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+thiserror = "2"
