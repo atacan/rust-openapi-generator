@@ -13,6 +13,7 @@
 pub mod collect;
 pub mod content_coding;
 pub mod encode;
+pub mod form;
 pub mod hooks;
 pub mod limits;
 pub mod mediatype;
@@ -28,3 +29,5 @@ pub mod client_error;
 pub mod multipart;
 #[cfg(feature = "server")]
 pub mod peek;
+#[cfg(feature = "server")]
+pub mod response_headers;

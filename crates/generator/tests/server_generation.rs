@@ -28,6 +28,7 @@ const SNAPSHOT_FIXTURES: &[&str] = &[
     "06b_oas31.yaml",
     "07_matrix.yaml",
     "08_views.yaml",
+    "10_forms_headers.yaml",
 ];
 
 /// Every fixture must plan + render without diagnostics.
@@ -41,6 +42,7 @@ const ALL_FIXTURES: &[&str] = &[
     "06b_oas31.yaml",
     "07_matrix.yaml",
     "08_views.yaml",
+    "10_forms_headers.yaml",
 ];
 
 fn fixtures_dir() -> PathBuf {
@@ -518,4 +520,218 @@ fn enum_block(output: &str, name: &str) -> String {
 
 fn struct_block(output: &str, name: &str) -> String {
     item_block(output, &format!("pub struct {name} {{"))
+}
+
+// ----------------------------------------------------------------------
+// Typed response headers (§15) + forms (§16) — synthetic document
+// ----------------------------------------------------------------------
+
+const HEADERS_FIXTURE: &str = r#"openapi: 3.1.0
+info:
+  title: typed headers
+  version: "1"
+paths:
+  /multi:
+    get:
+      operationId: getMulti
+      responses:
+        '200':
+          description: Either representation plus typed headers
+          headers:
+            X-Request-Id:
+              required: true
+              schema:
+                type: string
+            Retry-After-Seconds:
+              schema:
+                type: integer
+                format: int32
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Doc'
+            text/plain:
+              schema:
+                type: string
+        '302':
+          description: Redirect with a header and no body
+          headers:
+            Location:
+              required: true
+              schema:
+                type: string
+  /forms:
+    post:
+      operationId: postForm
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/FormIn'
+      responses:
+        '201':
+          description: Created with typed headers
+          headers:
+            Location:
+              required: true
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Doc'
+components:
+  schemas:
+    Doc:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+    FormIn:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        count:
+          type: integer
+          format: int32
+"#;
+
+static HEADERS_RUN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn generate_headers_fixture() -> String {
+    let id = HEADERS_RUN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("o2r-server-headers-{}-{id}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create fixture dir");
+    let fixture_path = dir.join("typed_headers.yaml");
+    std::fs::write(&fixture_path, HEADERS_FIXTURE).expect("write synthetic fixture");
+
+    let ir = load_document("typed_headers.yaml", &dir, &LoadConfig::default())
+        .unwrap_or_else(|diags| panic!("headers fixture must load: {diags:?}"));
+    let doc = normalize_with_config(ir, &NormalizeConfig::default())
+        .unwrap_or_else(|diags| panic!("headers fixture must normalize: {diags:?}"));
+    let plan =
+        plan_api(&doc).unwrap_or_else(|diags| panic!("headers fixture must plan: {diags:?}"));
+    let output = generate_server(&doc, &plan);
+    let _ = std::fs::remove_dir_all(&dir);
+    output
+}
+
+/// Pins the §15 Output B server shapes that no committed fixture covers:
+/// multi-content hoisting onto the status VARIANT, the header-only struct
+/// variant, and the §48 checked constructor on typed wrapper payloads.
+#[test]
+fn headers_hoist_and_header_only_variants_are_pinned() {
+    let output = generate_headers_fixture();
+
+    // Multi-content WITH documented headers: fields hoist onto the VARIANT.
+    let response_enum = enum_block(&output, "GetMultiResponse");
+    assert!(
+        response_enum.contains("pub x_request_id: String,"),
+        "{response_enum}"
+    );
+    assert!(
+        response_enum.contains("pub retry_after_seconds: Option<i32>,"),
+        "{response_enum}"
+    );
+    assert!(
+        response_enum.contains("content: GetMulti200Content,"),
+        "{response_enum}"
+    );
+
+    // Header-only 302: exactly the typed headers, never a body field.
+    assert!(output.contains("Found302 {"), "\n{output}");
+    assert!(
+        response_enum.contains("pub location: String,"),
+        "{response_enum}"
+    );
+
+    // Typed wrapper payload for the 201 carries Location + a domain body,
+    // plus its §48 checked constructor.
+    let wrapper = struct_block(&output, "PostForm201");
+    assert!(wrapper.contains("pub location: String,"), "{wrapper}");
+    assert!(wrapper.contains("pub body: Doc,"), "{wrapper}");
+    let ctor = item_block(&output, "pub fn new(");
+    assert!(
+        ctor.contains(
+            "::openapi_support::response_headers::checked_value(\"location\", &location)?;"
+        ),
+        "{ctor}"
+    );
+
+    // The IntoResponse path writes the collected headers through the shared
+    // helper whose failure takes the §34.1 fallback.
+    assert!(output.contains("fn write_typed_headers("), "\n{output}");
+    assert!(
+        output.contains("hook.on_encode_overflow(operation_id, variant, 0);"),
+        "header-conversion failure fires the hook:\n{output}"
+    );
+}
+
+/// The generated router self-decodes forms through the bounded support
+/// decoder; axum's `Form` extractor is never used (main spec §16).
+#[test]
+fn form_requests_decode_through_the_support_decoder() {
+    let output = generate_headers_fixture();
+
+    let handler = item_block(&output, "async fn route_post_form(");
+    assert!(
+        handler.contains("decode_form_body(&bytes, limits.structured_request_bytes)?;"),
+        "form bodies decode bounded (§16):\n{handler}"
+    );
+    assert!(
+        handler.contains("if bytes.is_empty() {"),
+        "empty body on a required form is MalformedBody (§28.3):\n{handler}"
+    );
+    assert!(!handler.contains("axum::Form"), "{handler}");
+
+    let decoder = item_block(&output, "fn decode_form_body<T>(");
+    assert!(
+        decoder.contains("decode_form_limited(bytes, limit)"),
+        "{decoder}"
+    );
+}
+
+/// The synthetic §15 module must also be rustfmt-clean so its emission paths
+/// stay canonical (main spec §50 test 40).
+#[test]
+fn headers_fixture_server_is_rustfmt_clean() {
+    let Some(rustfmt) = locate_rustfmt() else {
+        eprintln!("WARNING: no rustfmt on PATH; skipping");
+        return;
+    };
+    let workdir =
+        std::env::temp_dir().join(format!("o2r-server-headers-fmt-{}-fmt", std::process::id()));
+    std::fs::create_dir_all(&workdir).expect("create fixture dir");
+    let fixture_path = workdir.join("typed_headers.yaml");
+    std::fs::write(&fixture_path, HEADERS_FIXTURE).expect("write synthetic fixture");
+
+    let ir = load_document("typed_headers.yaml", &workdir, &LoadConfig::default())
+        .unwrap_or_else(|diags| panic!("headers fixture must load: {diags:?}"));
+    let doc = normalize_with_config(ir, &NormalizeConfig::default())
+        .unwrap_or_else(|diags| panic!("headers fixture must normalize: {diags:?}"));
+    let plan =
+        plan_api(&doc).unwrap_or_else(|diags| panic!("headers fixture must plan: {diags:?}"));
+    let output = generate_server(&doc, &plan);
+
+    let source = workdir.join("typed_headers.server.rs");
+    std::fs::write(&source, &output).expect("write generated server");
+
+    let checked = std::process::Command::new(&rustfmt)
+        .arg("--edition")
+        .arg("2021")
+        .arg("--check")
+        .arg(&source)
+        .output()
+        .expect("spawn rustfmt");
+    let _ = std::fs::remove_dir_all(&workdir);
+    assert!(
+        checked.status.success(),
+        "synthetic headers server is not rustfmt-clean\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr),
+    );
 }

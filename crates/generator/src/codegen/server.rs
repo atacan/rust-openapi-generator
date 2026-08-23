@@ -77,6 +77,7 @@ pub fn generate_server(doc: &NormalizedDocument, plan: &PlannedApi) -> String {
         || flags.needs_collect_stream
         || flags.needs_json_decode
         || flags.needs_text_decode
+        || flags.needs_form_decode
         || flags.needs_charset_check
         || flags.needs_cookie_decode;
     emit_imports(&mut emitter, &flags);
@@ -165,6 +166,9 @@ enum WrapperShape {
     /// Wildcard entry: the application supplies the concrete Content-Type
     /// because `*/*` is not one (main spec §22).
     Wildcard,
+    /// Decodable single-content entry with documented headers (main spec
+    /// §15): the wrapper carries the typed header fields beside the body.
+    TypedHeaders,
 }
 
 /// Module-level type-name registry for one API: content enums, streaming
@@ -225,9 +229,13 @@ impl ServerLayout {
     }
 }
 
-/// Single-content statuses whose payload streams own a wrapper struct:
-/// binary/raw carry the raw body; wildcards carry the application-supplied
-/// Content-Type beside it. No-body statuses never wrap (§35).
+/// Single-content statuses whose payload owns a wrapper struct: binary/raw
+/// carry the raw body; wildcards carry the application-supplied
+/// Content-Type beside it; decodable entries WITH documented headers carry
+/// the typed header fields (main spec §15, superseding
+/// D-impl-typed-headers-phase2). No-body statuses never wrap (§35), and
+/// range/default statuses with headers keep their struct variants (which
+/// must carry the wire status, §23–§24) instead of wrapping.
 fn wrapper_shape(status: &PlannedStatus) -> Option<WrapperShape> {
     if status.is_no_body_status {
         return None;
@@ -236,10 +244,23 @@ fn wrapper_shape(status: &PlannedStatus) -> Option<WrapperShape> {
         return None;
     };
     if content.is_wildcard {
-        return Some(WrapperShape::Wildcard);
+        return if status.headers.is_empty() || !struct_variant_status(status) {
+            Some(WrapperShape::Wildcard)
+        } else {
+            None
+        };
     }
     match content.media_class {
-        MediaClass::Binary | MediaClass::RawUnknown => Some(WrapperShape::Stream),
+        MediaClass::Binary | MediaClass::RawUnknown => {
+            if status.headers.is_empty() || !struct_variant_status(status) {
+                Some(WrapperShape::Stream)
+            } else {
+                None
+            }
+        }
+        _ if !status.headers.is_empty() && !struct_variant_status(status) => {
+            Some(WrapperShape::TypedHeaders)
+        }
         _ => None,
     }
 }
@@ -270,12 +291,13 @@ fn struct_variant_status(status: &PlannedStatus) -> bool {
 }
 
 /// Structured entries bound-collect and decode; streaming/wildcard entries
-/// pass the body through untouched.
+/// pass the body through untouched. Form bodies decode through the bounded
+/// support decoder (§16).
 fn is_decodable_content(content: &PlannedContent) -> bool {
     !content.is_wildcard
         && matches!(
             content.media_class,
-            MediaClass::JsonFamily | MediaClass::PlainText
+            MediaClass::JsonFamily | MediaClass::PlainText | MediaClass::UrlEncodedForm
         )
 }
 
@@ -301,6 +323,7 @@ struct Flags {
     needs_charset_check: bool,
     needs_json_decode: bool,
     needs_text_decode: bool,
+    needs_form_decode: bool,
     needs_serialize_json: bool,
     needs_encode_text: bool,
     needs_stream_response: bool,
@@ -321,6 +344,9 @@ struct Flags {
     needs_path_extractor: bool,
     needs_raw_query: bool,
     needs_headers_extractor: bool,
+    /// Documented response headers exist somewhere (main spec §15): pulls in
+    /// the typed-header writer plus its §34.1-style failure fallback.
+    needs_typed_headers: bool,
 }
 
 impl Flags {
@@ -370,13 +396,21 @@ impl Flags {
                 self.needs_json_decode = true;
                 self.needs_charset_check = true;
             }
+            MediaClass::UrlEncodedForm => {
+                // Bounded form decode per §16/D-impl-forms; axum's Form
+                // extractor is never used (the router self-decodes).
+                self.model_types
+                    .extend(model_type_names(&content.model_expr));
+                self.needs_form_decode = true;
+                self.needs_charset_check = true;
+            }
             MediaClass::PlainText => {
                 self.needs_text_decode = true;
                 self.needs_charset_check = true;
             }
             MediaClass::Binary | MediaClass::RawUnknown => {}
-            // Planning rejects forms/multipart/SSE/NDJSON/JSON-seq; they are
-            // Phase 2 deliverables (D-impl-forms-phase2) and never reach us.
+            // Planning rejects multipart/SSE/NDJSON/JSON-seq; they are later
+            // deliverables (D-impl-forms-phase2) and never reach us.
             _ => unreachable!(
                 "planner emitted Phase 2 media class {:?}",
                 content.media_class
@@ -385,6 +419,9 @@ impl Flags {
     }
 
     fn scan_status(&mut self, status: &PlannedStatus) {
+        if !status.headers.is_empty() {
+            self.needs_typed_headers = true;
+        }
         for content in effective_contents(status) {
             if content.is_wildcard {
                 self.needs_any_response = true;
@@ -502,11 +539,18 @@ fn emit_header(emitter: &mut Emitter, doc: &NormalizedDocument) {
              Output B)."
                 .to_owned(),
             String::new(),
-            "Mode A traits (§37), bounded JSON/text bodies (§34), streaming \
-             raw payloads (§32), pre-handler protocol rejections outside the \
+            "Mode A traits (§37), bounded JSON/form bodies (§34; axum's Form \
+              extractor is never used — routes self-decode after the §28 \
+             Content-Type dispatch), streaming raw payloads (§32), typed \
+             documented response headers (§15: IntoResponse converts stored \
+             domain values through the well-defined internal error path of \
+             §48, firing the encode hook and emitting the fixed empty 500 on \
+             failure), pre-handler protocol rejections outside the \
              documented enums (§39), identity-only inbound content coding \
-             (§30.4), and the §28 Content-Type dispatch state machine. The \
-             source document declares OpenAPI "
+             (§30.4), and the §28 Content-Type dispatch state machine. \
+             Recorded decision for multi-content statuses WITH documented \
+             headers: the typed fields hoist onto the status VARIANT beside \
+             the content enum. The source document declares OpenAPI "
                 .to_owned()
                 + &doc.raw_version
                 + ".",
@@ -570,6 +614,9 @@ fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
     }
     if flags.needs_serialize_json {
         emitter.line(0, "use ::openapi_support::encode::serialize_json_limited;");
+    }
+    if flags.needs_form_decode {
+        emitter.line(0, "use ::openapi_support::form::decode_form_limited;");
     }
     if flags.has_operations {
         emitter.line(
@@ -703,7 +750,7 @@ fn emit_operation_types(
 /// streaming classes (§32).
 fn payload_type(content: &PlannedContent) -> String {
     match content.media_class {
-        MediaClass::JsonFamily => content.model_expr.clone(),
+        MediaClass::JsonFamily | MediaClass::UrlEncodedForm => content.model_expr.clone(),
         MediaClass::PlainText => "String".to_owned(),
         MediaClass::Binary | MediaClass::RawUnknown => "::axum::body::Body".to_owned(),
         _ => unreachable!(
@@ -804,31 +851,83 @@ fn emit_wrapper(
 ) {
     let payload_doc = match shape {
         WrapperShape::Stream => {
-            "the body streams verbatim; typed documented-header fields \
-             arrive in Phase 2 (D-impl-typed-headers-phase2)"
+            "the body streams verbatim; typed documented-header fields ride \
+             beside it where documented (main spec §15/§32)"
         }
         WrapperShape::Wildcard => {
             "`*/*` is not a concrete media type so the application supplies \
              the actual Content-Type (main spec §22); the body streams \
              verbatim"
         }
+        WrapperShape::TypedHeaders => {
+            "typed payload (main spec §15 Output B): required documented \
+             headers as plain fields, optional ones as `Option<T>`, then the \
+             body stored as a domain value for the bounded encoder"
+        }
     };
-    emitter.docs(
-        0,
-        &[format!(
-            "Payload for status {} of `{}` (main spec §32): {}.",
-            crate::normalize::status_label(&status.key),
-            operation.method,
-            payload_doc
-        )],
-    );
+    if shape == WrapperShape::TypedHeaders {
+        emitter.docs(
+            0,
+            &[format!(
+                "Payload for status {} of `{}`: {}.",
+                crate::normalize::status_label(&status.key),
+                operation.method,
+                payload_doc
+            )],
+        );
+    } else {
+        emitter.docs(
+            0,
+            &[format!(
+                "Payload for status {} of `{}` (main spec §32): {}.",
+                crate::normalize::status_label(&status.key),
+                operation.method,
+                payload_doc
+            )],
+        );
+    }
     emitter.line(0, "#[derive(Debug)]");
     emitter.line(0, &format!("pub struct {name} {{"));
-    if shape == WrapperShape::Wildcard {
-        emitter.line(1, "pub content_type: ::mime::Mime,");
+    emit_header_fields(emitter, status, 1);
+    match shape {
+        WrapperShape::Wildcard => emitter.line(1, "pub content_type: ::mime::Mime,"),
+        // TypedHeaders wrappers store the DECODED domain value (§48's
+        // sanctioned store-domain-values choice), not the raw body.
+        WrapperShape::TypedHeaders => emitter.line(
+            1,
+            &format!(
+                "pub body: {},",
+                payload_type(effective_contents(status).first().expect("single content"))
+            ),
+        ),
+        WrapperShape::Stream => emitter.line(1, "pub body: ::axum::body::Body,"),
     }
-    emitter.line(1, "pub body: ::axum::body::Body,");
     emitter.line(0, "}");
+}
+
+/// Typed documented-header fields of one status (main spec §15): required
+/// headers become plain fields, optional ones `Option<T>`.
+fn emit_header_fields(emitter: &mut Emitter, status: &PlannedStatus, indent: usize) {
+    for header in &status.headers {
+        let field_type = if header.required {
+            header.rust_type.clone()
+        } else {
+            format!("Option<{}>", header.rust_type)
+        };
+        emitter.docs(
+            indent,
+            &[format!(
+                "Documented response header `{}` ({}).",
+                header.wire_name,
+                if header.required {
+                    "required"
+                } else {
+                    "optional"
+                }
+            )],
+        );
+        emitter.line(indent, &format!("pub {}: {field_type},", header.rust_name));
+    }
 }
 
 fn emit_response_enum(
@@ -855,8 +954,11 @@ fn emit_response_enum(
         }
         let contents = effective_contents(status);
         if struct_variant_status(status) {
+            // Ranges/default carry the wire status (§23–§24); documented
+            // headers ride inside the struct variant (§15).
             emitter.line(1, &format!("{} {{", status.enum_variant));
             emitter.line(2, "status: ::http::StatusCode,");
+            emit_header_fields(emitter, status, 2);
             match contents.len() {
                 0 => {}
                 1 => {
@@ -875,6 +977,27 @@ fn emit_response_enum(
                     emitter.line(2, &format!("body: {content_enum},"));
                 }
             }
+            emitter.line(1, "},");
+            continue;
+        }
+        if !status.headers.is_empty() && contents.is_empty() {
+            // Header-only documented response (e.g. 302 + Location): the
+            // variant carries exactly the typed headers.
+            emitter.line(1, &format!("{} {{", status.enum_variant));
+            emit_header_fields(emitter, status, 2);
+            emitter.line(1, "},");
+            continue;
+        }
+        if !status.headers.is_empty() && contents.len() >= 2 {
+            // Multi-content with documented headers: the typed fields hoist
+            // onto the STATUS VARIANT beside the content enum (recorded
+            // decision; see module docs).
+            let content_enum = layout
+                .content_enum(op_index, status_index)
+                .expect("registered");
+            emitter.line(1, &format!("{} {{", status.enum_variant));
+            emit_header_fields(emitter, status, 2);
+            emitter.line(2, &format!("content: {content_enum},"));
             emitter.line(1, "},");
             continue;
         }
@@ -959,10 +1082,31 @@ fn emit_encoding_impl(
         1,
         &["Encodes the documented outcome with the configured limits.".to_owned()],
     );
+    if operation
+        .statuses
+        .iter()
+        .any(|status| !status.headers.is_empty())
+    {
+        // Typed-header arms build their wire list imperatively; clippy's
+        // vec-init-then-push fires when every documented header is
+        // required, so the encoder opts out locally.
+        emitter.line(1, "#[allow(clippy::vec_init_then_push)]");
+    }
     emitter.line(1, "pub fn into_response_with_limits(");
     emitter.line(2, "self,");
-    emitter.line(2, "limits: &BodyLimits,");
-    emitter.line(2, "hook: &dyn EncodeOverflowHook,");
+    // Degenerate operations (every variant is a bare status) never touch
+    // the limits/hook pair; underscore names keep `-D warnings` clean.
+    let arg_uses = operation
+        .statuses
+        .iter()
+        .any(|status| !effective_contents(status).is_empty() || !status.headers.is_empty());
+    let (limits_name, hook_name) = if arg_uses {
+        ("limits", "hook")
+    } else {
+        ("_limits", "_hook")
+    };
+    emitter.line(2, &format!("{limits_name}: &BodyLimits,"));
+    emitter.line(2, &format!("{hook_name}: &dyn EncodeOverflowHook,"));
     emitter.line(1, ") -> ::axum::response::Response {");
     emitter.line(2, "match self {");
     for status_index in 0..operation.statuses.len() {
@@ -992,6 +1136,34 @@ fn emit_encoding_impl(
         }
     }
     emitter.line(0, "}");
+
+    // §48 checked constructors on typed wrapper payloads: String-typed
+    // headers can always fail `HeaderValue` conversion, so `new` validates
+    // eagerly and returns `Err(InvalidResponseHeader)` instead of letting a
+    // bad value surface only at encode time.
+    let mut first_wrapper_ctor = true;
+    for (status_index, _status) in operation.statuses.iter().enumerate() {
+        if layout
+            .wrapper(op_index, status_index)
+            .map(|(_, shape)| *shape)
+            != Some(WrapperShape::TypedHeaders)
+        {
+            continue;
+        }
+        if first_wrapper_ctor {
+            emitter.blank();
+            emitter.docs(
+                0,
+                &["Checked payload constructors validating every convertible \
+                   documented header eagerly (main spec §15/§48)."
+                    .to_owned()],
+            );
+            first_wrapper_ctor = false;
+        } else {
+            emitter.blank();
+        }
+        emit_wrapper_checked_ctor(emitter, operation, layout, op_index, status_index);
+    }
 
     emitter.blank();
     emitter.line(
@@ -1184,8 +1356,9 @@ fn emit_encode_arm(
 
     let constant = explicit_status_expr(status.key).expect("explicit statuses carry constants");
 
-    // Streaming/wildcard wrappers (§32/§22). The arm binds the wrapper value
-    // as `wrapper`, so field accesses must use that binding, not the type.
+    // Streaming/wildcard/typed-header wrappers (§32/§22/§15). The arm binds
+    // the wrapper value as `wrapper`, so field accesses must use that
+    // binding, not the type.
     if let Some((_, shape)) = layout.wrapper(op_index, status_index) {
         let literal = rust_string_literal(&contents[0].media_type_literal);
         let call = match shape {
@@ -1201,21 +1374,58 @@ fn emit_encode_arm(
                     "wrapper.body".to_owned(),
                 ],
             },
+            WrapperShape::TypedHeaders => structured_call(
+                &contents[0],
+                &constant,
+                // structured_call adds the `&` itself.
+                "wrapper.body",
+                "limits",
+                op_id,
+                variant,
+            ),
         };
+        if !status.headers.is_empty() {
+            // §15 with the §48 recorded decision: IntoResponse converts the
+            // stored domain values; a failing conversion fires the hook and
+            // emits the fixed empty 500 (same machinery as §34.1).
+            emitter.line(3, &format!("Self::{variant}(wrapper) => {{"));
+            emit_typed_pushes(emitter, 4, status, HeaderSource::Wrapper);
+            emit_let_call(emitter, 4, "encoded", &call);
+            emit_header_write(emitter, 4, op_id, variant);
+            emitter.line(3, "}");
+            return;
+        }
         emit_call_arm_expr(emitter, 3, &format!("Self::{variant}(wrapper)"), &call);
         return;
     }
 
     match contents.len() {
-        // Unit/no-body statuses: the typed status alone (§35).
+        // Unit statuses (§35) and header-only statuses (§15).
         0 => {
             let inline = format!("Self::{variant} => {constant}.into_response(),");
-            if fits(3, &inline) {
-                emitter.line(3, &inline);
+            if status.headers.is_empty() {
+                if fits(3, &inline) {
+                    emitter.line(3, &inline);
+                } else {
+                    emitter.line(3, &format!("Self::{variant} => {{"));
+                    emitter.line(4, &format!("let status = {constant};"));
+                    emitter.line(4, "status.into_response()");
+                    emitter.line(3, "}");
+                }
             } else {
-                emitter.line(3, &format!("Self::{variant} => {{"));
-                emitter.line(4, &format!("let status = {constant};"));
-                emitter.line(4, "status.into_response()");
+                // Header-only variant: write the typed headers beside the
+                // bare status.
+                emitter.line(
+                    3,
+                    &format!("Self::{variant} {{ {} }} => {{", {
+                        let names: Vec<String> =
+                            status.headers.iter().map(|h| h.rust_name.clone()).collect();
+                        names.join(", ")
+                    }),
+                );
+                emit_typed_pushes(emitter, 4, status, HeaderSource::Local);
+                emitter.line(4, &format!("let encoded = {constant}.into_response();"));
+                emit_header_write(emitter, 4, op_id, variant);
                 emitter.line(3, "}");
             }
         }
@@ -1231,6 +1441,34 @@ fn emit_encode_arm(
             let content_enum = layout
                 .content_enum(op_index, status_index)
                 .expect("registered");
+            if !status.headers.is_empty() {
+                // Headers hoist onto the status VARIANT (recorded decision):
+                // bind them once, then append them to every negotiated
+                // representation's response.
+                let mut names: Vec<String> = status
+                    .headers
+                    .iter()
+                    .map(|header| header.rust_name.clone())
+                    .collect();
+                names.push("content".to_owned());
+                emit_struct_pattern(emitter, 3, &format!("Self::{variant}"), &names);
+                emit_typed_pushes(emitter, 4, status, HeaderSource::Local);
+                emitter.line(4, "match content {");
+                emit_nested_content_arms(
+                    emitter,
+                    content_enum,
+                    contents,
+                    &constant,
+                    "limits",
+                    op_id,
+                    variant,
+                    5,
+                    true,
+                );
+                emitter.line(4, "}");
+                emitter.line(3, "}");
+                return;
+            }
             emitter.line(3, &format!("Self::{variant}(content) => match content {{"));
             emit_nested_content_arms(
                 emitter,
@@ -1241,15 +1479,113 @@ fn emit_encode_arm(
                 op_id,
                 variant,
                 4,
+                false,
             );
             emitter.line(3, "},");
         }
     }
 }
 
+/// Where typed header values live inside an encode arm: wrapper struct
+/// fields (`wrapper.<name>`) or hoisted locals (`<name>`).
+#[derive(Debug, Clone, Copy)]
+enum HeaderSource {
+    Wrapper,
+    Local,
+}
+
+fn header_source_expr(source: HeaderSource, rust_name: &str) -> String {
+    match source {
+        HeaderSource::Wrapper => format!("wrapper.{rust_name}"),
+        HeaderSource::Local => rust_name.to_owned(),
+    }
+}
+
+/// Builds the `Vec<(&'static str, String)>` of documented header values:
+/// strings clone directly; scalars format through Display. Optional fields
+/// contribute only when present.
+fn emit_typed_pushes(
+    emitter: &mut Emitter,
+    indent: usize,
+    status: &PlannedStatus,
+    source: HeaderSource,
+) {
+    emitter.line(
+        indent,
+        "let mut typed_headers = Vec::<(&'static str, String)>::new();",
+    );
+    for header in &status.headers {
+        let wire = rust_string_literal(&header.wire_name.to_ascii_lowercase());
+        let access = header_source_expr(source, &header.rust_name);
+        let value_expr = if header.rust_type == "String" {
+            format!("{access}.clone()")
+        } else {
+            format!("{access}.to_string()")
+        };
+        if header.required {
+            let line = format!("typed_headers.push(({wire}, {value_expr}));");
+            if fits(indent, &line) {
+                emitter.line(indent, &line);
+            } else {
+                emitter.line(indent, "typed_headers.push((");
+                emitter.line(indent + 1, &format!("{wire},"));
+                emitter.line(indent + 1, &format!("{value_expr},"));
+                emitter.line(indent, "));");
+            }
+        } else {
+            emitter.line(
+                indent,
+                &format!("if let Some(value) = {}.as_ref() {{", access),
+            );
+            let line = format!("typed_headers.push(({wire}, value.to_owned()));");
+            if header.rust_type == "String" && fits(indent + 1, &line) {
+                emitter.line(indent + 1, &line);
+            } else if header.rust_type == "String" {
+                emitter.line(indent + 1, "typed_headers.push((");
+                emitter.line(indent + 2, &format!("{wire},"));
+                emitter.line(indent + 2, "value.clone(),");
+                emitter.line(indent + 1, "));");
+            } else if fits(indent + 1, &line.replace("to_owned", "to_string")) {
+                emitter.line(
+                    indent + 1,
+                    &format!("typed_headers.push(({wire}, value.to_string()));"),
+                );
+            } else {
+                emitter.line(indent + 1, "typed_headers.push((");
+                emitter.line(indent + 2, &format!("{wire},"));
+                emitter.line(indent + 2, "value.to_string(),");
+                emitter.line(indent + 1, "));");
+            }
+            emitter.line(indent, "}");
+        }
+    }
+}
+
+/// Appends the collected typed headers to the encoded response; a failing
+/// `HeaderValue` conversion takes the §34.1-style fallback path.
+fn emit_header_write(emitter: &mut Emitter, indent: usize, op_id: &str, variant: &str) {
+    let line = format!(
+        "write_typed_headers(encoded, hook, {}, {}, &typed_headers)",
+        rust_string_literal(op_id),
+        rust_string_literal(variant)
+    );
+    if fits(indent, &line) {
+        emitter.line(indent, &line);
+    } else {
+        emitter.line(indent, "write_typed_headers(");
+        emitter.line(indent + 1, "encoded,");
+        emitter.line(indent + 1, "hook,");
+        emitter.line(indent + 1, &format!("{},", rust_string_literal(op_id)));
+        emitter.line(indent + 1, &format!("{},", rust_string_literal(variant)));
+        emitter.line(indent + 1, "&typed_headers,");
+        emitter.line(indent, ")");
+    }
+}
+
 /// Nested content-enum arms: every representation encodes with its own
 /// Content-Type literal (main spec §11/§41); wildcards stream with the
-/// application-supplied mime (§22).
+/// application-supplied mime (§22). When `with_headers` is set, each arm
+/// binds its encoded response and appends the hoisted typed headers.
 #[allow(clippy::too_many_arguments)]
 fn emit_nested_content_arms(
     emitter: &mut Emitter,
@@ -1260,6 +1596,7 @@ fn emit_nested_content_arms(
     op_id: &str,
     variant: &str,
     indent: usize,
+    with_headers: bool,
 ) {
     for content in contents {
         if content.is_wildcard {
@@ -1267,15 +1604,62 @@ fn emit_nested_content_arms(
                 "{content_enum}::{} {{ content_type, body }}",
                 content.variant_name
             );
-            emit_call_arm_expr(emitter, indent, &pattern, &any_call(status_arg));
+            if with_headers {
+                emit_header_write_arm(
+                    emitter,
+                    indent,
+                    &pattern,
+                    &any_call(status_arg),
+                    op_id,
+                    variant,
+                );
+            } else {
+                emit_call_arm_expr(emitter, indent, &pattern, &any_call(status_arg));
+            }
             continue;
         }
         // The arm binds the variant payload as `value`; streaming payloads
         // ARE the raw axum body, so `value` is passed through unchanged.
         let call = structured_call(content, status_arg, "value", limits_arg, op_id, variant);
         let pattern = format!("{content_enum}::{}(value)", content.variant_name);
-        emit_call_arm_expr(emitter, indent, &pattern, &call);
+        if with_headers {
+            emit_header_write_arm(emitter, indent, &pattern, &call, op_id, variant);
+        } else {
+            emit_call_arm_expr(emitter, indent, &pattern, &call);
+        }
     }
+}
+
+/// One nested arm that binds `encoded` then appends the typed headers.
+fn emit_header_write_arm(
+    emitter: &mut Emitter,
+    indent: usize,
+    pattern: &str,
+    call: &EncodeCall,
+    op_id: &str,
+    variant: &str,
+) {
+    emitter.line(indent, &format!("{pattern} => {{"));
+    emit_let_call(emitter, indent + 1, "encoded", call);
+    emit_header_write(emitter, indent + 1, op_id, variant);
+    emitter.line(indent, "}"); // trailing comma handled by caller context
+}
+
+/// Emits `let <binding> = <call>;` with rustfmt-canonical wrapping: inline
+/// when it fits, otherwise the argument list breaks vertically and the
+/// semicolon rides the closing paren.
+fn emit_let_call(emitter: &mut Emitter, indent: usize, binding: &str, call: &EncodeCall) {
+    let joined = call.args.join(", ");
+    let inline = format!("let {binding} = {}({joined});", call.callee);
+    if fits(indent, &inline) {
+        emitter.line(indent, &inline);
+        return;
+    }
+    emitter.line(indent, &format!("let {binding} = {}(", call.callee));
+    for arg in &call.args {
+        emitter.line(indent + 1, &format!("{arg},"));
+    }
+    emitter.line(indent, ");");
 }
 
 /// Range/default arm: debug-assert membership, then encode the carried
@@ -1307,20 +1691,38 @@ fn emit_range_default_arm(
         ResponseStatusKey::Explicit(_) => unreachable!("handled elsewhere"),
     };
 
-    let fields = match contents.len() {
-        0 => "status",
-        1 if contents[0].is_wildcard => "status, content_type, body",
-        _ => "status, body",
-    };
-    emitter.line(3, &format!("Self::{variant} {{ {fields} }} => {{"));
+    let mut field_names: Vec<String> = vec!["status".to_owned()];
+    for header in &status.headers {
+        field_names.push(header.rust_name.clone());
+    }
+    match contents.len() {
+        0 => {}
+        1 if contents[0].is_wildcard => {
+            field_names.push("content_type".to_owned());
+            field_names.push("body".to_owned());
+        }
+        _ => field_names.push("body".to_owned()),
+    }
+    emit_struct_pattern(emitter, 3, &format!("Self::{variant}"), &field_names);
     emitter.line(4, "debug_assert!(");
     emitter.line(5, &format!("{assertion},"));
     emitter.line(5, &format!("{},", rust_string_literal(&message)));
     emitter.line(4, ");");
 
+    // Documented headers append to every encoded representation (§15).
+    let has_headers = !status.headers.is_empty();
+    if has_headers {
+        emit_typed_pushes(emitter, 4, status, HeaderSource::Local);
+    }
+
     match contents.len() {
         0 => {
-            emitter.line(4, "status.into_response()");
+            if has_headers {
+                emitter.line(4, "let encoded = status.into_response();");
+                emit_header_write(emitter, 4, op_id, variant);
+            } else {
+                emitter.line(4, "status.into_response()");
+            }
         }
         1 => {
             let content = &contents[0];
@@ -1329,7 +1731,12 @@ fn emit_range_default_arm(
             } else {
                 structured_call(content, "status", "body", "limits", op_id, variant)
             };
-            emit_call_at(emitter, 4, &call);
+            if has_headers {
+                emit_let_call(emitter, 4, "encoded", &call);
+                emit_header_write(emitter, 4, op_id, variant);
+            } else {
+                emit_call_at(emitter, 4, &call);
+            }
         }
         _ => {
             let content_enum = layout
@@ -1345,6 +1752,7 @@ fn emit_range_default_arm(
                 op_id,
                 variant,
                 5,
+                has_headers,
             );
             emitter.line(4, "}");
         }
@@ -1353,6 +1761,9 @@ fn emit_range_default_arm(
 }
 
 /// Checked constructor validating the carried status (main spec §48).
+/// Documented headers ride as plain domain-value parameters: per §48's
+/// sanctioned alternative they are stored verbatim and validated at
+/// encode time through the well-defined internal error path.
 fn emit_checked_ctor(
     emitter: &mut Emitter,
     operation: &PlannedOperation,
@@ -1365,15 +1776,37 @@ fn emit_checked_ctor(
     let constructor = checked_ctor_name(status);
     let contents = effective_contents(status);
 
-    let params = match contents.len() {
-        0 => vec!["status: ::http::StatusCode".to_owned()],
-        _ => vec![
-            "status: ::http::StatusCode".to_owned(),
-            format!(
-                "body: {}",
-                ctor_body_type(operation, layout, op_index, status_index)
-            ),
-        ],
+    let mut params = vec!["status: ::http::StatusCode".to_owned()];
+    for header in &status.headers {
+        let field_type = if header.required {
+            header.rust_type.clone()
+        } else {
+            format!("Option<{}>", header.rust_type)
+        };
+        params.push(format!("{}: {field_type}", header.rust_name));
+    }
+    if !contents.is_empty() {
+        params.push(format!(
+            "body: {}",
+            ctor_body_type(operation, layout, op_index, status_index)
+        ));
+    }
+
+    let ctor_fields = |status: &PlannedStatus| -> Vec<String> {
+        let mut names = vec!["status".to_owned()];
+        for header in &status.headers {
+            names.push(header.rust_name.clone());
+        }
+        let contents = effective_contents(status);
+        match contents.len() {
+            0 => {}
+            1 if contents[0].is_wildcard => {
+                names.push("content_type".to_owned());
+                names.push("body".to_owned());
+            }
+            _ => names.push("body".to_owned()),
+        }
+        names
     };
 
     match status.key {
@@ -1391,7 +1824,13 @@ fn emit_checked_ctor(
                 2,
                 &format!("if ({low}..{high}).contains(&status.as_u16()) {{"),
             );
-            emit_ctor_ok(emitter, status, 3);
+            emit_struct_literal(
+                emitter,
+                3,
+                &format!("Ok(Self::{variant}"),
+                &ctor_fields(status),
+                ")",
+            );
             emitter.line(2, "} else {");
             emitter.line(3, "Err(InvalidStatusRange)");
             emitter.line(2, "}");
@@ -1414,19 +1853,12 @@ fn emit_checked_ctor(
                 emitter.line(3, "return Err(InvalidStatusRange);");
                 emitter.line(2, "}");
             }
-            emitter.line(
+            emit_struct_literal(
+                emitter,
                 2,
-                &format!(
-                    "Ok(Self::{} {{ {} }})",
-                    status.enum_variant,
-                    match contents.len() {
-                        0 => "status".to_owned(),
-                        1 if contents[0].is_wildcard => {
-                            "status, content_type, body".to_owned()
-                        }
-                        _ => "status, body".to_owned(),
-                    }
-                ),
+                &format!("Ok(Self::{}", status.enum_variant),
+                &ctor_fields(status),
+                ")",
             );
         }
         ResponseStatusKey::Explicit(_) => unreachable!("checked ctors cover ranges/default only"),
@@ -1474,19 +1906,152 @@ fn ctor_body_type(
     }
 }
 
-fn emit_ctor_ok(emitter: &mut Emitter, status: &PlannedStatus, indent: usize) {
+/// Checked constructor on a §15 typed wrapper payload: validates every
+/// String-typed header eagerly (main spec §48); scalar fields cannot fail
+/// conversion and skip validation.
+fn emit_wrapper_checked_ctor(
+    emitter: &mut Emitter,
+    operation: &PlannedOperation,
+    layout: &ServerLayout,
+    op_index: usize,
+    status_index: usize,
+) {
+    let status = &operation.statuses[status_index];
+    let (wrapper, _) = layout
+        .wrapper(op_index, status_index)
+        .expect("typed wrapper registered");
     let contents = effective_contents(status);
-    let expression = match contents.len() {
-        0 => format!("Ok(Self::{} {{ status }})", status.enum_variant),
-        1 if contents[0].is_wildcard => {
-            format!(
-                "Ok(Self::{} {{ status, content_type, body }})",
-                status.enum_variant
-            )
+
+    let mut params: Vec<String> = Vec::new();
+    for header in &status.headers {
+        let field_type = if header.required {
+            header.rust_type.clone()
+        } else {
+            format!("Option<{}>", header.rust_type)
+        };
+        params.push(format!("{}: {field_type}", header.rust_name));
+    }
+    params.push(format!(
+        "body: {}",
+        match contents.len() {
+            1 => payload_type(&contents[0]),
+            _ => layout
+                .content_enum(op_index, status_index)
+                .expect("registered")
+                .to_owned(),
         }
-        _ => format!("Ok(Self::{} {{ status, body }})", status.enum_variant),
-    };
-    emitter.line(indent, &expression);
+    ));
+    emit_ctor_signature_named(
+        emitter,
+        wrapper,
+        "new",
+        &params,
+        "Result<Self, ::openapi_support::response_headers::InvalidResponseHeader>",
+    );
+    for header in &status.headers {
+        if header.rust_type != "String" {
+            continue;
+        }
+        if header.required {
+            emitter.line(
+                2,
+                &format!(
+                    "::openapi_support::response_headers::checked_value({}, &{})?;",
+                    rust_string_literal(&header.wire_name.to_ascii_lowercase()),
+                    header.rust_name
+                ),
+            );
+        } else {
+            emitter.line(
+                2,
+                &format!("if let Some(value) = {}.as_ref() {{", header.rust_name),
+            );
+            emitter.line(
+                3,
+                &format!(
+                    "::openapi_support::response_headers::checked_value({}, value)?;",
+                    rust_string_literal(&header.wire_name.to_ascii_lowercase())
+                ),
+            );
+            emitter.line(2, "}");
+        }
+    }
+    let mut fields: Vec<String> = status
+        .headers
+        .iter()
+        .map(|header| header.rust_name.clone())
+        .collect();
+    fields.push("body".to_owned());
+    emit_struct_literal(emitter, 2, "Ok(Self", &fields, ")");
+    emitter.line(1, "}");
+    emitter.line(0, "}");
+}
+
+/// Emits a struct-variant match pattern with rustfmt's observed canonical
+/// layout: one line for at most two fields, vertical beyond that; always
+/// closes with `} => {`.
+fn emit_struct_pattern(emitter: &mut Emitter, indent: usize, head: &str, fields: &[String]) {
+    let joined = fields.join(", ");
+    let inline = format!("{head} {{ {joined} }} => {{");
+    if fields.len() <= 2 && fits(indent, &inline) {
+        emitter.line(indent, &inline);
+        return;
+    }
+    emitter.line(indent, &format!("{head} {{"));
+    for field in fields {
+        emitter.line(indent + 1, &format!("{field},"));
+    }
+    emitter.line(indent, "} => {");
+}
+
+/// Emits a struct-literal expression with rustfmt's observed canonical
+/// layout: one line for at most two short fields, vertical otherwise
+/// (`struct_lit_width` keeps three-plus-field literals broken).
+fn emit_struct_literal(
+    emitter: &mut Emitter,
+    indent: usize,
+    head: &str,
+    fields: &[String],
+    tail: &str,
+) {
+    let joined = fields.join(", ");
+    let inline = format!("{head} {{ {joined} }}{tail}");
+    if fields.len() <= 2 && fits(indent, &inline) {
+        emitter.line(indent, &inline);
+        return;
+    }
+    emitter.line(indent, &format!("{head} {{"));
+    for field in fields {
+        emitter.line(indent + 1, &format!("{field},"));
+    }
+    emitter.line(indent, &format!("}}{tail}"));
+}
+
+/// Checked-constructor signature with an explicit return type, collapsing
+/// when it fits.
+fn emit_ctor_signature_named(
+    emitter: &mut Emitter,
+    self_type: &str,
+    method: &str,
+    params: &[String],
+    ok_type: &str,
+) {
+    emitter.docs(
+        0,
+        &[format!("Checked constructor for [`{self_type}`] (§48).")],
+    );
+    emitter.line(0, &format!("impl {self_type} {{"));
+    let joined = params.join(", ");
+    let inline = format!("pub fn {method}({joined}) -> {ok_type} {{");
+    if fits(1, &inline) {
+        emitter.line(1, &inline);
+    } else {
+        emitter.line(1, &format!("pub fn {method}("));
+        for param in params {
+            emitter.line(2, &format!("{param},"));
+        }
+        emitter.line(1, &format!(") -> {ok_type} {{"));
+    }
 }
 
 /// Checked-constructor names per the §48 example style.
@@ -2112,6 +2677,11 @@ enum EntryPayload {
     Json {
         model: String,
     },
+    /// Single-content URL-encoded form: bounded collect then the support
+    /// decoder (main spec §16); axum's `Form` extractor is never used.
+    Form {
+        model: String,
+    },
     /// Single-content text: decodes to `String`.
     Text,
     /// Single-content streaming: the raw body passes through.
@@ -2121,6 +2691,10 @@ enum EntryPayload {
         struct_name: String,
     },
     EnumJson {
+        enum_name: String,
+        variant: String,
+    },
+    EnumForm {
         enum_name: String,
         variant: String,
     },
@@ -2142,12 +2716,21 @@ impl EntryPayload {
     fn is_decodable(&self) -> bool {
         matches!(
             self,
-            Self::Json { .. } | Self::Text | Self::EnumJson { .. } | Self::EnumText { .. }
+            Self::Json { .. }
+                | Self::Form { .. }
+                | Self::Text
+                | Self::EnumJson { .. }
+                | Self::EnumForm { .. }
+                | Self::EnumText { .. }
         )
     }
 
     fn is_json(&self) -> bool {
         matches!(self, Self::Json { .. } | Self::EnumJson { .. })
+    }
+
+    fn is_form(&self) -> bool {
+        matches!(self, Self::Form { .. } | Self::EnumForm { .. })
     }
 }
 
@@ -2180,6 +2763,15 @@ fn entry_payload(
                 variant: content.variant_name.clone(),
             },
             None => EntryPayload::Json {
+                model: content.model_expr.clone(),
+            },
+        },
+        MediaClass::UrlEncodedForm => match enum_name {
+            Some(enum_name) => EntryPayload::EnumForm {
+                enum_name,
+                variant: content.variant_name.clone(),
+            },
+            None => EntryPayload::Form {
                 model: content.model_expr.clone(),
             },
         },
@@ -2222,18 +2814,18 @@ fn emit_body_acquisition(
 
     if required {
         emitter.line(1, "let parsed = parse_single_content_type(&__headers)?;");
-        emit_classify_match_head(emitter, &literals, 1);
-        emit_absent_content_type_arm(emitter, operation, 2);
-        emit_unmatched_arm(emitter, 2);
+        let (arm_indent, close_indent) = emit_classify_match_head(emitter, &literals, 1);
+        emit_absent_content_type_arm(emitter, operation, arm_indent);
+        emit_unmatched_arm(emitter, arm_indent);
         for index in 0..operation.request_contents.len() {
             let payload = entry_payload(operation, layout, op_index, index);
-            emit_entry_arm(emitter, &payload, operation, index, 2, true);
+            emit_entry_arm(emitter, &payload, operation, index, arm_indent, true);
         }
         emitter.line(
-            2,
+            arm_indent,
             "RequestEntryMatch::Entry(_) => unreachable!(\"request entry index out of range\"),",
         );
-        emitter.line(1, "};");
+        emitter.line(close_indent, "};");
         return;
     }
 
@@ -2254,28 +2846,28 @@ fn emit_body_acquisition(
     emitter.line(2, "}");
     emitter.line(2, "BodyPresence::NonEmpty(_) => {");
     emitter.line(3, "let parsed = parse_single_content_type(&__headers)?;");
-    emit_classify_match_head(emitter, &literals, 3);
-    // The head helper emits the opening brace; arms follow at indent+1.
+    let (arm_indent, close_indent) = emit_classify_match_head(emitter, &literals, 3);
+    // The head helper emits the opening brace; arms follow at arm_indent.
     emitter.line(
-        4,
+        arm_indent,
         "RequestEntryMatch::AbsentContentType | RequestEntryMatch::Unmatched => {",
     );
-    emitter.line(5, "return Err(unsupported_media_type(");
+    emitter.line(arm_indent + 1, "return Err(unsupported_media_type(");
     emitter.line(
-        6,
+        arm_indent + 2,
         "\"nonempty optional body arrived without a usable Content-Type\",",
     );
-    emitter.line(5, "));");
-    emitter.line(4, "}");
+    emitter.line(arm_indent + 1, "));");
+    emitter.line(arm_indent, "}");
     for index in 0..operation.request_contents.len() {
         let payload = entry_payload(operation, layout, op_index, index);
-        emit_entry_arm(emitter, &payload, operation, index, 4, false);
+        emit_entry_arm(emitter, &payload, operation, index, arm_indent, false);
     }
     emitter.line(
-        4,
+        arm_indent,
         "RequestEntryMatch::Entry(_) => unreachable!(\"request entry index out of range\"),",
     );
-    emitter.line(3, "}");
+    emitter.line(close_indent, "}");
     emitter.line(2, "}");
     emitter.line(1, "};");
 }
@@ -2321,12 +2913,20 @@ fn emit_absent_content_type_arm(
     emitter.line(indent, "}");
 }
 
-/// Emits the `match classify_request_entry(...)` opener: one line when the
-/// whole slice fits within the rustfmt width, vertical slice otherwise. Only
-/// the required-body call site (indent 1) binds the match result to
-/// `request_body`; the optional-body site nests inside
-/// `BodyPresence::NonEmpty`, where the match is a plain arm expression.
-fn emit_classify_match_head(emitter: &mut Emitter, literals: &[String], indent: usize) {
+/// Emits the `match classify_request_entry(...)` opener following rustfmt's
+/// preference order and RETURNS the indents to use for the arms and the
+/// closing `};`:
+///
+/// 1. whole opener plus brace on one line;
+/// 2. opener on one line, brace dropping to its own line;
+/// 3. only when a `let x = ` prefix exists: break after `=` so the match
+///    (with its brace) sits one level deeper;
+/// 4. otherwise break the slice entries vertically.
+fn emit_classify_match_head(
+    emitter: &mut Emitter,
+    literals: &[String],
+    indent: usize,
+) -> (usize, usize) {
     let joined = literals.join(", ");
     let prefix = if indent == 1 {
         "let request_body = "
@@ -2335,18 +2935,26 @@ fn emit_classify_match_head(emitter: &mut Emitter, literals: &[String], indent: 
     };
     // rustfmt's canonical layouts, most-preferred first: whole head on one
     // line; otherwise the argument list stays horizontal and only the match
-    // brace drops; only when even the head cannot fit do the slice entries
-    // break vertically.
+    // brace drops; then (binding sites only) the break-after-`=` form; only
+    // when even the head cannot fit do the slice entries break vertically.
     let head = format!("{prefix}match classify_request_entry(parsed.as_ref(), &[{joined}])");
     let open_brace = format!("{head} {{");
     if fits(indent, &open_brace) {
         emitter.line(indent, &open_brace);
-        return;
+        return (indent + 1, indent);
     }
     if fits(indent, &head) {
         emitter.line(indent, &head);
         emitter.line(indent, "{");
-        return;
+        return (indent + 1, indent);
+    }
+    if !prefix.is_empty() {
+        let deep_open = format!("match classify_request_entry(parsed.as_ref(), &[{joined}]) {{");
+        if fits(indent + 1, &deep_open) {
+            emitter.line(indent, prefix.trim_end());
+            emitter.line(indent + 1, &deep_open);
+            return (indent + 2, indent + 1);
+        }
     }
     emitter.line(
         indent,
@@ -2356,6 +2964,7 @@ fn emit_classify_match_head(emitter: &mut Emitter, literals: &[String], indent: 
         emitter.line(indent + 1, &format!("{literal},"));
     }
     emitter.line(indent, "]) {");
+    (indent + 1, indent)
 }
 
 fn probe_limit_field(operation: &PlannedOperation) -> &'static str {
@@ -2409,7 +3018,9 @@ fn emit_entry_arm(
                 indent + 1,
                 &format!("let bytes = body_bytes(body, limits.{limit_field}).await?;"),
             );
-            if payload.is_json() {
+            // §28.3: an EMPTY body on a documented required body is missing,
+            // never a default value — forms follow the JSON rule.
+            if payload.is_json() || payload.is_form() {
                 emitter.line(indent + 1, "if bytes.is_empty() {");
                 emitter.line(
                     indent + 2,
@@ -2433,8 +3044,22 @@ fn emit_entry_arm(
                     emitter.line(indent + 2, "decode_json_body(&bytes)?;");
                 }
             }
+            EntryPayload::Form { model } => {
+                let call = format!("decode_form_body(&bytes, limits.{limit_field})?;");
+                let bind = format!("let value: {model} = {call}");
+                if fits(indent + 1, &bind) {
+                    emitter.line(indent + 1, &bind);
+                } else {
+                    emitter.line(indent + 1, &format!("let value: {model} ="));
+                    emitter.line(indent + 2, &call);
+                }
+            }
             EntryPayload::EnumJson { .. } => {
                 emitter.line(indent + 1, "let value = decode_json_body(&bytes)?;");
+            }
+            EntryPayload::EnumForm { .. } => {
+                let line = format!("let value = decode_form_body(&bytes, limits.{limit_field})?;");
+                emitter.line(indent + 1, &line);
             }
             _ => {
                 emitter.line(indent + 1, "let value = decode_text_body(bytes)?;");
@@ -2488,6 +3113,7 @@ fn emit_entry_yield_expr(
             }
         }
         EntryPayload::EnumJson { enum_name, variant }
+        | EntryPayload::EnumForm { enum_name, variant }
         | EntryPayload::EnumText { enum_name, variant } => {
             emit_inline(emitter, format!("{enum_name}::{variant}(value)"));
         }
@@ -2524,7 +3150,7 @@ fn emit_entry_yield_expr(
                 emitter.line(indent, "}),");
             }
         }
-        EntryPayload::Json { .. } | EntryPayload::Text => {
+        EntryPayload::Json { .. } | EntryPayload::Form { .. } | EntryPayload::Text => {
             unreachable!("decodable payloads keep block arms");
         }
     }
@@ -2549,7 +3175,7 @@ fn emit_entry_yield(emitter: &mut Emitter, indent: usize, payload: &EntryPayload
     };
 
     match payload {
-        EntryPayload::Json { .. } | EntryPayload::Text => {
+        EntryPayload::Json { .. } | EntryPayload::Form { .. } | EntryPayload::Text => {
             // Optional bodies yield `Some(..)` so the outer presence match
             // separates Empty (None) from a decoded document (§28.2).
             if required {
@@ -2581,6 +3207,7 @@ fn emit_entry_yield(emitter: &mut Emitter, indent: usize, payload: &EntryPayload
             );
         }
         EntryPayload::EnumJson { enum_name, variant }
+        | EntryPayload::EnumForm { enum_name, variant }
         | EntryPayload::EnumText { enum_name, variant } => {
             if required {
                 emitter.line(indent, &format!("{enum_name}::{variant}(value)"));
@@ -2773,6 +3400,10 @@ fn emit_module_helpers(emitter: &mut Emitter, flags: &Flags) {
         emitter.blank();
         emit_decode_text_body(emitter);
     }
+    if flags.needs_form_decode {
+        emitter.blank();
+        emit_decode_form_body(emitter);
+    }
     if flags.needs_charset_check {
         emitter.blank();
         emit_ensure_utf8_charset(emitter);
@@ -2821,6 +3452,78 @@ fn emit_module_helpers(emitter: &mut Emitter, flags: &Flags) {
         emitter.blank();
         emit_any_response(emitter);
     }
+    if flags.needs_typed_headers {
+        emitter.blank();
+        emit_write_typed_headers(emitter);
+        emitter.blank();
+        emit_header_encode_failure(emitter);
+    }
+}
+
+/// Writes the collected typed documented headers onto an encoded response
+/// (main spec §15): a value failing `HeaderValue` conversion discards the
+/// partial response and takes the fixed §34.1-style fallback.
+fn emit_write_typed_headers(emitter: &mut Emitter) {
+    emitter.docs(
+        0,
+        &[
+            "Appends typed documented response headers (main spec §15). A \
+             value that cannot become a `HeaderValue` fires the encode hook \
+             and emits the fixed empty 500 (§34.1 machinery; limit `0` is \
+             the recorded sentinel for non-size encode failures such as \
+             this one)."
+                .to_owned(),
+        ],
+    );
+    emitter.line(0, "fn write_typed_headers(");
+    emitter.line(1, "mut response: ::axum::response::Response,");
+    emitter.line(1, "hook: &dyn EncodeOverflowHook,");
+    emitter.line(1, "operation_id: &'static str,");
+    emitter.line(1, "variant: &'static str,");
+    emitter.line(1, "headers: &[(&'static str, String)],");
+    emitter.line(0, ") -> ::axum::response::Response {");
+    emitter.line(1, "for (wire, value) in headers {");
+    emitter.line(2, "match ::http::HeaderValue::try_from(value.as_str()) {");
+    emitter.line(3, "Ok(header) => {");
+    emitter.line(4, "response");
+    emitter.line(5, ".headers_mut()");
+    emitter.line(5, ".insert(::http::HeaderName::from_static(wire), header);");
+    emitter.line(3, "}");
+    emitter.line(3, "Err(_) => {");
+    emitter.line(
+        4,
+        "return header_encode_failure(hook, operation_id, variant);",
+    );
+    emitter.line(3, "}");
+    emitter.line(2, "}");
+    emitter.line(1, "}");
+    emitter.line(1, "response");
+    emitter.line(0, "}");
+}
+
+/// §34.1 machinery applied to header-conversion failures: fire the hook,
+/// then emit the protocol-safe fixed 500 with an empty body.
+fn emit_header_encode_failure(emitter: &mut Emitter) {
+    emitter.docs(
+        0,
+        &[
+            "Fixed fallback for a documented header value that fails HTTP \
+           header conversion at encode time (main spec §48's internal error \
+           path): hook first, then the empty-bodied 500."
+                .to_owned(),
+        ],
+    );
+    emitter.line(0, "fn header_encode_failure(");
+    emitter.line(1, "hook: &dyn EncodeOverflowHook,");
+    emitter.line(1, "operation_id: &'static str,");
+    emitter.line(1, "variant: &'static str,");
+    emitter.line(0, ") -> ::axum::response::Response {");
+    emitter.line(1, "hook.on_encode_overflow(operation_id, variant, 0);");
+    emitter.line(
+        1,
+        "::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()",
+    );
+    emitter.line(0, "}");
 }
 
 fn emit_invalid_parameter(emitter: &mut Emitter) {
@@ -3093,6 +3796,50 @@ fn emit_decode_json_body(emitter: &mut Emitter) {
     emitter.line(3, "malformed_body(\"malformed JSON body\")");
     emitter.line(2, "}");
     emitter.line(1, "})");
+    emitter.line(0, "}");
+}
+
+/// Maps bounded form decode failures onto §39 kinds (main spec §16,
+/// D-impl-charset-rejection, D-impl-runtime-validation-timing): the size
+/// gate → 413 BodyTooLarge, syntax/charset failures → 400 MalformedBody,
+/// data errors (missing fields, duplicates, wrong types) → 422
+/// SchemaViolation. Axum's `Form` extractor is never used; the router
+/// self-decodes from the bounded collect.
+fn emit_decode_form_body(emitter: &mut Emitter) {
+    emitter.line(
+        0,
+        "fn decode_form_body<T>(bytes: &[u8], limit: usize) -> Result<T, ProtocolRejection>",
+    );
+    emitter.line(0, "where");
+    emitter.line(1, "T: serde::de::DeserializeOwned,");
+    emitter.line(0, "{");
+    emitter.line(1, "match decode_form_limited(bytes, limit) {");
+    emitter.line(2, "Ok(value) => Ok(value),");
+    emitter.line(
+        2,
+        "Err(::openapi_support::form::FormDecodeError::TooLarge { .. }) => {",
+    );
+    // Defensive: bounded collection already enforced this limit.
+    emitter.line(
+        3,
+        "Err(ProtocolRejection::new(RejectionKind::BodyTooLarge))",
+    );
+    emitter.line(2, "}");
+    emitter.line(2, "Err(error) => {");
+    emitter.line(3, "if error.is_syntax() {");
+    emitter.line(4, "Err(malformed_body(\"malformed form body\"))");
+    emitter.line(3, "} else {");
+    emitter.line(
+        4,
+        "Err(ProtocolRejection::new(RejectionKind::SchemaViolation)",
+    );
+    emitter.line(
+        5,
+        ".with_detail(\"well-formed body failed schema validation\"))",
+    );
+    emitter.line(3, "}");
+    emitter.line(2, "}");
+    emitter.line(1, "}");
     emitter.line(0, "}");
 }
 

@@ -1,6 +1,6 @@
 /// Axum server generated from the OpenAPI document (main spec §8 Output B).
 ///
-/// Mode A traits (§37), bounded JSON/text bodies (§34), streaming raw payloads (§32), pre-handler protocol rejections outside the documented enums (§39), identity-only inbound content coding (§30.4), and the §28 Content-Type dispatch state machine. The source document declares OpenAPI 3.1.0.
+/// Mode A traits (§37), bounded JSON/form bodies (§34; axum's Form extractor is never used — routes self-decode after the §28 Content-Type dispatch), streaming raw payloads (§32), typed documented response headers (§15: IntoResponse converts stored domain values through the well-defined internal error path of §48, firing the encode hook and emitting the fixed empty 500 on failure), pre-handler protocol rejections outside the documented enums (§39), identity-only inbound content coding (§30.4), and the §28 Content-Type dispatch state machine. Recorded decision for multi-content statuses WITH documented headers: the typed fields hoist onto the status VARIANT beside the content enum. The source document declares OpenAPI 3.1.0.
 /// Generated deterministically byte-for-byte (main spec §50 test 39); do not edit by hand.
 use super::models::ProblemDetails;
 use ::axum::response::IntoResponse;
@@ -54,9 +54,13 @@ impl ::axum::response::IntoResponse for PutObjectResponse {
     }
 }
 
-/// Payload for status 200 of `get_object` (main spec §32): the body streams verbatim; typed documented-header fields arrive in Phase 2 (D-impl-typed-headers-phase2).
+/// Payload for status 200 of `get_object` (main spec §32): the body streams verbatim; typed documented-header fields ride beside it where documented (main spec §15/§32).
 #[derive(Debug)]
 pub struct GetObject200 {
+    /// Documented response header `ETag` (optional).
+    pub e_tag: Option<String>,
+    /// Documented response header `Content-Length` (optional).
+    pub content_length: Option<i64>,
     pub body: ::axum::body::Body,
 }
 
@@ -72,17 +76,28 @@ pub enum GetObjectResponse {
 /// Bounded encoder for [`GetObjectResponse`] (main spec §8 Output B, §41): JSON/text serialize under `structured_encode_bytes`; overflow discards partial output, fires the hook, and emits a fixed empty 500 (§34.1). Range/default statuses validate their carried status (§48).
 impl GetObjectResponse {
     /// Encodes the documented outcome with the configured limits.
+    #[allow(clippy::vec_init_then_push)]
     pub fn into_response_with_limits(
         self,
         limits: &BodyLimits,
         hook: &dyn EncodeOverflowHook,
     ) -> ::axum::response::Response {
         match self {
-            Self::Ok200(wrapper) => stream_response(
-                ::http::StatusCode::OK,
-                "application/octet-stream",
-                wrapper.body,
-            ),
+            Self::Ok200(wrapper) => {
+                let mut typed_headers = Vec::<(&'static str, String)>::new();
+                if let Some(value) = wrapper.e_tag.as_ref() {
+                    typed_headers.push(("etag", value.to_owned()));
+                }
+                if let Some(value) = wrapper.content_length.as_ref() {
+                    typed_headers.push(("content-length", value.to_string()));
+                }
+                let encoded = stream_response(
+                    ::http::StatusCode::OK,
+                    "application/octet-stream",
+                    wrapper.body,
+                );
+                write_typed_headers(encoded, hook, "getObject", "Ok200", &typed_headers)
+            }
             Self::NotFound404(value) => encode_json_limited(
                 ::http::StatusCode::NOT_FOUND,
                 "application/problem+json",
@@ -367,4 +382,37 @@ fn stream_response(
         ::http::HeaderValue::from_static(content_type),
     );
     response
+}
+
+/// Appends typed documented response headers (main spec §15). A value that cannot become a `HeaderValue` fires the encode hook and emits the fixed empty 500 (§34.1 machinery; limit `0` is the recorded sentinel for non-size encode failures such as this one).
+fn write_typed_headers(
+    mut response: ::axum::response::Response,
+    hook: &dyn EncodeOverflowHook,
+    operation_id: &'static str,
+    variant: &'static str,
+    headers: &[(&'static str, String)],
+) -> ::axum::response::Response {
+    for (wire, value) in headers {
+        match ::http::HeaderValue::try_from(value.as_str()) {
+            Ok(header) => {
+                response
+                    .headers_mut()
+                    .insert(::http::HeaderName::from_static(wire), header);
+            }
+            Err(_) => {
+                return header_encode_failure(hook, operation_id, variant);
+            }
+        }
+    }
+    response
+}
+
+/// Fixed fallback for a documented header value that fails HTTP header conversion at encode time (main spec §48's internal error path): hook first, then the empty-bodied 500.
+fn header_encode_failure(
+    hook: &dyn EncodeOverflowHook,
+    operation_id: &'static str,
+    variant: &'static str,
+) -> ::axum::response::Response {
+    hook.on_encode_overflow(operation_id, variant, 0);
+    ::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }

@@ -108,7 +108,7 @@ impl Layout {
                     let name = fresh_name(used, base);
                     layout.content_enums.insert((op_index, status_index), name);
                 }
-                if let Some(name) = wrapper_name(operation, status) {
+                if let Some(name) = wrapper_name(status) {
                     let name = fresh_name(used, format!("{}{}", operation.pascal, name));
                     layout.wrappers.insert((op_index, status_index), name);
                 }
@@ -118,21 +118,37 @@ impl Layout {
     }
 }
 
-/// Streaming single-content statuses own the raw response through a wrapper
-/// struct carrying `into_bytes_stream()` (main spec §32/§51.1,
-/// D-impl-typed-headers-phase2); ranges/defaults with exactly one streaming
-/// payload reuse the same shape as their struct-variant body.
-fn wrapper_name(_operation: &PlannedOperation, status: &PlannedStatus) -> Option<String> {
-    let streaming_single = matches!(
-        status.contents.as_slice(),
-        [content]
-            if matches!(content.media_class, MediaClass::Binary | MediaClass::RawUnknown)
-    );
-    if streaming_single && !status.is_no_body_status {
-        Some(status_name_part(status))
-    } else {
-        None
+/// Statuses whose payload owns a wrapper struct named `<Op><Status>`
+/// (main spec §32/§15): streaming single-content statuses carry the raw
+/// response; decodable single-content statuses WITH documented headers
+/// become §15 Output A wrappers (`{ typed header fields..., body }`).
+/// No-body statuses never wrap (§35); range/default statuses with headers
+/// keep their struct variants (which carry the wire status, §23–§24).
+fn wrapper_name(status: &PlannedStatus) -> Option<String> {
+    if status.is_no_body_status {
+        return None;
     }
+    let is_range = !matches!(status.key, ResponseStatusKey::Explicit(_));
+    let [content] = status.contents.as_slice() else {
+        return None;
+    };
+    if content.is_wildcard
+        || matches!(
+            content.media_class,
+            MediaClass::Binary | MediaClass::RawUnknown
+        )
+    {
+        // Streaming/wildcard payloads keep the Phase 1 wrapper shape unless
+        // a range/default needs its inline struct variant for headers.
+        if status.headers.is_empty() || !is_range {
+            return Some(status_name_part(status));
+        }
+        return None;
+    }
+    if !status.headers.is_empty() && !is_range {
+        return Some(status_name_part(status));
+    }
+    None
 }
 
 /// Status portion of derived type names per the §4 table
@@ -153,6 +169,7 @@ struct Flags {
     model_types: BTreeSet<String>,
     needs_body_limit_direction: bool,
     needs_serialize_json: bool,
+    needs_serialize_form: bool,
     needs_collect: bool,
     needs_content_type_helpers: bool,
     needs_charset_check: bool,
@@ -167,6 +184,16 @@ struct Flags {
     needs_cookie_value: bool,
     needs_param_spec: bool,
     needs_param_style: bool,
+    /// Typed documented response headers exist somewhere (main spec §15):
+    /// pulls in the shared header-value decode helper plus its source-error
+    /// type.
+    needs_response_header_parse: bool,
+    /// At least one REQUIRED documented header exists → the required
+    /// variant of the parse helper is emitted.
+    needs_required_header_helper: bool,
+    /// At least one OPTIONAL documented header exists → the optional
+    /// variant of the parse helper is emitted.
+    needs_optional_header_helper: bool,
 }
 
 impl Flags {
@@ -200,6 +227,14 @@ impl Flags {
                 self.model_types
                     .extend(model_type_names(&content.model_expr));
             }
+            MediaClass::UrlEncodedForm => {
+                // Bounded form serialization per §34/D-impl-forms; Reqwest's
+                // `.form()` convenience is never used.
+                self.needs_serialize_form = true;
+                self.needs_body_limit_direction = true;
+                self.model_types
+                    .extend(model_type_names(&content.model_expr));
+            }
             MediaClass::PlainText => self.needs_body_limit_direction = true,
             MediaClass::Binary | MediaClass::RawUnknown => {}
             // Planning rejects the rest; unreachable here.
@@ -208,13 +243,23 @@ impl Flags {
     }
 
     fn scan_status(&mut self, status: &PlannedStatus) {
+        if !status.headers.is_empty() {
+            self.needs_response_header_parse = true;
+            for header in &status.headers {
+                if header.required {
+                    self.needs_required_header_helper = true;
+                } else {
+                    self.needs_optional_header_helper = true;
+                }
+            }
+        }
         if status.is_no_body_status || status.contents.is_empty() {
             return;
         }
         let textual = status.contents.iter().any(|content| {
             matches!(
                 content.media_class,
-                MediaClass::JsonFamily | MediaClass::PlainText
+                MediaClass::JsonFamily | MediaClass::PlainText | MediaClass::UrlEncodedForm
             )
         });
         let negotiated = status.contents.len() >= 2;
@@ -284,9 +329,12 @@ fn emit_header(emitter: &mut Emitter, doc: &NormalizedDocument, flags: &Flags) {
              Output A)."
                 .to_owned(),
             String::new(),
-            "Bounded JSON/text bodies (§34), streaming raw payloads (§32), \
-             exhaustive documented-status enums (§2.4), redirects off by \
-             default (§30.1), and the authoritative `ClientError` (§36). The \
+            "Bounded JSON/form bodies (§34), streaming raw payloads (§32), \
+             exhaustive documented-status enums (§2.4), typed documented \
+             response headers (§15), redirects off by default (§30.1), and \
+             the authoritative `ClientError` (§36). Recorded decision for \
+             multi-content statuses WITH documented headers: the typed fields \
+             hoist onto the status VARIANT beside the content enum. The \
              source document declares OpenAPI "
                 .to_owned()
                 + &doc.raw_version
@@ -334,6 +382,9 @@ fn emit_header(emitter: &mut Emitter, doc: &NormalizedDocument, flags: &Flags) {
     }
     if flags.needs_serialize_json {
         imports.push("use ::openapi_support::encode::serialize_json_limited;".to_owned());
+    }
+    if flags.needs_serialize_form {
+        imports.push("use ::openapi_support::encode::serialize_form_limited;".to_owned());
     }
     imports.push("use ::openapi_support::limits::BodyLimits;".to_owned());
     if flags.needs_content_type_helpers {
@@ -1029,7 +1080,7 @@ fn emit_request_body_enum(emitter: &mut Emitter, operation: &PlannedOperation) {
 /// Client-side payload type of one request media entry (§6 summary table).
 fn request_payload_type(content: &PlannedContent) -> String {
     match content.media_class {
-        MediaClass::JsonFamily => content.model_expr.clone(),
+        MediaClass::JsonFamily | MediaClass::UrlEncodedForm => content.model_expr.clone(),
         MediaClass::PlainText => "String".to_owned(),
         MediaClass::Binary | MediaClass::RawUnknown => "::reqwest::Body".to_owned(),
         // Planning rejects the rest before emission.
@@ -1085,20 +1136,54 @@ fn emit_wrapper(
     status: &PlannedStatus,
     name: &str,
 ) {
-    emitter.docs(
-        0,
-        &[format!(
-            "Streaming payload for status {} of `{}` (main spec §32): owns the \
-                 response; typed documented-header fields arrive in Phase 2 \
-                 (D-impl-typed-headers-phase2).",
+    let [content] = status.contents.as_slice() else {
+        unreachable!("wrapper statuses always have exactly one content entry");
+    };
+    let streaming = matches!(
+        content.media_class,
+        MediaClass::Binary | MediaClass::RawUnknown
+    );
+    let mut docs = Vec::new();
+    if streaming {
+        let suffix = if status.headers.is_empty() {
+            String::new()
+        } else {
+            " plus its typed documented headers (§15, superseding \
+             D-impl-typed-headers-phase2)"
+                .to_owned()
+        };
+        docs.push(format!(
+            "Streaming payload for status {} of `{}` (main spec §32): owns \
+             the response{}.",
+            crate::normalize::status_label(&status.key),
+            operation.method,
+            suffix
+        ));
+    } else {
+        // §15 Output A wrapper: typed documented headers beside the body.
+        docs.push(format!(
+            "Typed payload for status {} of `{}` (main spec §15 Output A): \
+             required headers as plain fields, optional headers as \
+             `Option<T>`, then the decoded body.",
             crate::normalize::status_label(&status.key),
             operation.method
-        )],
-    );
+        ));
+    }
+    emitter.docs(0, &docs);
     emitter.line(0, "#[derive(Debug)]");
     emitter.line(0, &format!("pub struct {name} {{"));
-    emitter.line(1, "pub response: ::reqwest::Response,");
+    emit_header_fields(emitter, status, 1);
+    if streaming {
+        emitter.line(1, "pub response: ::reqwest::Response,");
+    } else {
+        emitter.line(1, &format!("pub body: {},", response_payload_type(content)));
+    }
     emitter.line(0, "}");
+    if !streaming {
+        // Structured §15 wrappers expose the decoded payload directly; no
+        // raw-response conveniences apply.
+        return;
+    }
     emitter.blank();
     emitter.line(0, &format!("impl {name} {{"));
     emitter.docs(
@@ -1117,6 +1202,31 @@ fn emit_wrapper(
     emitter.line(2, "self.response.bytes_stream()");
     emitter.line(1, "}");
     emitter.line(0, "}");
+}
+
+/// Typed documented-header fields of one status (main spec §15): required
+/// headers become plain fields, optional ones `Option<T>`.
+fn emit_header_fields(emitter: &mut Emitter, status: &PlannedStatus, indent: usize) {
+    for header in &status.headers {
+        let field_type = if header.required {
+            header.rust_type.clone()
+        } else {
+            format!("Option<{}>", header.rust_type)
+        };
+        emitter.docs(
+            indent,
+            &[format!(
+                "Documented response header `{}` ({}).",
+                header.wire_name,
+                if header.required {
+                    "required"
+                } else {
+                    "optional"
+                }
+            )],
+        );
+        emitter.line(indent, &format!("pub {}: {field_type},", header.rust_name));
+    }
 }
 
 fn emit_response_enum(
@@ -1146,13 +1256,13 @@ fn emit_response_enum(
             continue;
         }
         if struct_variant_status(status) {
-            // Ranges/default carry the wire status (main spec §23–§24).
+            // Ranges/default carry the wire status (main spec §23–§24);
+            // documented headers ride inside the struct variant (§15).
+            emitter.line(1, &format!("{} {{", status.enum_variant));
+            emitter.line(2, "status: ::http::StatusCode,");
+            emit_header_fields(emitter, status, 2);
             match status.contents.len() {
-                0 => {
-                    emitter.line(1, &format!("{} {{", status.enum_variant));
-                    emitter.line(2, "status: ::http::StatusCode,");
-                    emitter.line(1, "},");
-                }
+                0 => {}
                 _ => {
                     let body_type = match status.contents.len() {
                         1 => response_payload_type(&status.contents[0]),
@@ -1162,12 +1272,32 @@ fn emit_response_enum(
                             .expect("content enum registered")
                             .clone(),
                     };
-                    emitter.line(1, &format!("{} {{", status.enum_variant));
-                    emitter.line(2, "status: ::http::StatusCode,");
                     emitter.line(2, &format!("body: {body_type},"));
-                    emitter.line(1, "},");
                 }
             }
+            emitter.line(1, "},");
+            continue;
+        }
+        if !status.headers.is_empty() && status.contents.is_empty() {
+            // Header-only documented response (e.g. 302 + Location): the
+            // variant carries exactly the typed headers.
+            emitter.line(1, &format!("{} {{", status.enum_variant));
+            emit_header_fields(emitter, status, 2);
+            emitter.line(1, "},");
+            continue;
+        }
+        if !status.headers.is_empty() && status.contents.len() >= 2 {
+            // Multi-content with documented headers: the typed fields hoist
+            // onto the STATUS VARIANT beside the content enum (recorded
+            // decision; see module docs).
+            let content_enum = layout
+                .content_enums
+                .get(&(op_index, status_index))
+                .expect("content enum registered");
+            emitter.line(1, &format!("{} {{", status.enum_variant));
+            emit_header_fields(emitter, status, 2);
+            emitter.line(2, &format!("content: {content_enum},"));
+            emitter.line(1, "},");
             continue;
         }
         match status.contents.len() {
@@ -1301,11 +1431,13 @@ fn signature_arguments(operation: &PlannedOperation) -> Vec<SignatureArgument> {
 }
 
 /// Direct request-parameter type for single-content operations (§6 table):
-/// `&T` for JSON (D-§51.3 convenience), `&str` for text, owned `reqwest::Body`
-/// for streaming payloads.
+/// `&T` for JSON and forms (D-§51.3 convenience), `&str` for text, owned
+/// `reqwest::Body` for streaming payloads.
 fn request_parameter_type(content: &PlannedContent) -> String {
     match content.media_class {
-        MediaClass::JsonFamily => format!("&{}", content.model_expr),
+        MediaClass::JsonFamily | MediaClass::UrlEncodedForm => {
+            format!("&{}", content.model_expr)
+        }
         MediaClass::PlainText => "&str".to_owned(),
         MediaClass::Binary | MediaClass::RawUnknown => "::reqwest::Body".to_owned(),
         _ => "()".to_owned(),
@@ -1604,7 +1736,15 @@ fn emit_request_construction(
             flags.needs_body_limit_direction = true;
             if operation.request_body_required {
                 flags.needs_encode_overflow = true;
-                emit_bounded_encode(emitter, 2, "body");
+                emit_bounded_encode(emitter, 2, "body", "serialize_json_limited");
+            }
+        }
+        [content] if content.media_class == MediaClass::UrlEncodedForm => {
+            flags.needs_serialize_form = true;
+            flags.needs_body_limit_direction = true;
+            if operation.request_body_required {
+                flags.needs_encode_overflow = true;
+                emit_bounded_encode(emitter, 2, "body", "serialize_form_limited");
             }
         }
         [content] if content.media_class == MediaClass::PlainText => {
@@ -1683,7 +1823,7 @@ fn emit_request_construction(
         }
         if let [content] = operation.request_contents.as_slice() {
             let payload_expr = match content.media_class {
-                MediaClass::JsonFamily => "payload",
+                MediaClass::JsonFamily | MediaClass::UrlEncodedForm => "payload",
                 MediaClass::PlainText => "body.to_owned()",
                 _ => "body",
             };
@@ -1816,9 +1956,9 @@ fn emit_body_assignment(emitter: &mut Emitter, operation: &PlannedOperation, fla
 }
 
 /// Single-payload assignment on the rebound request builder. Required JSON
-/// bodies were already bounded-encoded before `request` existed (`payload`
-/// binding); optional JSON bodies serialize HERE so an encode overflow still
-/// returns before any wire traffic (§34.2).
+/// and form bodies were already bounded-encoded before `request` existed
+/// (`payload` binding); optional bodies serialize HERE so an encode overflow
+/// still returns before any wire traffic (§34.2).
 fn emit_single_request_body(
     emitter: &mut Emitter,
     indent: usize,
@@ -1826,18 +1966,30 @@ fn emit_single_request_body(
     required: bool,
     flags: &mut Flags,
 ) {
-    if content.media_class == MediaClass::JsonFamily && !required {
-        flags.needs_serialize_json = true;
-        flags.needs_body_limit_direction = true;
-        flags.needs_encode_overflow = true;
-        emit_bounded_encode(emitter, indent, "body");
+    match content.media_class {
+        MediaClass::JsonFamily if !required => {
+            flags.needs_serialize_json = true;
+            flags.needs_body_limit_direction = true;
+            flags.needs_encode_overflow = true;
+            emit_bounded_encode(emitter, indent, "body", "serialize_json_limited");
+        }
+        MediaClass::UrlEncodedForm if !required => {
+            flags.needs_serialize_form = true;
+            flags.needs_body_limit_direction = true;
+            flags.needs_encode_overflow = true;
+            emit_bounded_encode(emitter, indent, "body", "serialize_form_limited");
+        }
+        _ => {}
     }
     emitter.line(indent, "request = request");
     match content.media_class {
-        MediaClass::JsonFamily => {
+        MediaClass::JsonFamily | MediaClass::UrlEncodedForm => {
             emitter.line(
                 indent + 1,
-                ".header(::http::header::CONTENT_TYPE, \"application/json\")",
+                &format!(
+                    ".header(::http::header::CONTENT_TYPE, {})",
+                    rust_string_literal(&content.media_type_literal)
+                ),
             );
             emitter.line(indent + 1, ".body(payload);");
         }
@@ -1875,9 +2027,26 @@ fn emit_request_enum_arm(
         MediaClass::JsonFamily => {
             flags.needs_serialize_json = true;
             flags.needs_body_limit_direction = true;
-            emitter.line(indent, &format!("{variant}(value) => {{"));
             flags.needs_encode_overflow = true;
-            emit_bounded_encode(emitter, indent + 1, "&value");
+            emitter.line(indent, &format!("{variant}(value) => {{"));
+            emit_bounded_encode(emitter, indent + 1, "&value", "serialize_json_limited");
+            emitter.line(
+                indent + 1,
+                &format!(
+                    "request.header(::http::header::CONTENT_TYPE, {})",
+                    rust_string_literal(&content.media_type_literal)
+                ),
+            );
+            emitter.line(indent + 1, ".body(payload)");
+            emitter.line(indent, "}");
+        }
+        MediaClass::UrlEncodedForm => {
+            // §16/§34: bounded form serialization; `.form()` never used.
+            flags.needs_serialize_form = true;
+            flags.needs_body_limit_direction = true;
+            flags.needs_encode_overflow = true;
+            emitter.line(indent, &format!("{variant}(value) => {{"));
+            emit_bounded_encode(emitter, indent + 1, "&value", "serialize_form_limited");
             emitter.line(
                 indent + 1,
                 &format!(
@@ -1944,9 +2113,11 @@ fn emit_status_arm(
 ) {
     let status = &operation.statuses[status_index];
     let pattern = arm_pattern(status);
+    let has_headers = !status.headers.is_empty();
 
     // §35: no-body statuses and HEAD never read or validate the body, even
-    // when the document lists content entries for them.
+    // when the document lists content entries for them. (Planning refuses
+    // headers on no-body statuses, so nothing is dropped here.)
     if status.is_no_body_status || operation.http == HttpMethod::Head {
         emit_simple_arm(
             emitter,
@@ -1975,6 +2146,24 @@ fn emit_status_arm(
             content.media_class,
             MediaClass::Binary | MediaClass::RawUnknown
         ) {
+            if has_headers {
+                // Typed headers are read BEFORE handing the raw response to
+                // the wrapper (main spec §15).
+                emitter.line(3, &format!("{pattern} {{"));
+                emit_header_binds(emitter, 4, status);
+                emit_typed_wrapper_result(
+                    emitter,
+                    4,
+                    operation,
+                    status,
+                    status_index,
+                    layout,
+                    op_index,
+                    "response,",
+                );
+                emitter.line(3, "}");
+                return;
+            }
             emit_simple_arm(
                 emitter,
                 3,
@@ -1991,6 +2180,41 @@ fn emit_status_arm(
     }
 
     if status.contents.is_empty() {
+        if has_headers {
+            // Header-only documented response (§15): parse the headers and
+            // construct the struct variant; no body is read.
+            emitter.line(3, &format!("{pattern} {{"));
+            emit_header_binds(emitter, 4, status);
+            let mut fields: Vec<String> = Vec::new();
+            if struct_variant_status(status) {
+                fields.push("status".to_owned());
+            }
+            for header in &status.headers {
+                fields.push(header.rust_name.clone());
+            }
+            let head = format!(
+                "Ok({}::{} {{",
+                operation.response_enum_name, status.enum_variant
+            );
+            // rustfmt keeps at most two-field struct literals on one line
+            // (struct_lit_width heuristic), vertical beyond that.
+            let joined = fields.join(", ");
+            if fields.len() <= 2 {
+                let inline = format!("{head} {joined} }})");
+                if fits(4, &inline) {
+                    emitter.line(4, &inline);
+                    emitter.line(3, "}");
+                    return;
+                }
+            }
+            emitter.line(4, &head);
+            for field in &fields {
+                emitter.line(5, &format!("{field},"));
+            }
+            emitter.line(4, "})");
+            emitter.line(3, "}");
+            return;
+        }
         emit_simple_arm(
             emitter,
             3,
@@ -2006,6 +2230,10 @@ fn emit_status_arm(
     }
 
     emitter.line(3, &format!("{pattern} {{"));
+    // §15 Output A: documented headers parse BEFORE the body is consumed.
+    if has_headers {
+        emit_header_binds(emitter, 4, status);
+    }
     match status.contents.len() {
         1 => {
             emit_content_type_gate(emitter, &status.contents, flags);
@@ -2035,6 +2263,81 @@ fn emit_status_arm(
         }
     }
     emitter.line(3, "}");
+}
+
+/// Emits one `let <rust_name> = parse_{required,optional}_header::<T>(
+/// &response, "<wire>")?;` binding per documented header (main spec §15).
+/// Header names are plan-validated field names, so `from_static` is safe.
+fn emit_header_binds(emitter: &mut Emitter, indent: usize, status: &PlannedStatus) {
+    for header in &status.headers {
+        let helper = if header.required {
+            "parse_required_header"
+        } else {
+            "parse_optional_header"
+        };
+        let wire = rust_string_literal(&header.wire_name.to_ascii_lowercase());
+        let line = format!(
+            "let {} = {helper}::<{}>(&response, {wire})?;",
+            header.rust_name, header.rust_type
+        );
+        let head = format!("let {} =", header.rust_name);
+        let deep_call = format!("{helper}::<{}>(&response, {wire})?;", header.rust_type);
+        if fits(indent, &line) {
+            emitter.line(indent, &line);
+        } else if fits(indent + 1, &deep_call) {
+            // rustfmt breaks after `=` first, keeping the argument list
+            // horizontal on the continuation line.
+            emitter.line(indent, &head);
+            emitter.line(indent + 1, &deep_call);
+        } else {
+            emitter.line(
+                indent,
+                &format!(
+                    "let {} = {helper}::<{}>(&response,",
+                    header.rust_name, header.rust_type
+                ),
+            );
+            emitter.line(indent + 1, &format!("{wire})?;"));
+        }
+    }
+}
+
+/// Emits the `Ok(<Enum>::<Variant>(<Wrapper> {{ ... }}))` construction for a
+/// status whose typed wrapper carries documented headers beside its payload;
+/// `inner_line` is the trailing field (`response,` for streaming payloads or
+/// `body: value,` for decoded ones).
+#[allow(clippy::too_many_arguments)]
+fn emit_typed_wrapper_result(
+    emitter: &mut Emitter,
+    indent: usize,
+    operation: &PlannedOperation,
+    status: &PlannedStatus,
+    status_index: usize,
+    layout: &Layout,
+    op_index: usize,
+    inner_line: &str,
+) {
+    let wrapper = layout
+        .wrappers
+        .get(&(op_index, status_index))
+        .unwrap_or_else(|| panic!("wrapper missing for {}", status.enum_variant));
+    emitter.line(
+        indent,
+        &format!(
+            "Ok({}::{}({wrapper} {{",
+            operation.response_enum_name, status.enum_variant
+        ),
+    );
+    emit_wrapper_fields(emitter, indent + 1, status);
+    emitter.line(indent + 1, inner_line);
+    emitter.line(indent, "}))");
+}
+
+/// The typed-header fields of a wrapper literal (already-bound locals).
+fn emit_wrapper_fields(emitter: &mut Emitter, indent: usize, status: &PlannedStatus) {
+    for header in &status.headers {
+        emitter.line(indent, &format!("{},", header.rust_name));
+    }
 }
 
 /// Expression-form match arm (`PATTERN => RESULT,`) for bodies that are a
@@ -2155,6 +2458,7 @@ fn emit_result_line(
     let enum_name = &operation.response_enum_name;
     let variant = &status.enum_variant;
     let wrapper = layout.wrappers.get(&(op_index, status_index));
+    let has_headers = !status.headers.is_empty();
 
     if struct_variant_status(status) {
         match (&body, wrapper) {
@@ -2171,18 +2475,47 @@ fn emit_result_line(
             (BodyExpr::Value(value), _) => {
                 emitter.line(indent, &format!("Ok({enum_name}::{variant} {{"));
                 emitter.line(indent + 1, "status,");
+                if has_headers {
+                    emit_wrapper_fields(emitter, indent + 1, status);
+                }
                 emitter.line(indent + 1, &format!("body: {value},"));
                 emitter.line(indent, "})");
             }
             (BodyExpr::Wrapper, Some(wrapper_name)) => {
                 emitter.line(indent, &format!("Ok({enum_name}::{variant} {{"));
                 emitter.line(indent + 1, "status,");
-                emitter.line(indent + 1, &format!("body: {wrapper_name} {{ response }},"));
+                if has_headers {
+                    // Headers were parsed before the raw response moved into
+                    // the wrapper (main spec §15).
+                    emit_wrapper_fields(emitter, indent + 1, status);
+                    emitter.line(indent + 1, &format!("body: {wrapper_name} {{ response }},"));
+                } else {
+                    emitter.line(indent + 1, &format!("body: {wrapper_name} {{ response }},"));
+                }
                 emitter.line(indent, "})");
             }
             (BodyExpr::Wrapper, None) => unreachable!("wrapper expression without registration"),
         }
         return;
+    }
+
+    // Explicit statuses with a §15 typed wrapper: headers hoist into the
+    // wrapper beside the decoded payload.
+    if has_headers && matches!(body, BodyExpr::Value(_)) {
+        if wrapper.is_some() {
+            emit_typed_wrapper_result(
+                emitter,
+                indent,
+                operation,
+                status,
+                status_index,
+                layout,
+                op_index,
+                "body: value,",
+            );
+            return;
+        }
+        unreachable!("typed single-content status without a registered wrapper");
     }
 
     let payload = match &body {
@@ -2252,16 +2585,17 @@ fn emit_content_type_gate(emitter: &mut Emitter, contents: &[PlannedContent], fl
     emitter.line(4, "let content_type = mime_of(&parsed)?;");
 }
 
-/// Bounded JSON request serialization; an encode overflow returns
-/// `BodyTooLarge` without sending anything (§34.2).
-fn emit_bounded_encode(emitter: &mut Emitter, indent: usize, value_expr: &str) {
+/// Bounded JSON/form request serialization; an encode overflow returns
+/// `BodyTooLarge` without sending anything (§34.2). `serializer` selects
+/// `serialize_json_limited` or `serialize_form_limited`.
+fn emit_bounded_encode(emitter: &mut Emitter, indent: usize, value_expr: &str, serializer: &str) {
     let head = format!(
-        "let payload = match serialize_json_limited({value_expr}, self.limits.structured_encode_bytes) {{"
+        "let payload = match {serializer}({value_expr}, self.limits.structured_encode_bytes) {{"
     );
     if fits(indent, &head) {
         emitter.line(indent, &head);
     } else {
-        emitter.line(indent, "let payload = match serialize_json_limited(");
+        emitter.line(indent, &format!("let payload = match {serializer}("));
         emitter.line(indent + 1, &format!("{value_expr},"));
         emitter.line(indent + 1, "self.limits.structured_encode_bytes,");
         emitter.line(indent, ") {");
@@ -2434,7 +2768,9 @@ fn emit_negotiated_arm_body(
 
 /// Result expression of one negotiated branch: tuple-variant construction
 /// for explicit statuses, struct-variant fields (`status`, `body`) for
-/// ranges/default. Wrapping follows rustfmt-canonical layout.
+/// ranges/default. Documented headers hoist onto the status VARIANT beside
+/// the content enum (recorded decision; see module docs). Wrapping follows
+/// rustfmt-canonical layout.
 fn emit_negotiated_result(
     emitter: &mut Emitter,
     indent: usize,
@@ -2455,11 +2791,26 @@ fn emit_negotiated_result(
         // rustfmt keeps struct literals vertical beyond `struct_lit_width`.
         emitter.line(indent, &format!("Ok({enum_name}::{variant} {{"));
         emitter.line(indent + 1, "status,");
+        emit_wrapper_fields_opt(emitter, indent + 1, status);
         emitter.line(indent + 1, "body: payload,");
         emitter.line(indent, "})");
         return;
     }
+    if !status.headers.is_empty() {
+        emitter.line(indent, &format!("Ok({enum_name}::{variant} {{"));
+        emit_wrapper_fields_opt(emitter, indent + 1, status);
+        emitter.line(indent + 1, "content: payload,");
+        emitter.line(indent, "})");
+        return;
+    }
     emitter.line(indent, &format!("Ok({enum_name}::{variant}(payload))"));
+}
+
+/// Header-field locals inside a result literal; empty when none documented.
+fn emit_wrapper_fields_opt(emitter: &mut Emitter, indent: usize, status: &PlannedStatus) {
+    if !status.headers.is_empty() {
+        emit_wrapper_fields(emitter, indent, status);
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -2704,6 +3055,98 @@ fn emit_module_helpers(emitter: &mut Emitter, flags: &Flags, has_variables: bool
         emitter.line(2, "limit,");
         emitter.line(1, "}");
         emitter.line(0, "}");
+    }
+
+    if flags.needs_response_header_parse {
+        emitter.blank();
+        emitter.docs(
+            0,
+            &[
+                "Typed documented response headers (main spec §15): required \
+                 headers missing from the response are protocol errors \
+                 (`MissingRequiredHeader`), values failing their Rust type are \
+                 `InvalidHeader`; both surface BEFORE the body is consumed. A \
+                 repeated documented header reads its first occurrence."
+                    .to_owned(),
+            ],
+        );
+        if flags.needs_required_header_helper {
+            emitter.line(0, "#[allow(clippy::missing_errors_doc)]");
+            emitter.line(0, "fn parse_required_header<T>(");
+            emitter.line(1, "response: &::reqwest::Response,");
+            emitter.line(1, "wire: &'static str,");
+            emitter.line(0, ") -> Result<T, ClientError>");
+            emitter.line(0, "where");
+            emitter.line(1, "T: ::std::str::FromStr,");
+            emitter.line(1, "T::Err: ::std::error::Error + Send + Sync + 'static,");
+            emitter.line(0, "{");
+            emitter.line(1, "let name = ::http::HeaderName::from_static(wire);");
+            emitter.line(1, "let Some(raw) = response.headers().get(&name) else {");
+            emitter.line(
+                2,
+                "return Err(ClientError::MissingRequiredHeader { name });",
+            );
+            emitter.line(1, "};");
+            emitter.line(1, "parse_header_value(name, raw)");
+            emitter.line(0, "}");
+            emitter.blank();
+        }
+        if flags.needs_optional_header_helper {
+            emitter.line(0, "#[allow(clippy::missing_errors_doc)]");
+            emitter.line(0, "fn parse_optional_header<T>(");
+            emitter.line(1, "response: &::reqwest::Response,");
+            emitter.line(1, "wire: &'static str,");
+            emitter.line(0, ") -> Result<Option<T>, ClientError>");
+            emitter.line(0, "where");
+            emitter.line(1, "T: ::std::str::FromStr,");
+            emitter.line(1, "T::Err: ::std::error::Error + Send + Sync + 'static,");
+            emitter.line(0, "{");
+            emitter.line(1, "let name = ::http::HeaderName::from_static(wire);");
+            emitter.line(1, "match response.headers().get(&name) {");
+            emitter.line(2, "Some(raw) => parse_header_value(name, raw).map(Some),");
+            emitter.line(2, "None => Ok(None),");
+            emitter.line(1, "}");
+            emitter.line(0, "}");
+            emitter.blank();
+        }
+        emitter.docs(
+            0,
+            &["Decodes one raw header value into its typed representation.".to_owned()],
+        );
+        emitter.line(0, "#[allow(clippy::missing_errors_doc)]");
+        emitter.line(0, "fn parse_header_value<T>(");
+        emitter.line(1, "name: ::http::HeaderName,");
+        emitter.line(1, "raw: &::http::HeaderValue,");
+        emitter.line(0, ") -> Result<T, ClientError>");
+        emitter.line(0, "where");
+        emitter.line(1, "T: ::std::str::FromStr,");
+        emitter.line(1, "T::Err: ::std::error::Error + Send + Sync + 'static,");
+        emitter.line(0, "{");
+        emitter.line(
+            1,
+            "let text = raw.to_str().map_err(|_| ClientError::InvalidHeader {",
+        );
+        emitter.line(2, "name: name.clone(),");
+        emitter.line(2, "source: Box::new(NonUtf8HeaderValue),");
+        emitter.line(1, "})?;");
+        emitter.line(
+            1,
+            "text.parse().map_err(|source| ClientError::InvalidHeader {",
+        );
+        emitter.line(2, "name,");
+        emitter.line(2, "source: Box::new(source),");
+        emitter.line(1, "})");
+        emitter.line(0, "}");
+
+        emitter.blank();
+        emit_error_type(
+            emitter,
+            "NonUtf8HeaderValue",
+            None,
+            "\"documented response header value is not valid UTF-8\"",
+            "a documented response header carried non-UTF-8 bytes; generated \
+             clients surface this as `ClientError::InvalidHeader`",
+        );
     }
 
     emitter.blank();

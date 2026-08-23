@@ -4,9 +4,10 @@
 ///
 /// Servers (companion §8): operation-level `servers` override path-level, path-level overrides root-level, and within each effective array the first entry is that operation's default base. Every DISTINCT effective default URL becomes its own stored base: `base_url` is the primary (the first operation's first effective server); further bases live in `base_url_<key>` fields whose keys are documented under `ClientBuilder::secondary_base_url`. Recorded decision: an explicit `base_url` replaces ONLY the primary base; each other base needs its own `secondary_base_url` override, so a relative secondary still requires an absolute value there (D-impl-relative-servers).
 /// Generated deterministically byte-for-byte (main spec §50 test 39); do not edit by hand.
-use super::models::ProblemDetails;
-use ::openapi_support::client_error::ClientError;
+use super::models::{CacheEntryForm, CreateSessionForm, ProblemDetails, Session};
+use ::openapi_support::client_error::{BodyLimitDirection, ClientError};
 use ::openapi_support::collect::collect_reqwest_limited;
+use ::openapi_support::encode::serialize_form_limited;
 use ::openapi_support::limits::BodyLimits;
 use ::openapi_support::mediatype::ParsedMediaType;
 use ::openapi_support::params::{encode_path, ParamSpec, ParamStyle, ParamValue};
@@ -17,7 +18,6 @@ pub struct Client {
     http: ::reqwest::Client,
     base_url: String,
     limits: BodyLimits,
-    base_url_storage: String,
 }
 
 /// Builder for `Client` (main spec §30.1): redirects disabled unless opted in through `follow_redirects`; relative default servers require explicit overrides (D-impl-relative-servers). Recorded decision (companion §8): an explicit `base_url` replaces ONLY the primary base; every additional base is overridden per key through `secondary_base_url`.
@@ -27,7 +27,6 @@ pub struct ClientBuilder {
     limits: BodyLimits,
     default_server_url: String,
     default_server_variables: Vec<(String, String, Option<Vec<String>>)>,
-    secondary_base_urls: ::std::collections::BTreeMap<String, String>,
     server_variables: ::std::collections::BTreeMap<String, String>,
 }
 
@@ -41,19 +40,14 @@ impl ClientBuilder {
     /// Process-default transport: no redirects (§30.1) and process-default body limits (§33).
     #[must_use]
     pub fn new() -> Self {
-        let default_server_url = "https://{region}.api.example.com/v1".to_owned();
-        let default_server_variables = vec![server_variable(
-            "region",
-            "us-east",
-            &["us-east", "eu-west"],
-        )];
+        let default_server_url = "/".to_owned();
+        let default_server_variables = Vec::new();
         Self {
             http: ::reqwest::Client::builder().redirect(::reqwest::redirect::Policy::none()),
             base_url: None,
             limits: BodyLimits::process_default(),
             default_server_url,
             default_server_variables,
-            secondary_base_urls: ::std::collections::BTreeMap::new(),
             server_variables: ::std::collections::BTreeMap::new(),
         }
     }
@@ -76,24 +70,6 @@ impl ClientBuilder {
         self
     }
 
-    /// Overrides ONE secondary base URL by its documented key (companion §8: every distinct effective default server generates its own base).
-    /// An explicit `base_url` never affects these bases — it replaces only the primary (recorded decision); a relative secondary URL therefore REQUIRES an absolute value here (D-impl-relative-servers).
-    /// Keys are deterministic snake_case derivations of each server URL; declared keys for this client:
-    /// - `storage`: `/storage`
-    pub fn secondary_base_url(mut self, key: &str, value: impl Into<String>) -> Self {
-        self.secondary_base_urls
-            .insert(key.to_owned(), value.into());
-        self
-    }
-
-    /// Server variable `{region}` (declared default `us-east`; allowed values: us-east, eu-west)
-    /// One builder method per variable name controls EVERY base that declares it (companion §8); enum validation against the declared allowed values happens at `build` time.
-    pub fn region(mut self, value: impl Into<String>) -> Self {
-        self.server_variables
-            .insert("region".to_owned(), value.into());
-        self
-    }
-
     /// Builds the client (main spec §30.1, companion §8): every distinct base resolves independently — builder overrides or declared defaults, validated against their enums — and a non-absolute base without its own override is `ClientError::InvalidUrl` (D-impl-relative-servers).
     pub fn build(self) -> Result<Client, ClientError> {
         let base_url = match self.base_url {
@@ -111,90 +87,115 @@ impl ClientBuilder {
          absolute default server exists"
             )));
         }
-        let storage_override = self.secondary_base_urls.get("storage").cloned();
-        let url_storage = match storage_override {
-            Some(explicit) => explicit,
-            None => substitute_server_variables("/storage", &[], &self.server_variables)?,
-        };
-        let trimmed_storage = url_storage.trim_end_matches('/');
-        if !is_absolute_url(trimmed_storage) {
-            return Err(ClientError::InvalidUrl(format!(
-                "secondary base `storage` URL `{trimmed_storage}` is not absolute; \
-                 call `secondary_base_url` with an absolute value"
-            )));
-        }
         let http = self.http.build().map_err(ClientError::Transport)?;
         Ok(Client {
             http,
             base_url: trimmed.to_owned(),
             limits: self.limits,
-            base_url_storage: trimmed_storage.to_owned(),
         })
     }
 }
 
-/// Documented outcomes for `put_object` (main spec §8/§13): exhaustive match required; deliberately not `#[non_exhaustive]` (§47).
+/// Typed payload for status 201 of `create_session` (main spec §15 Output A): required headers as plain fields, optional headers as `Option<T>`, then the decoded body.
 #[derive(Debug)]
-pub enum PutObjectResponse {
-    /// HTTP 201 Created.
-    Created201,
-    /// HTTP 400 BadRequest.
-    BadRequest400(ProblemDetails),
-}
-
-/// Streaming payload for status 200 of `get_object` (main spec §32): owns the response plus its typed documented headers (§15, superseding D-impl-typed-headers-phase2).
-#[derive(Debug)]
-pub struct GetObject200 {
+pub struct CreateSession201 {
+    /// Documented response header `Location` (required).
+    pub location: String,
     /// Documented response header `ETag` (optional).
     pub e_tag: Option<String>,
-    /// Documented response header `Content-Length` (optional).
-    pub content_length: Option<i64>,
-    pub response: ::reqwest::Response,
+    pub body: Session,
 }
 
-impl GetObject200 {
-    /// Consumes the wrapper into the raw chunk stream (main spec §32).
-    pub fn into_bytes_stream(
-        self,
-    ) -> impl ::futures_core::Stream<Item = ::reqwest::Result<::bytes::Bytes>> {
-        self.response.bytes_stream()
-    }
-}
-
-/// Documented outcomes for `get_object` (main spec §8/§13): exhaustive match required; deliberately not `#[non_exhaustive]` (§47).
+/// Documented outcomes for `create_session` (main spec §8/§13): exhaustive match required; deliberately not `#[non_exhaustive]` (§47).
 #[derive(Debug)]
-pub enum GetObjectResponse {
+pub enum CreateSessionResponse {
+    /// HTTP 201 Created.
+    Created201(CreateSession201),
+    /// HTTP 401 Unauthorized.
+    Unauthorized401(ProblemDetails),
+}
+
+/// Typed payload for status 404 of `get_session` (main spec §15 Output A): required headers as plain fields, optional headers as `Option<T>`, then the decoded body.
+#[derive(Debug)]
+pub struct GetSession404 {
+    /// Documented response header `X-Request-Id` (required).
+    pub x_request_id: String,
+    pub body: ProblemDetails,
+}
+
+/// Documented outcomes for `get_session` (main spec §8/§13): exhaustive match required; deliberately not `#[non_exhaustive]` (§47).
+#[derive(Debug)]
+pub enum GetSessionResponse {
     /// HTTP 200 Ok.
-    Ok200(GetObject200),
+    Ok200(Session),
     /// HTTP 404 NotFound.
-    NotFound404(ProblemDetails),
+    NotFound404(GetSession404),
+}
+
+/// Documented outcomes for `put_cache_entry` (main spec §8/§13): exhaustive match required; deliberately not `#[non_exhaustive]` (§47).
+#[derive(Debug)]
+pub enum PutCacheEntryResponse {
+    /// HTTP 204 NoContent.
+    NoContent204,
 }
 
 impl Client {
-    /// `PUT` `/objects/{id}`.
-    /// Operation `putObject`.
-    pub async fn put_object(
+    /// `POST` `/sessions`.
+    /// Operation `createSession`.
+    pub async fn create_session(
         &self,
-        id: &str,
-        body: ::reqwest::Body,
-    ) -> Result<PutObjectResponse, ClientError> {
+        body: &CreateSessionForm,
+    ) -> Result<CreateSessionResponse, ClientError> {
         let mut url = self.base_url.clone();
-        url.push_str("/objects/");
-        let spec = ParamSpec::new("id", ParamStyle::Simple, false, false);
-        let value = ParamValue::Text(id.to_owned());
-        url.push_str(&encode_path(&spec, &value));
+        url.push_str("/sessions");
+        let payload = match serialize_form_limited(body, self.limits.structured_encode_bytes) {
+            Ok(payload) => payload,
+            Err(_) => return Err(encode_overflow_error(self.limits.structured_encode_bytes)),
+        };
         // §30.1: redirects are off by default so documented 3xx statuses reach the exhaustive enum; opt-in following never buffers bodies for replay.
         let response = self
             .http
-            .request(::http::Method::PUT, &url)
-            .header(::http::header::CONTENT_TYPE, "application/octet-stream")
-            .header(::http::header::ACCEPT, "application/problem+json")
-            .body(body)
+            .request(::http::Method::POST, &url)
+            .header(
+                ::http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .header(
+                ::http::header::ACCEPT,
+                "application/json, application/problem+json",
+            )
+            .body(payload)
             .send()
             .await?;
         match response.status() {
-            ::http::StatusCode::CREATED => Ok(PutObjectResponse::Created201),
-            ::http::StatusCode::BAD_REQUEST => {
+            ::http::StatusCode::CREATED => {
+                let location = parse_required_header::<String>(&response, "location")?;
+                let e_tag = parse_optional_header::<String>(&response, "etag")?;
+                let parsed = parse_response_content_type(&response)?;
+                let Some(parsed) = parsed else {
+                    return Err(ClientError::UnexpectedContentType {
+                        expected: vec!["application/json".to_owned()],
+                        actual: None,
+                    });
+                };
+                let content_type = mime_of(&parsed)?;
+                ensure_utf8_charset(&parsed)?;
+                let limit = self.limits.structured_response_bytes;
+                let bytes = collect_reqwest_limited(response, limit).await?;
+                if bytes.is_empty() {
+                    return Err(ClientError::Decode {
+                        content_type: Some(content_type),
+                        source: Box::new(EmptyJsonBody),
+                    });
+                }
+                let value: Session = json_decode(&bytes, Some(content_type))?;
+                Ok(CreateSessionResponse::Created201(CreateSession201 {
+                    location,
+                    e_tag,
+                    body: value,
+                }))
+            }
+            ::http::StatusCode::UNAUTHORIZED => {
                 let parsed = parse_response_content_type(&response)?;
                 let Some(parsed) = parsed else {
                     return Err(ClientError::UnexpectedContentType {
@@ -213,17 +214,17 @@ impl Client {
                     });
                 }
                 let value: ProblemDetails = json_decode(&bytes, Some(content_type))?;
-                Ok(PutObjectResponse::BadRequest400(value))
+                Ok(CreateSessionResponse::Unauthorized401(value))
             }
             other => Err(ClientError::UndocumentedStatus { status: other }),
         }
     }
 
-    /// `GET` `/objects/{id}`.
-    /// Operation `getObject`.
-    pub async fn get_object(&self, id: &str) -> Result<GetObjectResponse, ClientError> {
-        let mut url = self.base_url_storage.clone();
-        url.push_str("/objects/");
+    /// `GET` `/sessions/{id}`.
+    /// Operation `getSession`.
+    pub async fn get_session(&self, id: &str) -> Result<GetSessionResponse, ClientError> {
+        let mut url = self.base_url.clone();
+        url.push_str("/sessions/");
         let spec = ParamSpec::new("id", ParamStyle::Simple, false, false);
         let value = ParamValue::Text(id.to_owned());
         url.push_str(&encode_path(&spec, &value));
@@ -233,21 +234,34 @@ impl Client {
             .request(::http::Method::GET, &url)
             .header(
                 ::http::header::ACCEPT,
-                "application/octet-stream, application/problem+json",
+                "application/json, application/problem+json",
             )
             .send()
             .await?;
         match response.status() {
             ::http::StatusCode::OK => {
-                let e_tag = parse_optional_header::<String>(&response, "etag")?;
-                let content_length = parse_optional_header::<i64>(&response, "content-length")?;
-                Ok(GetObjectResponse::Ok200(GetObject200 {
-                    e_tag,
-                    content_length,
-                    response,
-                }))
+                let parsed = parse_response_content_type(&response)?;
+                let Some(parsed) = parsed else {
+                    return Err(ClientError::UnexpectedContentType {
+                        expected: vec!["application/json".to_owned()],
+                        actual: None,
+                    });
+                };
+                let content_type = mime_of(&parsed)?;
+                ensure_utf8_charset(&parsed)?;
+                let limit = self.limits.structured_response_bytes;
+                let bytes = collect_reqwest_limited(response, limit).await?;
+                if bytes.is_empty() {
+                    return Err(ClientError::Decode {
+                        content_type: Some(content_type),
+                        source: Box::new(EmptyJsonBody),
+                    });
+                }
+                let value: Session = json_decode(&bytes, Some(content_type))?;
+                Ok(GetSessionResponse::Ok200(value))
             }
             ::http::StatusCode::NOT_FOUND => {
+                let x_request_id = parse_required_header::<String>(&response, "x-request-id")?;
                 let parsed = parse_response_content_type(&response)?;
                 let Some(parsed) = parsed else {
                     return Err(ClientError::UnexpectedContentType {
@@ -266,8 +280,44 @@ impl Client {
                     });
                 }
                 let value: ProblemDetails = json_decode(&bytes, Some(content_type))?;
-                Ok(GetObjectResponse::NotFound404(value))
+                Ok(GetSessionResponse::NotFound404(GetSession404 {
+                    x_request_id,
+                    body: value,
+                }))
             }
+            other => Err(ClientError::UndocumentedStatus { status: other }),
+        }
+    }
+
+    /// `PUT` `/cache/{key}`.
+    /// Operation `putCacheEntry`.
+    pub async fn put_cache_entry(
+        &self,
+        key: &str,
+        body: &CacheEntryForm,
+    ) -> Result<PutCacheEntryResponse, ClientError> {
+        let mut url = self.base_url.clone();
+        url.push_str("/cache/");
+        let spec = ParamSpec::new("key", ParamStyle::Simple, false, false);
+        let value = ParamValue::Text(key.to_owned());
+        url.push_str(&encode_path(&spec, &value));
+        let payload = match serialize_form_limited(body, self.limits.structured_encode_bytes) {
+            Ok(payload) => payload,
+            Err(_) => return Err(encode_overflow_error(self.limits.structured_encode_bytes)),
+        };
+        // §30.1: redirects are off by default so documented 3xx statuses reach the exhaustive enum; opt-in following never buffers bodies for replay.
+        let response = self
+            .http
+            .request(::http::Method::PUT, &url)
+            .header(
+                ::http::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(payload)
+            .send()
+            .await?;
+        match response.status() {
+            ::http::StatusCode::NO_CONTENT => Ok(PutCacheEntryResponse::NoContent204),
             other => Err(ClientError::UndocumentedStatus { status: other }),
         }
     }
@@ -374,7 +424,32 @@ where
     })
 }
 
+/// Client-side encode overflow (§34.2): returned BEFORE anything is sent.
+#[must_use]
+fn encode_overflow_error(limit: usize) -> ClientError {
+    ClientError::BodyTooLarge {
+        direction: BodyLimitDirection::Encode,
+        limit,
+    }
+}
+
 /// Typed documented response headers (main spec §15): required headers missing from the response are protocol errors (`MissingRequiredHeader`), values failing their Rust type are `InvalidHeader`; both surface BEFORE the body is consumed. A repeated documented header reads its first occurrence.
+#[allow(clippy::missing_errors_doc)]
+fn parse_required_header<T>(
+    response: &::reqwest::Response,
+    wire: &'static str,
+) -> Result<T, ClientError>
+where
+    T: ::std::str::FromStr,
+    T::Err: ::std::error::Error + Send + Sync + 'static,
+{
+    let name = ::http::HeaderName::from_static(wire);
+    let Some(raw) = response.headers().get(&name) else {
+        return Err(ClientError::MissingRequiredHeader { name });
+    };
+    parse_header_value(name, raw)
+}
+
 #[allow(clippy::missing_errors_doc)]
 fn parse_optional_header<T>(
     response: &::reqwest::Response,
@@ -458,21 +533,6 @@ fn substitute_server_variables(
         )));
     }
     Ok(resolved)
-}
-
-/// One declared server variable in builder-ready form.
-#[must_use]
-fn server_variable(
-    name: &str,
-    default: &str,
-    allowed: &[&str],
-) -> (String, String, Option<Vec<String>>) {
-    let allowed = if allowed.is_empty() {
-        None
-    } else {
-        Some(allowed.iter().map(|value| (*value).to_owned()).collect())
-    };
-    (name.to_owned(), default.to_owned(), allowed)
 }
 
 /// Absolute-URL gate for the resolved base (D-impl-relative-servers): scheme + `://` + non-empty remainder.

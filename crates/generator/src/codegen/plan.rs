@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::diagnostics::{Diagnostic, Diagnostics, DocumentPath};
 use crate::ir::document::{
     ContentEntryIr, HttpMethod, MediaClass, ParameterIr, ParameterLocation, ParameterStyle,
-    RangeClass, ResponseStatusKey, ServerIr,
+    RangeClass, ResponseEntryIr, ResponseStatusKey, ServerIr,
 };
 use crate::ir::schema::{SchemaId, SchemaKind};
 use crate::normalize::composition::ResolvedKind;
@@ -75,11 +75,29 @@ pub struct PlannedStatus {
     /// `ClientError4xx`/`ServerError5xx` for ranges, `Default` last).
     pub enum_variant: String,
     pub contents: Vec<PlannedContent>,
+    /// Typed documented headers (main spec §15): wire names verbatim,
+    /// declaration order; empty when none are documented.
+    pub headers: Vec<PlannedResponseHeader>,
     /// 204/205/304 (§35): unit variant ignoring any documented bytes.
     pub is_no_body_status: bool,
     /// True for explicit 2xx codes and the `2XX` range; selects the bounded
     /// collection limit (structured vs. error budget, Example 1 pattern).
     pub is_success_class: bool,
+}
+
+/// One typed response header planned from a Header Object (main spec §15):
+/// scalar schemas only in v1 — string→String, integer int32→i32 else i64,
+/// number→f64, boolean→bool; arrays and composites stop with an Error
+/// diagnostic. `rust_name` runs the snake_case naming pipeline with numeric
+/// collision suffixes by declaration order (companion §10/D-§6); `wire_name`
+/// stays verbatim and is validated as an RFC 9110 field name so generated
+/// code can use `http::HeaderName::from_static`.
+#[derive(Debug, Clone)]
+pub struct PlannedResponseHeader {
+    pub rust_name: String,
+    pub wire_name: String,
+    pub required: bool,
+    pub rust_type: String,
 }
 
 /// One media-type entry of a request body or response status.
@@ -155,12 +173,16 @@ fn plan_operation(
     let location = operation_location(operation);
 
     // Request body planning; unsupported media classes stop-and-report.
+    // UrlEncodedForm requests are honored in this phase (main spec §16,
+    // D-impl-forms-phase2 superseding the deferral); response-side forms and
+    // the remaining Phase 2 media classes still stop-and-report.
     let mut request_contents = Vec::new();
     let mut request_body_enum_name = None;
     let mut request_body_required = false;
     if let Some(body) = &operation.request_body {
         request_body_required = body.required;
-        request_contents = plan_contents(doc, &location, &body.content, diags);
+        request_contents =
+            plan_contents(doc, &location, &body.content, diags, ContentSide::Request);
         if request_contents.len() >= 2 {
             let stem = operation
                 .response_enum
@@ -178,10 +200,18 @@ fn plan_operation(
         .iter()
         .enumerate()
         .map(|(index, response)| {
-            let contents = plan_contents(doc, &location, &response.content, diags);
+            let contents = plan_contents(
+                doc,
+                &location,
+                &response.content,
+                diags,
+                ContentSide::Response,
+            );
+            let headers = plan_response_headers(doc, response, operation.method, &location, diags);
             let status = PlannedStatus {
                 key: response.status,
                 enum_variant: variant_name(&response.status),
+                headers,
                 is_no_body_status: matches!(
                     response.status,
                     ResponseStatusKey::Explicit(204 | 205 | 304)
@@ -351,32 +381,47 @@ pub(crate) fn reason_phrase(code: u16) -> Option<&'static str> {
     })
 }
 
-/// Plans one content list: Phase 1 media classes only, stop-and-report on the
-/// rest (UrlEncodedForm/Multipart/EventStream/Ndjson/JsonSeq are later
-/// phases per DECISIONS.md D-impl-forms-phase2 and main spec §52).
+/// Which side of an operation a content list belongs to: UrlEncodedForm is
+/// honored for REQUESTS in this phase (main spec §16) while every response
+/// list still stops on it (D-impl-forms-phase2 scope note).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentSide {
+    Request,
+    Response,
+}
+
+/// Plans one content list: Phase 1 media classes plus request-side
+/// UrlEncodedForm; everything else stop-and-reports (Multipart/EventStream/
+/// Ndjson/JsonSeq and response-side forms are later-phase deliverables,
+/// DECISIONS.md D-impl-forms-phase2 and main spec §52).
 fn plan_contents(
     doc: &NormalizedDocument,
     location: &DocumentPath,
     contents: &[ContentEntryIr],
     diags: &mut Diagnostics,
+    side: ContentSide,
 ) -> Vec<PlannedContent> {
     let mut planned = Vec::with_capacity(contents.len());
     let mut used_variants: BTreeSet<String> = BTreeSet::new();
     for entry in contents {
-        if matches!(
-            entry.media_class,
-            MediaClass::UrlEncodedForm
-                | MediaClass::Multipart
-                | MediaClass::EventStream
-                | MediaClass::Ndjson
-                | MediaClass::JsonSeq
-        ) {
+        let form_rejected = matches!(entry.media_class, MediaClass::UrlEncodedForm)
+            && side == ContentSide::Response;
+        if form_rejected
+            || matches!(
+                entry.media_class,
+                MediaClass::Multipart
+                    | MediaClass::EventStream
+                    | MediaClass::Ndjson
+                    | MediaClass::JsonSeq
+            )
+        {
             diags.error(
                 location.key("content").key(entry.media_type.clone()),
                 "client_media_class_phase1",
                 format!(
-                    "Phase 1 does not generate media class {:?} for `{}`; forms, \
-                     multipart, SSE, NDJSON, and JSON sequences are later phases",
+                    "this phase does not generate media class {:?} for `{}` \
+                     here; forms decode on requests only, multipart, SSE, \
+                     NDJSON, and JSON sequences remain later phases",
                     entry.media_class, entry.media_type
                 ),
             );
@@ -387,6 +432,7 @@ fn plan_contents(
         let variant = unique_variant(&variant_base, &mut used_variants);
         let model_expr = match entry.media_class {
             MediaClass::JsonFamily => json_model_expr(doc, entry.schema, location, diags),
+            MediaClass::UrlEncodedForm => json_model_expr(doc, entry.schema, location, diags),
             MediaClass::PlainText => "String".to_owned(),
             // Binary/RawUnknown stream; each emitter renders its own payload.
             _ => String::new(),
@@ -585,6 +631,150 @@ fn effective_kind(doc: &NormalizedDocument, effective: SchemaId) -> Box<SchemaKi
     match doc.resolution(effective).kind.clone() {
         ResolvedKind::IntersectedScalar(scalar) => Box::new(scalar.base_kind),
         _ => Box::new(doc.arena.get(effective).kind.clone()),
+    }
+}
+
+// ----------------------------------------------------------------------
+// Typed response headers (main spec §15)
+// ----------------------------------------------------------------------
+
+/// Plans the typed header fields of one response (main spec §15): scalar
+/// schemas map like parameters; arrays/composites stop with an Error
+/// diagnostic. No-body statuses (§35) refuse documented headers outright —
+/// their unit variants would silently drop contract information.
+fn plan_response_headers(
+    doc: &NormalizedDocument,
+    response: &ResponseEntryIr,
+    http_method: HttpMethod,
+    location: &DocumentPath,
+    diags: &mut Diagnostics,
+) -> Vec<PlannedResponseHeader> {
+    if response.headers.is_empty() {
+        return Vec::new();
+    }
+    let header_location = || location.key("responses").key(status_label(response));
+    if matches!(
+        response.status,
+        ResponseStatusKey::Explicit(204 | 205 | 304)
+    ) {
+        diags.error(
+            header_location().key("headers"),
+            "headers_on_no_body_status",
+            format!(
+                "status {} documents headers, but no-body statuses (204/205/304, \
+                 main spec §35) keep unit variants and cannot carry them; move \
+                 the headers to another status",
+                crate::normalize::status_label(&response.status)
+            ),
+        );
+        return Vec::new();
+    }
+    if http_method == HttpMethod::Head {
+        // §35 wants HEAD decoders to surface typed headers without touching
+        // the body; that dedicated decoder shape remains a later-phase
+        // deliverable, so stop-and-report instead of improvising.
+        diags.error(
+            header_location().key("headers"),
+            "headers_on_head_operation",
+            "operation documents response headers on a HEAD request (main \
+             spec §35); the typed-header HEAD decoder shape is a \
+             later-phase deliverable"
+                .to_owned(),
+        );
+        return Vec::new();
+    }
+    // rust_name collisions inside one status get numeric suffixes ordered by
+    // declaration position (companion §10/D-§6).
+    let mut used_names: BTreeMap<String, u32> = BTreeMap::new();
+    let mut planned = Vec::with_capacity(response.headers.len());
+    for (wire_name, header) in &response.headers {
+        if !is_valid_field_name(wire_name) {
+            diags.error(
+                header_location().key("headers").key(wire_name.clone()),
+                "header_wire_name_invalid",
+                format!(
+                    "`{wire_name}` is not a valid HTTP field name, so generated \
+                     code could not address it on the wire"
+                ),
+            );
+            continue;
+        }
+        let base = naming::ident(wire_name, NameStyle::Snake);
+        let counter = used_names.entry(base.clone()).or_insert(0);
+        *counter += 1;
+        let rust_name = if *counter == 1 {
+            base
+        } else {
+            naming::sanitize_joined(&format!("{base}_{counter}"))
+        };
+        let schema = doc.resolve_alias(header.schema);
+        let kind = effective_kind(doc, schema);
+        let Some(rust_type) = header_rust_type(&kind) else {
+            diags.error(
+                header_location().key("headers").key(wire_name.clone()),
+                "header_schema_unsupported",
+                format!(
+                    "header `{wire_name}` needs a composite or array schema, which \
+                     this phase's typed response headers cannot represent; use a \
+                     scalar (string/integer/number/boolean)"
+                ),
+            );
+            continue;
+        };
+        planned.push(PlannedResponseHeader {
+            rust_name,
+            wire_name: wire_name.clone(),
+            required: header.required,
+            rust_type,
+        });
+    }
+    planned
+}
+
+fn status_label(response: &ResponseEntryIr) -> String {
+    crate::normalize::status_label(&response.status)
+}
+
+/// RFC 9110 field-name token: ASCII alphanumerics plus `!#$%&'*+-.^_`|~`.
+/// Planning rejects anything else so generated code can rely on
+/// `http::HeaderName::from_static`.
+fn is_valid_field_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+/// Scalar header representation mirroring the parameter mapping minus
+/// arrays: string→String, integer int32→i32 else i64, number→f64,
+/// boolean→bool; every other shape stops at the caller with a diagnostic.
+fn header_rust_type(kind: &SchemaKind) -> Option<String> {
+    match kind {
+        SchemaKind::Boolean => Some("bool".to_owned()),
+        SchemaKind::Integer { format } => Some(match format.as_deref() {
+            Some("int32") => "i32".to_owned(),
+            _ => "i64".to_owned(),
+        }),
+        SchemaKind::Number { .. } => Some("f64".to_owned()),
+        SchemaKind::String_ { .. } => Some("String".to_owned()),
+        _ => None,
     }
 }
 

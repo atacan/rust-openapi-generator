@@ -161,4 +161,19 @@ pub mod fixtures {
             include!(concat!(env!("OUT_DIR"), "/09_optional_body/server.rs"));
         }
     }
+
+    pub mod fixture_10_forms_headers {
+        pub mod models {
+            include!(concat!(env!("OUT_DIR"), "/10_forms_headers/models.rs"));
+        }
+        pub mod views {
+            include!(concat!(env!("OUT_DIR"), "/10_forms_headers/views.rs"));
+        }
+        pub mod client {
+            include!(concat!(env!("OUT_DIR"), "/10_forms_headers/client.rs"));
+        }
+        pub mod server {
+            include!(concat!(env!("OUT_DIR"), "/10_forms_headers/server.rs"));
+        }
+    }
 }

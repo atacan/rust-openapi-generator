@@ -13,6 +13,7 @@ use bytes::Bytes;
 use openapi_conformance::fixtures::fixture_01_json_roundtrip as fx01;
 use openapi_conformance::fixtures::fixture_02_streaming_binary as fx02;
 use openapi_conformance::fixtures::fixture_09_optional_body as fx09;
+use openapi_support::limits::BodyLimits;
 use openapi_support::optional::OptionalField;
 use tower::ServiceExt;
 
@@ -371,4 +372,154 @@ async fn test46_chunked_stream_presence_and_empty_stream_absence() {
         vec![None],
         "empty stream must decode as ABSENT"
     );
+}
+
+// ----------------------------------------------------------------------
+// Fixture 10 — form decode rejections (§16, §39) + §48 checked ctors
+// ----------------------------------------------------------------------
+
+use openapi_conformance::fixtures::fixture_10_forms_headers as fx10;
+
+struct CountingSessionsApp(Arc<AtomicUsize>);
+
+#[async_trait]
+impl fx10::server::Api for CountingSessionsApp {
+    async fn create_session(
+        &self,
+        _form: fx10::models::CreateSessionForm,
+    ) -> fx10::server::CreateSessionResponse {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        unreachable!("application must never observe a rejected request")
+    }
+
+    async fn get_session(&self, _id: String) -> fx10::server::GetSessionResponse {
+        unreachable!("not exercised")
+    }
+
+    async fn put_cache_entry(
+        &self,
+        _key: String,
+        _body: fx10::models::CacheEntryForm,
+    ) -> fx10::server::PutCacheEntryResponse {
+        unreachable!("not exercised")
+    }
+}
+
+/// Malformed form framing (`%GZ` escape) is a syntactic failure: 400
+/// MalformedBody BEFORE the handler runs (§39 row 2).
+#[tokio::test]
+async fn fixture_10_malformed_form_body_is_a_400_and_skips_the_handler() {
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let api = Arc::new(CountingSessionsApp(invocations.clone()));
+    let (limits, hook) = common::router_args();
+    let router = fx10::server::router(api, limits, hook);
+
+    let response = router
+        .oneshot(
+            ::http::Request::builder()
+                .method(::http::Method::POST)
+                .uri("/sessions")
+                .header(
+                    ::http::header::CONTENT_TYPE,
+                    "application/x-www-form-urlencoded",
+                )
+                .body(axum::body::Body::from("username=a&password=%GZ"))
+                .expect("request"),
+        )
+        .await
+        .expect("in-memory service");
+
+    assert_eq!(response.status(), ::http::StatusCode::BAD_REQUEST);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    assert!(bytes.is_empty(), "rejection bodies stay empty (§39 rule 3)");
+    assert_eq!(
+        invocations.load(Ordering::SeqCst),
+        0,
+        "handler must not run"
+    );
+}
+
+/// A form body over `structured_request_bytes` is rejected with 413
+/// BodyTooLarge before any parsing work (§33/§39).
+#[tokio::test]
+async fn fixture_10_oversized_form_body_is_a_413() {
+    struct NeverApp;
+    #[async_trait]
+    impl fx10::server::Api for NeverApp {
+        async fn create_session(
+            &self,
+            _form: fx10::models::CreateSessionForm,
+        ) -> fx10::server::CreateSessionResponse {
+            unreachable!("not exercised")
+        }
+        async fn get_session(&self, _id: String) -> fx10::server::GetSessionResponse {
+            unreachable!("not exercised")
+        }
+        async fn put_cache_entry(
+            &self,
+            _key: String,
+            _body: fx10::models::CacheEntryForm,
+        ) -> fx10::server::PutCacheEntryResponse {
+            unreachable!("not exercised")
+        }
+    }
+    let api = Arc::new(NeverApp);
+    let tiny = BodyLimits {
+        structured_request_bytes: 16,
+        ..BodyLimits::process_default()
+    };
+    let hook = Arc::new(openapi_support::hooks::NoOpEncodeOverflowHook);
+    let router = fx10::server::router(api, tiny, hook);
+
+    // 32 bytes of well-formed pairs — the size gate wins BEFORE parsing.
+    let response = router
+        .oneshot(
+            ::http::Request::builder()
+                .method(::http::Method::POST)
+                .uri("/sessions")
+                .header(
+                    ::http::header::CONTENT_TYPE,
+                    "application/x-www-form-urlencoded",
+                )
+                .body(axum::body::Body::from(
+                    "username=aaaaaaaaaaaaaaaaaaaaaa&password=b",
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("in-memory service");
+    assert_eq!(response.status(), ::http::StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// A documented header value that cannot become an HTTP value is rejected by
+/// the §48 checked constructor at construction time.
+#[test]
+fn fixture_10_checked_ctor_rejects_unconvertible_header_values() {
+    use openapi_support::response_headers::InvalidResponseHeader;
+
+    let error = fx10::server::CreateSession201::new(
+        "bad\r\nsplit".to_owned(), // CR/LF can never enter a HeaderValue
+        None,
+        fx10::models::Session {
+            id: "s".to_owned(),
+            token: OptionalField::Absent,
+        },
+    )
+    .expect_err("CR/LF Location must fail conversion");
+    assert!(matches!(error, InvalidResponseHeader { .. }));
+    assert!(error.to_string().contains("location"));
+
+    // The legal twin constructs.
+    let ok = fx10::server::CreateSession201::new(
+        "/sessions/s".to_owned(),
+        Some("\"e\"".to_owned()),
+        fx10::models::Session {
+            id: "s".to_owned(),
+            token: OptionalField::Absent,
+        },
+    )
+    .expect("legal values construct");
+    assert_eq!(ok.location, "/sessions/s");
 }

@@ -23,6 +23,7 @@ const SNAPSHOT_FIXTURES: &[&str] = &[
     "02_streaming_binary.yaml",
     "03_nested_content.yaml",
     "04_status_ranges.yaml",
+    "10_forms_headers.yaml",
 ];
 
 /// Every fixture must plan + render without diagnostics (07/08 included).
@@ -36,6 +37,7 @@ const ALL_FIXTURES: &[&str] = &[
     "06b_oas31.yaml",
     "07_matrix.yaml",
     "08_views.yaml",
+    "10_forms_headers.yaml",
 ];
 
 fn fixtures_dir() -> PathBuf {
@@ -468,4 +470,151 @@ fn method_block(output: &str, name: &str) -> String {
         .find("\n    }\n")
         .map_or(rest.len(), |index| index + "\n    }\n".len());
     rest[..end].to_owned()
+}
+
+// ----------------------------------------------------------------------
+// Typed response headers (§15) — synthetic document, no committed fixture
+// ----------------------------------------------------------------------
+
+const HEADERS_FIXTURE: &str = r#"openapi: 3.1.0
+info:
+  title: typed headers
+  version: "1"
+paths:
+  /multi:
+    get:
+      operationId: getMulti
+      responses:
+        '200':
+          description: Either representation plus typed headers
+          headers:
+            X-Request-Id:
+              required: true
+              schema:
+                type: string
+            Retry-After-Seconds:
+              schema:
+                type: integer
+                format: int32
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Doc'
+            text/plain:
+              schema:
+                type: string
+        '302':
+          description: Redirect with a header and no body
+          headers:
+            Location:
+              required: true
+              schema:
+                type: string
+components:
+  schemas:
+    Doc:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+"#;
+
+/// Pins the §15 client shapes that no committed fixture covers: multi-content
+/// hoisting onto the status VARIANT, header-only struct variants, and
+/// collision-suffixed header naming. The rendered module is additionally
+/// checked against rustfmt so the new emission paths stay canonical.
+#[test]
+fn headers_hoist_onto_multi_content_variants_and_header_only_statuses() {
+    let dir = std::env::temp_dir().join(format!("o2r-client-headers-{}-a", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create fixture dir");
+    let fixture_path = dir.join("typed_headers.yaml");
+    std::fs::write(&fixture_path, HEADERS_FIXTURE).expect("write synthetic fixture");
+
+    let ir = load_document("typed_headers.yaml", &dir, &LoadConfig::default())
+        .unwrap_or_else(|diags| panic!("headers fixture must load: {diags:?}"));
+    let doc = normalize_with_config(ir, &NormalizeConfig::default())
+        .unwrap_or_else(|diags| panic!("headers fixture must normalize: {diags:?}"));
+    let plan =
+        plan_api(&doc).unwrap_or_else(|diags| panic!("headers fixture must plan: {diags:?}"));
+    let output = generate_client(&doc, &plan);
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Hoisted multi-content variant: typed fields beside the content enum;
+    // snake_case naming keeps declaration order (companion §10/D-§6).
+    let response_enum = enum_block(&output, "GetMultiResponse");
+    assert!(response_enum.contains("Ok200 {"), "{response_enum}");
+    assert!(
+        response_enum.contains("pub x_request_id: String,"),
+        "{response_enum}"
+    );
+    assert!(
+        response_enum.contains("pub retry_after_seconds: Option<i32>,"),
+        "{response_enum}"
+    );
+    assert!(
+        response_enum.contains("content: GetMulti200Content,"),
+        "{response_enum}"
+    );
+
+    // Header-only 302: exactly the typed headers, never a body field.
+    assert!(output.contains("Found302 {"), "\n{output}");
+    assert!(
+        response_enum.contains("pub location: String,"),
+        "{response_enum}"
+    );
+
+    // The 302 decode arm reads the header BEFORE constructing the variant
+    // and never touches a body.
+    let method = method_block(&output, "get_multi");
+    assert!(
+        method.contains("parse_required_header::<String>(&response, \"location\")?"),
+        "{method}"
+    );
+    assert!(
+        method.contains("Ok(GetMultiResponse::Found302 {"),
+        "{method}"
+    );
+}
+
+/// The synthetic §15 module must also be rustfmt-clean so its emission paths
+/// stay canonical (main spec §50 test 40).
+#[test]
+fn headers_fixture_client_is_rustfmt_clean() {
+    let Some(rustfmt) = locate_rustfmt() else {
+        eprintln!("WARNING: no rustfmt on PATH; skipping");
+        return;
+    };
+    let workdir =
+        std::env::temp_dir().join(format!("o2r-client-headers-fmt-{}", std::process::id()));
+    std::fs::create_dir_all(&workdir).expect("create fixture dir");
+    let fixture_path = workdir.join("typed_headers.yaml");
+    std::fs::write(&fixture_path, HEADERS_FIXTURE).expect("write synthetic fixture");
+
+    let ir = load_document("typed_headers.yaml", &workdir, &LoadConfig::default())
+        .unwrap_or_else(|diags| panic!("headers fixture must load: {diags:?}"));
+    let doc = normalize_with_config(ir, &NormalizeConfig::default())
+        .unwrap_or_else(|diags| panic!("headers fixture must normalize: {diags:?}"));
+    let plan =
+        plan_api(&doc).unwrap_or_else(|diags| panic!("headers fixture must plan: {diags:?}"));
+    let output = generate_client(&doc, &plan);
+
+    let source = workdir.join("typed_headers.client.rs");
+    std::fs::write(&source, &output).expect("write generated client");
+
+    let checked = std::process::Command::new(&rustfmt)
+        .arg("--edition")
+        .arg("2021")
+        .arg("--check")
+        .arg(&source)
+        .output()
+        .expect("spawn rustfmt");
+    let _ = std::fs::remove_dir_all(&workdir);
+    assert!(
+        checked.status.success(),
+        "synthetic headers client is not rustfmt-clean\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr),
+    );
 }

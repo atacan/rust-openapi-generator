@@ -1,0 +1,125 @@
+# Fixture 10 — URL-encoded forms (main spec §16) and typed response headers
+# (§15). createSession posts a REQUIRED form body (username/password plus an
+# optional remember_me boolean) and answers 201 JSON documenting Location
+# (required) and ETag (optional) response headers. getSession returns 200
+# JSON or 404 problem+json WITH a required `X-Request-Id` header exercising
+# the snake_case naming pipeline (`x_request_id`). putCacheEntry is a form op
+# whose 204 documents NO headers, pinning the unit no-body variant (§35).
+openapi: 3.1.0
+info:
+  title: forms and headers
+  version: "1"
+paths:
+  /sessions:
+    post:
+      operationId: createSession
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/CreateSessionForm'
+      responses:
+        '201':
+          description: Session created
+          headers:
+            Location:
+              description: URL of the created session
+              required: true
+              schema:
+                type: string
+                format: uri
+            ETag:
+              description: entity tag of the session representation
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '401':
+          description: Invalid credentials
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+  /sessions/{id}:
+    get:
+      operationId: getSession
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '404':
+          description: Missing session
+          headers:
+            X-Request-Id:
+              description: correlation id assigned by the server
+              required: true
+              schema:
+                type: string
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+  /cache/{key}:
+    put:
+      operationId: putCacheEntry
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/CacheEntryForm'
+      responses:
+        '204':
+          description: Stored
+components:
+  schemas:
+    CreateSessionForm:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+        remember_me:
+          type: boolean
+    CacheEntryForm:
+      type: object
+      properties:
+        ttl_seconds:
+          type: integer
+          format: int32
+    Session:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+        token:
+          type: string
+    ProblemDetails:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+        detail:
+          type: string

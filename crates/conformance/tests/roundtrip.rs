@@ -16,6 +16,7 @@ use openapi_conformance::fixtures::fixture_01_json_roundtrip as fx01;
 use openapi_conformance::fixtures::fixture_02_streaming_binary as fx02;
 use openapi_conformance::fixtures::fixture_03_nested_content as fx03;
 use openapi_conformance::fixtures::fixture_04_status_ranges as fx04;
+use openapi_conformance::fixtures::fixture_10_forms_headers as fx10;
 use openapi_support::hooks::EncodeOverflowHook;
 use openapi_support::limits::BodyLimits;
 use openapi_support::optional::OptionalField;
@@ -160,6 +161,9 @@ impl fx02::server::Api for StorageApp {
             .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
             .collect();
         fx02::server::GetObjectResponse::Ok200(fx02::server::GetObject200 {
+            // Typed documented headers (main spec §15): both optional here.
+            e_tag: Some("\"etag-1\"".to_owned()),
+            content_length: Some(stored.len() as i64),
             body: ::axum::body::Body::from_stream(futures_util::stream::iter(chunks)),
         })
     }
@@ -216,12 +220,15 @@ async fn fixture_02_streaming_round_trip_stays_chunked_and_hits_both_bases() {
         "upload must arrive in multiple chunks, got {received}"
     );
 
-    // Download: streamed back and reassembled byte-for-byte equal.
+    // Download: streamed back and reassembled byte-for-byte equal, with the
+    // typed documented headers decoded beside the raw response (§15).
     let expected = common::pattern_payload(CHUNK_COUNT * CHUNK_LEN, CHUNK_LEN);
     let downloaded = client.get_object("blob").await.expect("200 documented");
     let fx02::client::GetObjectResponse::Ok200(wrapper) = downloaded else {
         panic!("expected Ok200 wrapper");
     };
+    assert_eq!(wrapper.e_tag.as_deref(), Some("\"etag-1\""));
+    assert_eq!(wrapper.content_length, Some(expected.len() as i64));
     let mut stream = wrapper.into_bytes_stream();
     let mut reassembled = Vec::with_capacity(expected.len());
     let mut download_chunks = 0_usize;
@@ -374,7 +381,6 @@ fn status_client(
         .build()
         .expect("client builds")
 }
-
 #[tokio::test]
 async fn fixture_04_status_precedence_and_range_carry() {
     let app = Arc::new(StatusScriptApp {
@@ -415,5 +421,167 @@ async fn fixture_04_status_precedence_and_range_carry() {
             assert_eq!(body.title, "status 599");
         }
         other => panic!("599 must fall into Default, got {other:?}"),
+    }
+}
+
+// ----------------------------------------------------------------------
+// Fixture 10 — URL-encoded forms (§16) + typed response headers (§15)
+// ----------------------------------------------------------------------
+
+struct SessionApp {
+    /// When false, the 201 omits the optional ETag (absent vs present).
+    etag_enabled: AtomicBool,
+}
+
+#[async_trait]
+impl fx10::server::Api for SessionApp {
+    async fn create_session(
+        &self,
+        form: fx10::models::CreateSessionForm,
+    ) -> fx10::server::CreateSessionResponse {
+        // The decoded form drives the response so equality is observable
+        // end to end.
+        let etag = if self.etag_enabled.load(Ordering::SeqCst) {
+            Some(format!("\"{}\"", form.username))
+        } else {
+            None
+        };
+        let session = fx10::models::Session {
+            id: format!("s-{}", form.username),
+            token: OptionalField::Absent,
+        };
+        // Checked constructor path (§48): validated eagerly.
+        match fx10::server::CreateSession201::new(
+            format!("/sessions/s-{}", form.username),
+            etag,
+            session,
+        ) {
+            Ok(payload) => fx10::server::CreateSessionResponse::Created201(payload),
+            Err(error) => panic!("checked ctor rejected a legal value: {error}"),
+        }
+    }
+
+    async fn get_session(&self, _id: String) -> fx10::server::GetSessionResponse {
+        unreachable!("not exercised in this suite")
+    }
+
+    async fn put_cache_entry(
+        &self,
+        _key: String,
+        _body: fx10::models::CacheEntryForm,
+    ) -> fx10::server::PutCacheEntryResponse {
+        fx10::server::PutCacheEntryResponse::NoContent204
+    }
+}
+
+fn spawn_sessions(app: Arc<SessionApp>) -> std::net::SocketAddr {
+    let (limits, hook) = common::router_args();
+    common::spawn_router(fx10::server::router(app, limits, hook))
+}
+
+fn sessions_client(address: std::net::SocketAddr) -> fx10::client::Client {
+    fx10::client::ClientBuilder::new()
+        .base_url(common::base_url(address))
+        .build()
+        .expect("client builds")
+}
+
+/// Form POST round trip BOTH directions: client bounded-encodes the form
+/// (§34/§16), the router decodes it into the flat struct, and the 201
+/// carries typed Location (required) + ETag (optional) headers that the
+/// client parses beside the JSON body (§15 Output A).
+#[tokio::test]
+async fn fixture_10_form_round_trip_with_typed_headers() {
+    let app = Arc::new(SessionApp {
+        etag_enabled: AtomicBool::new(true),
+    });
+    let address = spawn_sessions(app.clone());
+    let client = sessions_client(address);
+
+    let sent = fx10::models::CreateSessionForm {
+        username: "ada".to_owned(),
+        password: "s3cret&=+".to_owned(), // exercises percent/+ encoding
+        remember_me: OptionalField::Present(true),
+    };
+    let response = client.create_session(&sent).await.expect("201 documented");
+    match response {
+        fx10::client::CreateSessionResponse::Created201(payload) => {
+            assert_eq!(payload.location, "/sessions/s-ada");
+            assert_eq!(payload.e_tag.as_deref(), Some("\"ada\""));
+            assert_eq!(
+                payload.body,
+                fx10::models::Session {
+                    id: "s-ada".to_owned(),
+                    token: OptionalField::Absent,
+                }
+            );
+        }
+        other => panic!("expected Created201, got {other:?}"),
+    }
+}
+
+/// Optional documented header ABSENT on the wire: the client still decodes
+/// the variant with `e_tag: None` (required Location stays mandatory).
+#[tokio::test]
+async fn fixture_10_absent_optional_header_decodes_as_none() {
+    let app = Arc::new(SessionApp {
+        etag_enabled: AtomicBool::new(false),
+    });
+    let address = spawn_sessions(app);
+    let client = sessions_client(address);
+
+    let sent = fx10::models::CreateSessionForm {
+        username: "bob".to_owned(),
+        password: "hunter2".to_owned(),
+        remember_me: OptionalField::Absent,
+    };
+    let response = client.create_session(&sent).await.expect("201 documented");
+    match response {
+        fx10::client::CreateSessionResponse::Created201(payload) => {
+            assert_eq!(payload.e_tag, None, "absent ETag must decode as None");
+            assert_eq!(payload.location, "/sessions/s-bob");
+            // remember_me absent on the wire round-trips as Absent.
+            let _ = sent;
+        }
+        other => panic!("expected Created201, got {other:?}"),
+    }
+}
+
+/// A required documented header missing from the response is a protocol
+/// error (`MissingRequiredHeader`), never a silently-filled variant (§15).
+#[tokio::test]
+async fn fixture_10_missing_required_location_header_is_a_client_error() {
+    // Hostile endpoint answering 201 WITHOUT the required Location header —
+    // impossible from the generated server, so hand-written.
+    let hostile = axum::Router::new().route(
+        "/sessions",
+        axum::routing::post(|| async {
+            (
+                ::http::StatusCode::CREATED,
+                [(::http::header::CONTENT_TYPE, "application/json".to_owned())],
+                "{\"id\":\"s-x\"}",
+            )
+        }),
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let listener = tokio::net::TcpListener::from_std(listener).expect("std listener");
+    let address = listener.local_addr().expect("addr");
+    tokio::spawn(async move { axum::serve(listener, hostile).await.expect("serve") });
+
+    let client = sessions_client(address);
+    let error = client
+        .create_session(&fx10::models::CreateSessionForm {
+            username: "x".to_owned(),
+            password: "y".to_owned(),
+            remember_me: OptionalField::Absent,
+        })
+        .await
+        .expect_err("missing Location must fail");
+    match error {
+        openapi_support::client_error::ClientError::MissingRequiredHeader { name } => {
+            assert_eq!(name, ::http::HeaderName::from_static("location"));
+        }
+        other => panic!("expected MissingRequiredHeader, got {other:?}"),
     }
 }
