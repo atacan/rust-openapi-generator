@@ -1,0 +1,518 @@
+//! Server-emission harness: loads every committed fixture through
+//! `load_document` → `normalize_with_config` → `codegen::plan::plan_api` →
+//! `generate_server`, compares the rendered `server.rs` byte-for-byte against
+//! snapshots under `tests/snapshots/`, asserts rustfmt-cleanliness (main spec
+//! §50 test 40) and double-generation determinism (test 39), pins the §8
+//! Output B / §22 / §23–§24 / §38 / §39 server shapes each fixture exists to
+//! cover, and greps every snapshot for the forbidden patterns of §49.
+//!
+//! Snapshot regeneration: `SERVER_SNAPSHOT_UPDATE=1 cargo test`.
+
+use std::path::PathBuf;
+
+use openapi_to_rust_generator::codegen::plan::plan_api;
+use openapi_to_rust_generator::codegen::server::generate_server;
+use openapi_to_rust_generator::normalize::{
+    normalize_with_config, NormalizeConfig, NormalizedDocument,
+};
+use openapi_to_rust_generator::parse::{load_document, LoadConfig};
+
+/// Fixtures with committed snapshots (byte-compare).
+const SNAPSHOT_FIXTURES: &[&str] = &[
+    "01_json_roundtrip.yaml",
+    "02_streaming_binary.yaml",
+    "03_nested_content.yaml",
+    "04_status_ranges.yaml",
+    "05_composition.yaml",
+    "06a_oas30.yaml",
+    "06b_oas31.yaml",
+    "07_matrix.yaml",
+    "08_views.yaml",
+];
+
+/// Every fixture must plan + render without diagnostics.
+const ALL_FIXTURES: &[&str] = &[
+    "01_json_roundtrip.yaml",
+    "02_streaming_binary.yaml",
+    "03_nested_content.yaml",
+    "04_status_ranges.yaml",
+    "05_composition.yaml",
+    "06a_oas30.yaml",
+    "06b_oas31.yaml",
+    "07_matrix.yaml",
+    "08_views.yaml",
+];
+
+fn fixtures_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures")
+}
+
+fn snapshots_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("snapshots")
+}
+
+fn normalize_fixture(name: &str) -> NormalizedDocument {
+    let ir = load_document(name, &fixtures_dir(), &LoadConfig::default())
+        .unwrap_or_else(|diags| panic!("{name} must load: {diags:?}"));
+    normalize_with_config(ir, &NormalizeConfig::default())
+        .unwrap_or_else(|diags| panic!("{name} must normalize: {diags:?}"))
+}
+
+fn generate_fixture(name: &str) -> String {
+    let doc = normalize_fixture(name);
+    let plan = plan_api(&doc).unwrap_or_else(|diags| panic!("{name} must plan: {diags:?}"));
+    generate_server(&doc, &plan)
+}
+
+fn snapshot_name(fixture: &str) -> String {
+    let stem = fixture.strip_suffix(".yaml").unwrap_or(fixture);
+    format!("{stem}.server.rs")
+}
+
+// ----------------------------------------------------------------------
+// Snapshots + double-generation determinism (main spec §50 test 39)
+// ----------------------------------------------------------------------
+
+#[test]
+fn server_snapshots_match_byte_for_byte_and_generation_is_deterministic() {
+    std::fs::create_dir_all(snapshots_dir()).expect("create snapshots dir");
+    for fixture in SNAPSHOT_FIXTURES {
+        let generated = generate_fixture(fixture);
+
+        // Double-generation check: an independent fresh load+plan+generate
+        // must produce identical bytes.
+        assert_eq!(
+            generated,
+            generate_fixture(fixture),
+            "{fixture}: generation is not deterministic"
+        );
+
+        let snapshot = snapshots_dir().join(snapshot_name(fixture));
+        if std::env::var("SERVER_SNAPSHOT_UPDATE").as_deref() == Ok("1") {
+            std::fs::write(&snapshot, &generated)
+                .unwrap_or_else(|err| panic!("write snapshot {}: {err}", snapshot.display()));
+            continue;
+        }
+        let expected = std::fs::read_to_string(&snapshot).unwrap_or_else(|_| {
+            panic!(
+                "missing snapshot {}; run with SERVER_SNAPSHOT_UPDATE=1",
+                snapshot.display()
+            )
+        });
+        assert_eq!(
+            generated, expected,
+            "{fixture}: generated server diverged from snapshot"
+        );
+    }
+}
+
+#[test]
+fn every_fixture_plans_and_renders_without_diagnostics() {
+    for fixture in ALL_FIXTURES {
+        let first = generate_fixture(fixture);
+        let second = generate_fixture(fixture);
+        assert_eq!(first, second, "{fixture}: generation is not deterministic");
+        assert!(
+            first.contains("pub fn router("),
+            "{fixture} must expose the router:\n{first}"
+        );
+        assert!(
+            first.contains("#[::async_trait::async_trait]"),
+            "{fixture} must annotate its API trait:"
+        );
+        assert!(
+            first.contains("pub trait Api: Send + Sync + 'static"),
+            "{fixture} untagged documents name the trait `Api`:"
+        );
+    }
+}
+
+// ----------------------------------------------------------------------
+// rustfmt-clean emission (main spec §50 test 40)
+// ----------------------------------------------------------------------
+
+#[test]
+fn generated_servers_are_rustfmt_clean() {
+    let Some(rustfmt) = locate_rustfmt() else {
+        eprintln!(
+            "WARNING: no rustfmt binary on PATH; skipping the rustfmt-clean assertion \
+             (main spec §50 test 40)"
+        );
+        return;
+    };
+    for fixture in ALL_FIXTURES {
+        let generated = generate_fixture(fixture);
+
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "o2r-server-fmt-{}-{id}-{}",
+            std::process::id(),
+            fixture.trim_end_matches(".yaml")
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join(snapshot_name(fixture));
+        std::fs::write(&source, &generated).expect("write generated server");
+
+        let checked = std::process::Command::new(&rustfmt)
+            .arg("--edition")
+            .arg("2021")
+            .arg("--check")
+            .arg(&source)
+            .output()
+            .expect("spawn rustfmt");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            checked.status.success(),
+            "{fixture}: generated output is not rustfmt-clean\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr),
+        );
+    }
+}
+
+/// Resolves a usable rustfmt: plain PATH lookup first, then the rustup
+/// shim next to the running toolchain's cargo.
+fn locate_rustfmt() -> Option<PathBuf> {
+    if which_exists("rustfmt") {
+        return Some(PathBuf::from("rustfmt"));
+    }
+    let cargo = PathBuf::from(std::env::var("CARGO").ok()?);
+    let sibling = cargo.with_file_name("rustfmt");
+    sibling.is_file().then_some(sibling)
+}
+
+fn which_exists(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+}
+
+// ----------------------------------------------------------------------
+// Forbidden patterns across EVERY snapshot (main spec §49)
+// ----------------------------------------------------------------------
+
+#[test]
+fn no_forbidden_patterns_in_any_snapshot() {
+    let mut checked = 0_usize;
+    for entry in std::fs::read_dir(snapshots_dir()).expect("snapshots dir") {
+        let path = entry.expect("snapshot entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let stem = path.file_name().unwrap().to_string_lossy().into_owned();
+        if !stem.ends_with(".server.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("snapshot readable");
+        for forbidden in [
+            "serde_json::to_vec",
+            "serde_json::to_string",
+            "serde_urlencoded",
+            "axum::Json(",
+            "Form(",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "{stem}: forbidden pattern `{forbidden}` (main spec §49)"
+            );
+        }
+        // Every bounded response encoder must route through the generated
+        // limited serializer, never an unbounded responder.
+        assert!(
+            text.contains("into_response_with_limits"),
+            "{stem}: bounded encoder must be present"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= SNAPSHOT_FIXTURES.len(),
+        "expected at least {} server snapshots, found {checked}",
+        SNAPSHOT_FIXTURES.len()
+    );
+}
+
+// ----------------------------------------------------------------------
+// Fixture 01 — Example 1 shape (§8 Output B): buffered route wiring
+// ----------------------------------------------------------------------
+
+#[test]
+fn fixture_01_router_installs_default_body_limit_and_emits_problem_json() {
+    let output = generate_fixture("01_json_roundtrip.yaml");
+
+    // §38 wiring: buffered JSON route installs DefaultBodyLimit at the
+    // purpose-specific request limit.
+    assert!(
+        output.contains("DefaultBodyLimit::max(limits.structured_request_bytes)"),
+        "buffered routes must install DefaultBodyLimit:\n{output}"
+    );
+    assert!(
+        output.contains("::axum::routing::post(route_create_widget).layer("),
+        "the POST route must carry the limit layer:\n{output}"
+    );
+
+    // The documented 400 variant keeps application/problem+json distinct
+    // from generic application/json (§41/§8 Output B note).
+    let encoder = item_block(&output, "impl CreateWidgetResponse {");
+    assert!(
+        encoder.contains("\"application/problem+json\""),
+        "BadRequest400 arm must emit problem+json:\n{encoder}"
+    );
+    assert!(
+        encoder.contains("::http::StatusCode::BAD_REQUEST"),
+        "\n{encoder}"
+    );
+
+    // Mode A trait shape (§37): direct enum return, owned body value.
+    assert!(
+        output.contains("pub trait Api: Send + Sync + 'static"),
+        "\n{output}"
+    );
+    assert!(
+        output
+            .contains("async fn create_widget(&self, body: CreateWidget) -> CreateWidgetResponse;"),
+        "\n{output}"
+    );
+
+    // §34.1 fallback: overflow fires the hook and emits a fixed empty 500.
+    assert!(output.contains("on_encode_overflow(operation_id, variant, limit)"),);
+    assert!(
+        output.contains("::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()"),
+        "\n{output}"
+    );
+}
+
+// ----------------------------------------------------------------------
+// Fixture 02 — streaming upload/download (§9, §10, §32): exemption
+// ----------------------------------------------------------------------
+
+#[test]
+fn fixture_02_streaming_routes_skip_the_body_limit_and_take_axum_bodies() {
+    let output = generate_fixture("02_streaming_binary.yaml");
+
+    // Nothing aggregates here: no route may install the limit layer (§38).
+    assert!(
+        !output.contains("DefaultBodyLimit::max("),
+        "streaming-body routes must stay exempt from DefaultBodyLimit:\n{output}"
+    );
+
+    // Streaming download wrapper owns the raw axum body (§10 Output B with
+    // D-impl-typed-headers-phase2 deferring header fields).
+    let wrapper = struct_block(&output, "GetObject200");
+    assert!(
+        wrapper.contains("pub body: ::axum::body::Body,"),
+        "\n{wrapper}"
+    );
+
+    // Trait takes the streaming body natively (§9 Output B).
+    assert!(
+        output.contains(
+            "async fn put_object(&self, id: String, body: ::axum::body::Body) -> PutObjectResponse;"
+        ),
+        "\n{output}"
+    );
+
+    // Unit variant for the body-less 201 (§35).
+    assert!(
+        enum_block(&output, "PutObjectResponse").contains("Created201,"),
+        "\n{output}"
+    );
+
+    // Route registered verbatim under the axum 0.8 `{param}` syntax.
+    assert!(
+        output.contains(".route(\"/objects/{id}\", ::axum::routing::put(route_put_object))"),
+        "\n{output}"
+    );
+}
+
+// ----------------------------------------------------------------------
+// Fixture 03 — nested content enum (§11)
+// ----------------------------------------------------------------------
+
+#[test]
+fn fixture_03_nested_content_enum_carries_axum_streaming_payloads() {
+    let output = generate_fixture("03_nested_content.yaml");
+
+    let content_enum = enum_block(&output, "GetArtifact200Content");
+    assert!(
+        content_enum.contains("Json(ArtifactMetadata),"),
+        "\n{content_enum}"
+    );
+    assert!(
+        content_enum.contains("OctetStream(::axum::body::Body),"),
+        "streaming payloads are axum bodies (Output B):\n{content_enum}"
+    );
+
+    // Encoder dispatches per nested variant behind the correct literal.
+    let encoder = item_block(&output, "impl GetArtifactResponse {");
+    assert!(
+        encoder.contains("GetArtifact200Content::OctetStream(value) => stream_response(")
+            && encoder.contains("\"application/octet-stream\""),
+        "\n{encoder}"
+    );
+    assert!(
+        encoder.contains("GetArtifact200Content::Json(value) => encode_json_limited("),
+        "\n{encoder}"
+    );
+}
+
+// ----------------------------------------------------------------------
+// Fixture 04 — ranges + default (§23, §24, §48)
+// ----------------------------------------------------------------------
+
+#[test]
+fn fixture_04_checked_range_constructors_and_debug_asserts_exist() {
+    let output = generate_fixture("04_status_ranges.yaml");
+
+    // §48 checked constructors for every range/default variant.
+    assert!(output.contains("pub fn success_2xx("), "\n{output}");
+    assert!(output.contains("pub fn client_error_4xx("), "\n{output}");
+    assert!(output.contains("pub fn default_status("), "\n{output}");
+
+    // Membership validation guards.
+    assert!(
+        output.contains("(200..300).contains(&status.as_u16())"),
+        "\n{output}"
+    );
+    assert!(
+        output.contains("(400..500).contains(&status.as_u16())"),
+        "\n{output}"
+    );
+
+    // The IntoResponse path debug-asserts membership (§24/§48).
+    assert!(output.contains("debug_assert!("), "\n{output}");
+
+    // Shared error type for the fallible constructors.
+    assert!(
+        output.contains("pub struct InvalidStatusRange;"),
+        "\n{output}"
+    );
+
+    // Range/default variants carry the wire status (§23).
+    let response_enum = enum_block(&output, "GetWidgetResponse");
+    assert!(
+        response_enum.contains("status: ::http::StatusCode,"),
+        "\n{response_enum}"
+    );
+
+    // `default_status` refuses statuses other variants already cover (§24):
+    // explicit 200, the 2XX range, and the 4XX range all appear as guards.
+    let ctor = item_block(&output, "pub fn default_status(");
+    assert!(ctor.contains("status.as_u16() == 200"), "\n{ctor}");
+    assert!(ctor.matches("(200..300)").count() >= 1, "\n{ctor}");
+    assert!(ctor.matches("(400..500)").count() >= 1, "\n{ctor}");
+}
+
+// ----------------------------------------------------------------------
+// Wildcard content (§22) — synthetic document, no committed fixture
+// ----------------------------------------------------------------------
+
+const WILDCARD_FIXTURE: &str = r#"openapi: 3.1.0
+info:
+  title: wildcard shapes
+  version: "1"
+paths:
+  /documents:
+    get:
+      operationId: getDocument
+      responses:
+        '200':
+          description: Any representation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+            '*/*':
+              schema: {}
+  /uploads:
+    post:
+      operationId: uploadAnything
+      requestBody:
+        required: true
+        content:
+          '*/*':
+            schema: {}
+      responses:
+        '204':
+          description: Stored
+components:
+  schemas:
+    Document:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+"#;
+
+#[test]
+fn wildcard_content_variants_are_structs_carrying_mime_and_body() {
+    let dir = std::env::temp_dir().join(format!("o2r-server-wildcard-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create fixture dir");
+    let fixture_path = dir.join("wildcard_shapes.yaml");
+    std::fs::write(&fixture_path, WILDCARD_FIXTURE).expect("write synthetic fixture");
+
+    let ir = load_document("wildcard_shapes.yaml", &dir, &LoadConfig::default())
+        .unwrap_or_else(|diags| panic!("wildcard fixture must load: {diags:?}"));
+    let doc = normalize_with_config(ir, &NormalizeConfig::default())
+        .unwrap_or_else(|diags| panic!("wildcard fixture must normalize: {diags:?}"));
+    let plan =
+        plan_api(&doc).unwrap_or_else(|diags| panic!("wildcard fixture must plan: {diags:?}"));
+    let output = generate_server(&doc, &plan);
+
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // §22 Output B: the wildcard RESPONSE variant is a struct variant
+    // carrying the concrete Content-Type beside the raw body.
+    let content_enum = enum_block(&output, "GetDocument200Content");
+    assert!(
+        content_enum.contains(
+            "Any {\n        content_type: ::mime::Mime,\n        body: ::axum::body::Body,\n    },"
+        ),
+        "wildcard content variant must be a struct variant:\n{content_enum}"
+    );
+
+    // Single-content wildcard REQUEST bodies become a dedicated struct the
+    // router fills with the negotiated Content-Type (§28.5 exception).
+    let request_struct = struct_block(&output, "UploadAnythingRequestBody");
+    assert!(
+        request_struct.contains("pub content_type: ::mime::Mime,")
+            && request_struct.contains("pub body: ::axum::body::Body,"),
+        "\n{request_struct}"
+    );
+    assert!(
+        output.contains("mime_of(parsed.as_ref())"),
+        "router must hand the negotiated media type to the payload:\n{output}"
+    );
+    assert!(
+        !output.contains("DefaultBodyLimit::max("),
+        "wildcard passthrough streams; the route stays exempt:\n{output}"
+    );
+}
+
+// ----------------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------------
+
+/// The full text of one top-level item block, from its doc comments (or the
+/// preceding blank line) through its closing line.
+fn item_block(output: &str, marker: &str) -> String {
+    let start = output
+        .find(marker)
+        .unwrap_or_else(|| panic!("marker `{marker}` not found in output:\n{output}"));
+    let before = &output[..start];
+    let block_start = before.rfind("\n\n").map_or(0, |index| index + 2);
+    let after = &output[start..];
+    let block_end = after.find("\n\n").map_or(after.len(), |index| index + 1);
+    output[block_start..start + block_end].to_owned()
+}
+
+fn enum_block(output: &str, name: &str) -> String {
+    item_block(output, &format!("pub enum {name} {{"))
+}
+
+fn struct_block(output: &str, name: &str) -> String {
+    item_block(output, &format!("pub struct {name} {{"))
+}
