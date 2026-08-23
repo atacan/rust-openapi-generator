@@ -6,7 +6,8 @@
 //! inbound content coding (§30.4), stream decode errors and committed-stream
 //! failures (§40), and the presence/nullability matrix (companion §2.1).
 //! Dispatch layer: media-type parsing/matching and peek-and-preserve presence
-//! detection (§28), percent encoding (companion §8), and the authoritative
+//! detection (§28), percent encoding (companion §8), the parameter
+//! style × explode matrix (companion §6), and the authoritative
 //! `ClientError` (§36).
 
 pub mod collect;
@@ -16,6 +17,7 @@ pub mod hooks;
 pub mod limits;
 pub mod mediatype;
 pub mod optional;
+pub mod params;
 pub mod percent;
 pub mod rejection;
 pub mod stream_errors;

@@ -260,3 +260,26 @@ doc-comments but enforced at runtime starting Phase 2.
 ### D-impl-flatten-map-deterministic Schema-valued additionalProperties uses `BTreeMap`
 `#[serde(flatten)]` maps serialize in iteration order; `BTreeMap<String, T>` keeps runtime wire
 bytes deterministic (sorted keys) consistent with the D-§4.4 sorted-key choice.
+
+### D-impl-typed-headers-phase2 Typed response-header fields ship in Phase 2
+Phase 1 streaming/raw client variants own the `reqwest::Response` through a generated status
+wrapper (`into_bytes_stream()` convenience, main spec §32/§51.1) without typed documented-header
+fields; typed header structs (`GetArtifact200Headers`, §4 naming table) land in Phase 2 together
+with header parameters' collision rules (companion §6/D-§6).
+
+### D-impl-singlefile-layout Single-file generated modules until multi-tag fixtures exist
+Phase 1 emits one `models.rs` / `views.rs` / `client.rs` / `server.rs` per generated crate. The
+per-tag module layout of spec §3 (`client/<tag>.rs`) arrives when fixture coverage exercises tags;
+the naming pipeline's tag sanitation is already in place.
+
+### D-impl-param-matrix-phase1 Full companion §6 matrix ships in Phase 1
+The complete style × explode × location matrix (incl. deepObject, allowReserved, cookie-as-header,
+no jar) lives in `openapi_support::params` from Phase 1 because both generated clients (encode)
+and generated routers (pre-handler syntax validation, §38) consume it; generation-time rejection
+of invalid style/location combinations happens in the generator per companion §6.
+
+### D-impl-forms-phase2 Forms and multipart are Phase 2 deliverables
+Per main spec §52, URL-encoded forms, multipart, typed response headers, wildcard negotiation,
+and status-range/default handling beyond the Phase 1 enum shapes arrive in Phase 2. Phase 1
+server bodies: JSON family (bounded decode), plain text (bounded String), binary/raw/unknown
+(streaming passthrough).
