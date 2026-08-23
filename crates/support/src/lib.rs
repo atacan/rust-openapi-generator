@@ -25,4 +25,6 @@ pub mod stream_errors;
 #[cfg(feature = "client")]
 pub mod client_error;
 #[cfg(feature = "server")]
+pub mod multipart;
+#[cfg(feature = "server")]
 pub mod peek;
