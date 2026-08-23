@@ -3,6 +3,7 @@
 /// Mode A traits (§37), bounded JSON/text bodies (§34), streaming raw payloads (§32), pre-handler protocol rejections outside the documented enums (§39), identity-only inbound content coding (§30.4), and the §28 Content-Type dispatch state machine. The source document declares OpenAPI 3.1.0.
 /// Generated deterministically byte-for-byte (main spec §50 test 39); do not edit by hand.
 use super::models::ProblemDetails;
+use ::axum::response::IntoResponse;
 use ::openapi_support::content_coding::ensure_identity_content_coding;
 use ::openapi_support::encode::serialize_json_limited;
 use ::openapi_support::hooks::{EncodeOverflowHook, NoOpEncodeOverflowHook};
@@ -80,7 +81,7 @@ impl GetObjectResponse {
             Self::Ok200(wrapper) => stream_response(
                 ::http::StatusCode::OK,
                 "application/octet-stream",
-                GetObject200.body,
+                wrapper.body,
             ),
             Self::NotFound404(value) => encode_json_limited(
                 ::http::StatusCode::NOT_FOUND,
@@ -146,10 +147,11 @@ async fn route_put_object(
     };
     let id: String = expect_text(decoded, "id")?;
     let parsed = parse_single_content_type(&__headers)?;
-    match classify_request_entry(parsed.as_ref(), &["application/octet-stream"]) {
+    let request_body = match classify_request_entry(parsed.as_ref(), &["application/octet-stream"])
+    {
         RequestEntryMatch::AbsentContentType => {
             let (presence, _replay) =
-                detect_body_presence(body.into_data_stream(), limits.peek_buffer_bytes);
+                detect_body_presence(body.into_data_stream(), limits.peek_buffer_bytes).await;
             if matches!(presence, BodyPresence::Empty) {
                 return Err(malformed_body("required request body arrived empty"));
             }
@@ -313,33 +315,6 @@ fn expect_text(
             "missing required parameter `{parameter}`"
         ))),
     }
-}
-
-/// Unwraps an array decode product into its text items.
-fn expect_texts(
-    decoded: Option<ParamValue>,
-    parameter: &'static str,
-) -> Result<Vec<String>, ProtocolRejection> {
-    let items = match decoded {
-        Some(ParamValue::Array(items)) => items,
-        item => {
-            return Err(invalid_parameter(format!(
-                "parameter `{parameter}` must be an array of scalars, got {item:?}"
-            )));
-        }
-    };
-    let mut texts = Vec::with_capacity(items.len());
-    for item in items {
-        match item {
-            ParamValue::Text(text) => texts.push(text),
-            item => {
-                return Err(invalid_parameter(format!(
-                    "parameter `{parameter}` has an unexpected shape: {item:?}"
-                )));
-            }
-        }
-    }
-    Ok(texts)
 }
 
 /// §34.1 steps 1–3: partial output is discarded, nothing partial  reaches the wire, and the hook carries the operation id, variant,  and limit for observability.

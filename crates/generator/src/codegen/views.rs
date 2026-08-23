@@ -360,6 +360,18 @@ impl<'a> Generator<'a> {
             _ => return,
         };
 
+        // Cheap direction probe BEFORE any resolution: registering anonymous
+        // children or model imports for components that end up with no views
+        // would leak side effects into the module (stray definitions and
+        // unused imports under `-D warnings`).
+        let has_direction = properties.iter().any(|property| {
+            let node = self.doc.arena.get(self.chase(property.schema.target));
+            node.read_only || node.write_only
+        });
+        if !has_direction {
+            return;
+        }
+
         let resolved = self.resolve_properties(schema.rust_type.as_str(), &properties);
         if !resolved
             .iter()
@@ -374,6 +386,9 @@ impl<'a> Generator<'a> {
         let component = schema.rust_type.as_str();
         let write_name = self.fresh_type_name(&format!("{component}Write"));
         let read_name = self.fresh_type_name(&format!("{component}Read"));
+        // The conversion impls below reference the SHARED model type by bare
+        // name, so it must ride the granular `use super::models::…` imports.
+        self.model_imports.insert(component.to_owned());
 
         let node = self.doc.arena.get(effective);
         let mut write_docs = description_lines(&node.description.clone());

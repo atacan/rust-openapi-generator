@@ -3,10 +3,11 @@
 /// Mode A traits (§37), bounded JSON/text bodies (§34), streaming raw payloads (§32), pre-handler protocol rejections outside the documented enums (§39), identity-only inbound content coding (§30.4), and the §28 Content-Type dispatch state machine. The source document declares OpenAPI 3.1.0.
 /// Generated deterministically byte-for-byte (main spec §50 test 39); do not edit by hand.
 use super::models::ModernEnvelope;
+use ::axum::response::IntoResponse;
 use ::openapi_support::encode::serialize_json_limited;
 use ::openapi_support::hooks::{EncodeOverflowHook, NoOpEncodeOverflowHook};
 use ::openapi_support::limits::BodyLimits;
-use ::openapi_support::rejection::{ProtocolRejection, RejectionKind};
+use ::openapi_support::rejection::ProtocolRejection;
 
 /// Documented outcomes for `get_modern` (main spec §8/§13): exhaustive match required; deliberately not `#[non_exhaustive]` (§47).
 #[derive(Debug)]
@@ -84,23 +85,6 @@ pub fn router(
     ::axum::Router::new()
         .route("/modern", ::axum::routing::get(route_get_modern))
         .with_state(state)
-}
-
-/// Canonical §39 mapping row 1: invalid or missing required  path/query/header parameter → 400.
-fn invalid_parameter(detail: impl Into<::std::borrow::Cow<'static, str>>) -> ProtocolRejection {
-    ProtocolRejection::new(RejectionKind::InvalidParameter).with_detail(detail)
-}
-
-/// §39 mapping row 2: syntactically malformed framing → 400; empty  bodies on required-body operations count as missing (§28.3).
-fn malformed_body(detail: impl Into<::std::borrow::Cow<'static, str>>) -> ProtocolRejection {
-    ProtocolRejection::new(RejectionKind::MalformedBody).with_detail(detail)
-}
-
-/// Missing, unparsable, wildcard, or unmatched Content-Type on a  body-bearing request → 415 (§28.2, §28.5, §39 table).
-fn unsupported_media_type(
-    detail: impl Into<::std::borrow::Cow<'static, str>>,
-) -> ProtocolRejection {
-    ProtocolRejection::new(RejectionKind::UnsupportedMediaType).with_detail(detail)
 }
 
 /// §34.1 steps 1–3: partial output is discarded, nothing partial  reaches the wire, and the hook carries the operation id, variant,  and limit for observability.

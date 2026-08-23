@@ -3,6 +3,7 @@
 /// Mode A traits (§37), bounded JSON/text bodies (§34), streaming raw payloads (§32), pre-handler protocol rejections outside the documented enums (§39), identity-only inbound content coding (§30.4), and the §28 Content-Type dispatch state machine. The source document declares OpenAPI 3.1.0.
 /// Generated deterministically byte-for-byte (main spec §50 test 39); do not edit by hand.
 use super::models::{ArtifactMetadata, ProblemDetails};
+use ::axum::response::IntoResponse;
 use ::openapi_support::encode::serialize_json_limited;
 use ::openapi_support::hooks::{EncodeOverflowHook, NoOpEncodeOverflowHook};
 use ::openapi_support::limits::BodyLimits;
@@ -45,11 +46,9 @@ impl GetArtifactResponse {
                     "getArtifact",
                     "Ok200",
                 ),
-                GetArtifact200Content::OctetStream(value) => stream_response(
-                    ::http::StatusCode::OK,
-                    "application/octet-stream",
-                    value.body.body,
-                ),
+                GetArtifact200Content::OctetStream(value) => {
+                    stream_response(::http::StatusCode::OK, "application/octet-stream", value)
+                }
             },
             Self::NotFound404(value) => encode_json_limited(
                 ::http::StatusCode::NOT_FOUND,
@@ -133,18 +132,6 @@ fn invalid_parameter(detail: impl Into<::std::borrow::Cow<'static, str>>) -> Pro
     ProtocolRejection::new(RejectionKind::InvalidParameter).with_detail(detail)
 }
 
-/// §39 mapping row 2: syntactically malformed framing → 400; empty  bodies on required-body operations count as missing (§28.3).
-fn malformed_body(detail: impl Into<::std::borrow::Cow<'static, str>>) -> ProtocolRejection {
-    ProtocolRejection::new(RejectionKind::MalformedBody).with_detail(detail)
-}
-
-/// Missing, unparsable, wildcard, or unmatched Content-Type on a  body-bearing request → 415 (§28.2, §28.5, §39 table).
-fn unsupported_media_type(
-    detail: impl Into<::std::borrow::Cow<'static, str>>,
-) -> ProtocolRejection {
-    ProtocolRejection::new(RejectionKind::UnsupportedMediaType).with_detail(detail)
-}
-
 /// Unwraps a scalar decode product; `None` means the parameter was  absent (required parameters reject with 400, §39 row 1).
 fn expect_text(
     decoded: Option<ParamValue>,
@@ -159,33 +146,6 @@ fn expect_text(
             "missing required parameter `{parameter}`"
         ))),
     }
-}
-
-/// Unwraps an array decode product into its text items.
-fn expect_texts(
-    decoded: Option<ParamValue>,
-    parameter: &'static str,
-) -> Result<Vec<String>, ProtocolRejection> {
-    let items = match decoded {
-        Some(ParamValue::Array(items)) => items,
-        item => {
-            return Err(invalid_parameter(format!(
-                "parameter `{parameter}` must be an array of scalars, got {item:?}"
-            )));
-        }
-    };
-    let mut texts = Vec::with_capacity(items.len());
-    for item in items {
-        match item {
-            ParamValue::Text(text) => texts.push(text),
-            item => {
-                return Err(invalid_parameter(format!(
-                    "parameter `{parameter}` has an unexpected shape: {item:?}"
-                )));
-            }
-        }
-    }
-    Ok(texts)
 }
 
 /// §34.1 steps 1–3: partial output is discarded, nothing partial  reaches the wire, and the hook carries the operation id, variant,  and limit for observability.

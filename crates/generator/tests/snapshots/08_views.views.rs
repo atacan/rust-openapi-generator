@@ -21,6 +21,10 @@
 use openapi_support::optional::OptionalField;
 use serde::{Deserialize, Serialize};
 
+use super::models::Account;
+use super::models::AuditEntry;
+use super::models::SyncedRecord;
+
 /// Directional write view of `Account` (companion §5): client request encode and server request decode wire shape.
 /// Every property survives in this direction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

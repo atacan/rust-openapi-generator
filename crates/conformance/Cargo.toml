@@ -1,0 +1,30 @@
+[package]
+name = "openapi-conformance"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[build-dependencies]
+openapi-to-rust-generator = { path = "../generator" }
+
+[dependencies]
+openapi-support = { path = "../support", features = ["client", "server"] }
+async-trait = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+mime = { workspace = true }
+reqwest = { workspace = true }
+futures-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio-util = { workspace = true }
+tower = { workspace = true }
+futures-util = { workspace = true }

@@ -286,7 +286,7 @@ struct UnsupportedCharset(String);
 
 impl std::fmt::Display for UnsupportedCharset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "charset `{}` is outside the UTF-8 family", &self.0)
+        write!(f, "charset `{}` is outside the UTF-8 family", self.0)
     }
 }
 

@@ -32,6 +32,10 @@ const RUSTFMT_MAX_WIDTH: usize = 100;
 /// rustfmt's default maximum width for a call argument list.
 const FN_CALL_WIDTH: usize = 60;
 
+/// Empirical rustfmt budget for an UNBROKEN call inside a match-arm block
+/// (see [`emit_call_arm_expr`]).
+const ARM_BODY_CALL_BUDGET: usize = 77;
+
 /// Renders ONE generated `server.rs` for the planned API (main spec §3,
 /// D-impl-singlefile-layout).
 #[must_use]
@@ -47,6 +51,34 @@ pub fn generate_server(doc: &NormalizedDocument, plan: &PlannedApi) -> String {
 
     let mut emitter = Emitter::new();
     emit_header(&mut emitter, doc);
+
+    // The generated encoders and no-body arms CALL `IntoResponse::
+    // into_response`, so the trait must be in scope; importing it whenever
+    // any caller exists keeps the import used under `-D warnings`.
+    flags.needs_into_response_trait = flags.needs_serialize_json
+        || flags.needs_encode_text
+        || flags.needs_stream_response
+        || flags.needs_any_response
+        || plan.operations.iter().any(|operation| {
+            operation
+                .statuses
+                .iter()
+                .any(|status| effective_contents(status).is_empty())
+        });
+    // §39 rejection constructors are only emitted with their call sites.
+    flags.needs_invalid_parameter = flags.needs_param_helpers;
+    flags.has_request_bodies = plan
+        .operations
+        .iter()
+        .any(|operation| !operation.request_contents.is_empty());
+    flags.needs_unsupported_media_type = flags.has_request_bodies;
+    flags.needs_malformed_body = flags.needs_content_type_gate
+        || flags.needs_collect_body
+        || flags.needs_collect_stream
+        || flags.needs_json_decode
+        || flags.needs_text_decode
+        || flags.needs_charset_check
+        || flags.needs_cookie_decode;
     emit_imports(&mut emitter, &flags);
 
     let mut invalid_status_range_emitted = false;
@@ -256,6 +288,11 @@ fn is_decodable_content(content: &PlannedContent) -> bool {
 struct Flags {
     model_types: BTreeSet<String>,
     has_operations: bool,
+    needs_into_response_trait: bool,
+    needs_invalid_parameter: bool,
+    needs_malformed_body: bool,
+    needs_unsupported_media_type: bool,
+    has_request_bodies: bool,
     needs_content_coding: bool,
     needs_content_type_gate: bool,
     needs_collect_body: bool,
@@ -271,6 +308,8 @@ struct Flags {
     needs_mime_of: bool,
     needs_invalid_status_range: bool,
     needs_param_helpers: bool,
+    needs_expect_text: bool,
+    needs_expect_texts: bool,
     needs_parse_scalar: bool,
     needs_parse_texts: bool,
     needs_split_query_pairs: bool,
@@ -399,12 +438,16 @@ impl Flags {
             }
         }
         if parameter.rust_type.starts_with("Vec<") {
+            self.needs_expect_texts = true;
             if leaf_type(&parameter.rust_type) != "String" {
                 self.needs_parse_scalar = true;
                 self.needs_parse_texts = true;
             }
-        } else if leaf_type(&parameter.rust_type) != "String" {
-            self.needs_parse_scalar = true;
+        } else {
+            self.needs_expect_text = true;
+            if leaf_type(&parameter.rust_type) != "String" {
+                self.needs_parse_scalar = true;
+            }
         }
     }
 }
@@ -418,7 +461,8 @@ fn leaf_type(rust_type: &str) -> &str {
 
 /// Bare model type names referenced by an expression (`Option<T>`,
 /// `Vec<T>`, tuples) for the import block; composite wrappers like
-/// `serde_json::*` resolve through full paths instead.
+/// `serde_json::*` resolve through full paths instead. Inline scalars
+/// (`String`, primitives) never live in `super::models` and are skipped.
 fn model_type_names(expr: &str) -> Vec<String> {
     let cleaned = expr.replace(['&', '(', ')', ','], " ");
     let mut names = Vec::new();
@@ -431,7 +475,14 @@ fn model_type_names(expr: &str) -> Vec<String> {
             inner = rest;
         }
         let inner = inner.trim_end_matches('>');
-        if inner.is_empty() || inner.contains("::") || inner.starts_with(char::is_lowercase) {
+        if inner.is_empty()
+            || inner.contains("::")
+            || inner.starts_with(char::is_lowercase)
+            || matches!(
+                inner,
+                "String" | "bool" | "i8" | "i16" | "i32" | "i64" | "f32" | "f64"
+            )
+        {
             continue;
         }
         names.push(inner.to_owned());
@@ -502,6 +553,9 @@ fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
         }
     }
 
+    if flags.needs_into_response_trait {
+        emitter.line(0, "use ::axum::response::IntoResponse;");
+    }
     if flags.needs_collect_body || flags.needs_collect_stream {
         emitter.line(
             0,
@@ -543,10 +597,22 @@ fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
                 "use ::openapi_support::peek::{detect_body_presence, BodyPresence};",
             );
         }
-        emitter.line(
-            0,
-            "use ::openapi_support::rejection::{ProtocolRejection, RejectionKind};",
-        );
+        // `RejectionKind` only appears at §39 constructor / bounded-collection
+        // call sites; without any it stays unimported (unused-import hygiene).
+        if flags.needs_invalid_parameter
+            || flags.needs_malformed_body
+            || flags.needs_unsupported_media_type
+            || flags.needs_collect_body
+            || flags.needs_collect_stream
+            || flags.needs_json_decode
+        {
+            emitter.line(
+                0,
+                "use ::openapi_support::rejection::{ProtocolRejection, RejectionKind};",
+            );
+        } else {
+            emitter.line(0, "use ::openapi_support::rejection::ProtocolRejection;");
+        }
         // rustfmt orders extern imports by crate name (openapi_support < std).
         if path_extractor {
             emitter.line(0, "use ::std::collections::HashMap;");
@@ -1030,9 +1096,11 @@ fn structured_call(
             callee: "encode_text_limited",
             args: [head, vec![format!("&{access}")], tail].concat(),
         },
+        // The caller passes the exact expression of the raw axum body; no
+        // extra field access is appended here.
         MediaClass::Binary | MediaClass::RawUnknown => EncodeCall {
             callee: "stream_response",
-            args: [head, vec![format!("{access}.body")]].concat(),
+            args: [head, vec![access.to_owned()]].concat(),
         },
         other => unreachable!("Phase 2 media class {other:?}"),
     }
@@ -1049,12 +1117,29 @@ fn any_call(status_arg: &str) -> EncodeCall {
     }
 }
 
-/// Emits `PATTERN => callee(args),` collapsing when it fits.
+/// Emits `PATTERN => callee(args),` following rustfmt's preference order:
+/// inline when it fits; otherwise a block-wrapped UNBROKEN call when the
+/// call stays within rustfmt's arm-body call budget; only then vertical
+/// argument breaking.
+///
+/// The budget below was derived empirically from rustfmt (style edition
+/// default, max_width 100): for match-arm bodies of this shape rustfmt keeps
+/// an unbroken call inside a block iff the rendered call is at most 77
+/// columns, INDEPENDENT of nesting depth; anything longer breaks arguments
+/// vertically WITHOUT a wrapping block. The committed snapshot suite re-verifies
+/// every emitted file against real rustfmt, so any drift fails loudly.
 fn emit_call_arm_expr(emitter: &mut Emitter, indent: usize, pattern: &str, call: &EncodeCall) {
     let joined = call.args.join(", ");
     let inline = format!("{pattern} => {}({joined}),", call.callee);
     if fits(indent, &inline) {
         emitter.line(indent, &inline);
+        return;
+    }
+    let block_body = format!("{}({joined})", call.callee);
+    if fits(indent + 1, &block_body) && block_body.chars().count() <= ARM_BODY_CALL_BUDGET {
+        emitter.line(indent, &format!("{pattern} => {{"));
+        emitter.line(indent + 1, &block_body);
+        emitter.line(indent, "}");
         return;
     }
     emitter.line(indent, &format!("{pattern} => {}(", call.callee));
@@ -1099,20 +1184,21 @@ fn emit_encode_arm(
 
     let constant = explicit_status_expr(status.key).expect("explicit statuses carry constants");
 
-    // Streaming/wildcard wrappers (§32/§22).
-    if let Some((wrapper_name, shape)) = layout.wrapper(op_index, status_index) {
+    // Streaming/wildcard wrappers (§32/§22). The arm binds the wrapper value
+    // as `wrapper`, so field accesses must use that binding, not the type.
+    if let Some((_, shape)) = layout.wrapper(op_index, status_index) {
         let literal = rust_string_literal(&contents[0].media_type_literal);
         let call = match shape {
             WrapperShape::Stream => EncodeCall {
                 callee: "stream_response",
-                args: vec![constant.clone(), literal, format!("{wrapper_name}.body")],
+                args: vec![constant.clone(), literal, "wrapper.body".to_owned()],
             },
             WrapperShape::Wildcard => EncodeCall {
                 callee: "any_response",
                 args: vec![
                     constant.clone(),
-                    format!("{wrapper_name}.content_type"),
-                    format!("{wrapper_name}.body"),
+                    "wrapper.content_type".to_owned(),
+                    "wrapper.body".to_owned(),
                 ],
             },
         };
@@ -1134,10 +1220,10 @@ fn emit_encode_arm(
             }
         }
         1 => {
-            let access = match contents[0].media_class {
-                MediaClass::Binary | MediaClass::RawUnknown => "value.body",
-                _ => "value",
-            };
+            // Single-content streaming statuses are wrapper statuses handled
+            // above, so `value` here is either a model or the raw axum body
+            // itself; no extra field access applies.
+            let access = "value";
             let call = structured_call(&contents[0], &constant, access, "limits", op_id, variant);
             emit_call_arm_expr(emitter, 3, &format!("Self::{variant}(value)"), &call);
         }
@@ -1184,11 +1270,9 @@ fn emit_nested_content_arms(
             emit_call_arm_expr(emitter, indent, &pattern, &any_call(status_arg));
             continue;
         }
-        let access = match content.media_class {
-            MediaClass::Binary | MediaClass::RawUnknown => "value.body",
-            _ => "value",
-        };
-        let call = structured_call(content, status_arg, access, limits_arg, op_id, variant);
+        // The arm binds the variant payload as `value`; streaming payloads
+        // ARE the raw axum body, so `value` is passed through unchanged.
+        let call = structured_call(content, status_arg, "value", limits_arg, op_id, variant);
         let pattern = format!("{content_enum}::{}(value)", content.variant_name);
         emit_call_arm_expr(emitter, indent, &pattern, &call);
     }
@@ -2158,7 +2242,7 @@ fn emit_body_acquisition(
     emitter.line(1, "let (presence, replay) =");
     emitter.line(
         2,
-        "detect_body_presence(body.into_data_stream(), limits.peek_buffer_bytes);",
+        "detect_body_presence(body.into_data_stream(), limits.peek_buffer_bytes).await;",
     );
     emitter.line(1, "let request_body = match presence {");
     emitter.line(2, "BodyPresence::Empty => None,");
@@ -2222,7 +2306,7 @@ fn emit_absent_content_type_arm(
         emitter.line(indent + 1, "let (presence, _replay) =");
         emitter.line(
             indent + 2,
-            "detect_body_presence(body.into_data_stream(), limits.peek_buffer_bytes);",
+            "detect_body_presence(body.into_data_stream(), limits.peek_buffer_bytes).await;",
         );
         emitter.line(indent + 1, "if matches!(presence, BodyPresence::Empty) {");
         emitter.line(
@@ -2238,19 +2322,32 @@ fn emit_absent_content_type_arm(
 }
 
 /// Emits the `match classify_request_entry(...)` opener: one line when the
-/// whole slice fits within the rustfmt width, vertical slice otherwise.
+/// whole slice fits within the rustfmt width, vertical slice otherwise. Only
+/// the required-body call site (indent 1) binds the match result to
+/// `request_body`; the optional-body site nests inside
+/// `BodyPresence::NonEmpty`, where the match is a plain arm expression.
 fn emit_classify_match_head(emitter: &mut Emitter, literals: &[String], indent: usize) {
     let joined = literals.join(", ");
-    let inline = format!("match classify_request_entry(parsed.as_ref(), &[{joined}]) {{");
-    if fits(indent, &inline) {
-        emitter.line(indent, &inline);
-        return;
-    }
     let prefix = if indent == 1 {
         "let request_body = "
     } else {
         ""
     };
+    // rustfmt's canonical layouts, most-preferred first: whole head on one
+    // line; otherwise the argument list stays horizontal and only the match
+    // brace drops; only when even the head cannot fit do the slice entries
+    // break vertically.
+    let head = format!("{prefix}match classify_request_entry(parsed.as_ref(), &[{joined}])");
+    let open_brace = format!("{head} {{");
+    if fits(indent, &open_brace) {
+        emitter.line(indent, &open_brace);
+        return;
+    }
+    if fits(indent, &head) {
+        emitter.line(indent, &head);
+        emitter.line(indent, "{");
+        return;
+    }
     emitter.line(
         indent,
         &format!("{prefix}match classify_request_entry(parsed.as_ref(), &["),
@@ -2453,7 +2550,13 @@ fn emit_entry_yield(emitter: &mut Emitter, indent: usize, payload: &EntryPayload
 
     match payload {
         EntryPayload::Json { .. } | EntryPayload::Text => {
-            emitter.line(indent, "value");
+            // Optional bodies yield `Some(..)` so the outer presence match
+            // separates Empty (None) from a decoded document (§28.2).
+            if required {
+                emitter.line(indent, "value");
+            } else {
+                emitter.line(indent, "Some(value)");
+            }
         }
         EntryPayload::RawBody => {
             if required {
@@ -2479,7 +2582,11 @@ fn emit_entry_yield(emitter: &mut Emitter, indent: usize, payload: &EntryPayload
         }
         EntryPayload::EnumJson { enum_name, variant }
         | EntryPayload::EnumText { enum_name, variant } => {
-            emitter.line(indent, &format!("{enum_name}::{variant}(value)"));
+            if required {
+                emitter.line(indent, &format!("{enum_name}::{variant}(value)"));
+            } else {
+                emitter.line(indent, &format!("Some({enum_name}::{variant}(value))"));
+            }
         }
         EntryPayload::EnumRaw { enum_name, variant } => {
             let inner = if required {
@@ -2628,8 +2735,21 @@ fn emit_module_helpers(emitter: &mut Emitter, flags: &Flags) {
         return;
     }
 
-    emitter.blank();
-    emit_rejection_constructors(emitter);
+    // Each §39 constructor is emitted only when some generated call site
+    // references it, keeping the module free of dead code under
+    // `-D warnings`.
+    if flags.needs_invalid_parameter {
+        emitter.blank();
+        emit_invalid_parameter(emitter);
+    }
+    if flags.needs_malformed_body {
+        emitter.blank();
+        emit_malformed_body(emitter);
+    }
+    if flags.needs_unsupported_media_type {
+        emitter.blank();
+        emit_unsupported_media_type(emitter);
+    }
 
     if flags.needs_content_type_gate {
         emitter.blank();
@@ -2661,9 +2781,11 @@ fn emit_module_helpers(emitter: &mut Emitter, flags: &Flags) {
         emitter.blank();
         emit_mime_of(emitter);
     }
-    if flags.needs_param_helpers {
+    if flags.needs_expect_text {
         emitter.blank();
         emit_expect_text(emitter);
+    }
+    if flags.needs_expect_texts {
         emitter.blank();
         emit_expect_texts(emitter);
     }
@@ -2701,7 +2823,7 @@ fn emit_module_helpers(emitter: &mut Emitter, flags: &Flags) {
     }
 }
 
-fn emit_rejection_constructors(emitter: &mut Emitter) {
+fn emit_invalid_parameter(emitter: &mut Emitter) {
     emitter.docs(
         0,
         &[
@@ -2715,7 +2837,9 @@ fn emit_rejection_constructors(emitter: &mut Emitter) {
         "ProtocolRejection::new(RejectionKind::InvalidParameter).with_detail(detail)",
     );
     emitter.line(0, "}");
-    emitter.blank();
+}
+
+fn emit_malformed_body(emitter: &mut Emitter) {
     emitter.docs(
         0,
         &[
@@ -2729,7 +2853,9 @@ fn emit_rejection_constructors(emitter: &mut Emitter) {
         "ProtocolRejection::new(RejectionKind::MalformedBody).with_detail(detail)",
     );
     emitter.line(0, "}");
-    emitter.blank();
+}
+
+fn emit_unsupported_media_type(emitter: &mut Emitter) {
     emitter.docs(
         0,
         &["Missing, unparsable, wildcard, or unmatched Content-Type on a  body-bearing request → 415 (§28.2, §28.5, §39 table)."

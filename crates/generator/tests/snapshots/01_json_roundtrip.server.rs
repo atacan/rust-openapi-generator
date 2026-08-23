@@ -3,6 +3,7 @@
 /// Mode A traits (§37), bounded JSON/text bodies (§34), streaming raw payloads (§32), pre-handler protocol rejections outside the documented enums (§39), identity-only inbound content coding (§30.4), and the §28 Content-Type dispatch state machine. The source document declares OpenAPI 3.1.0.
 /// Generated deterministically byte-for-byte (main spec §50 test 39); do not edit by hand.
 use super::models::{CreateWidget, ProblemDetails, Widget};
+use ::axum::response::IntoResponse;
 use ::openapi_support::collect::{collect_body_limited, CollectLimitedError};
 use ::openapi_support::content_coding::ensure_identity_content_coding;
 use ::openapi_support::encode::serialize_json_limited;
@@ -85,7 +86,7 @@ async fn route_create_widget(
     let limits = __state.limits;
     let hook = __state.encode_overflow_hook.as_ref();
     let parsed = parse_single_content_type(&__headers)?;
-    match classify_request_entry(parsed.as_ref(), &["application/json"]) {
+    let request_body = match classify_request_entry(parsed.as_ref(), &["application/json"]) {
         RequestEntryMatch::AbsentContentType => {
             let probe = body_bytes(body, limits.structured_request_bytes).await?;
             if probe.is_empty() {
@@ -135,11 +136,6 @@ pub fn router(
             ),
         )
         .with_state(state)
-}
-
-/// Canonical §39 mapping row 1: invalid or missing required  path/query/header parameter → 400.
-fn invalid_parameter(detail: impl Into<::std::borrow::Cow<'static, str>>) -> ProtocolRejection {
-    ProtocolRejection::new(RejectionKind::InvalidParameter).with_detail(detail)
 }
 
 /// §39 mapping row 2: syntactically malformed framing → 400; empty  bodies on required-body operations count as missing (§28.3).

@@ -243,7 +243,8 @@ impl Flags {
 
 /// Bare model type names referenced by an expression (`Option<T>`,
 /// `Vec<T>`, tuples) for the import block; composite wrappers like
-/// `serde_json::*` resolve through full paths instead.
+/// `serde_json::*` resolve through full paths instead. Inline scalars
+/// (`String`, primitives) never live in `super::models` and are skipped.
 fn model_type_names(expr: &str) -> Vec<String> {
     let cleaned = expr.replace(['&', '(', ')', ','], " ");
     let mut names = Vec::new();
@@ -256,7 +257,14 @@ fn model_type_names(expr: &str) -> Vec<String> {
             inner = rest;
         }
         let inner = inner.trim_end_matches('>');
-        if inner.is_empty() || inner.contains("::") || inner.starts_with(char::is_lowercase) {
+        if inner.is_empty()
+            || inner.contains("::")
+            || inner.starts_with(char::is_lowercase)
+            || matches!(
+                inner,
+                "String" | "bool" | "i8" | "i16" | "i32" | "i64" | "f32" | "f64"
+            )
+        {
             continue;
         }
         names.push(inner.to_owned());
@@ -1097,7 +1105,9 @@ fn emit_wrapper(
         1,
         &["Consumes the wrapper into the raw chunk stream (main spec §32).".to_owned()],
     );
-    emitter.line(1, "#[must_use]");
+    // NOTE: deliberately no `#[must_use]` — the returned opaque
+    // `impl Stream` is already `must_use`, and a bare attribute here trips
+    // clippy::double_must_use under `-D warnings`.
     emitter.line(1, "pub fn into_bytes_stream(");
     emitter.line(2, "self,");
     emitter.line(
@@ -1797,15 +1807,31 @@ fn emit_body_assignment(emitter: &mut Emitter, operation: &PlannedOperation, fla
         return;
     };
     if operation.request_body_required {
-        emit_single_request_body(emitter, 2, content);
+        emit_single_request_body(emitter, 2, content, true, flags);
     } else {
         emitter.line(2, "if let Some(body) = body {");
-        emit_single_request_body(emitter, 3, content);
+        emit_single_request_body(emitter, 3, content, false, flags);
         emitter.line(2, "}");
     }
 }
 
-fn emit_single_request_body(emitter: &mut Emitter, indent: usize, content: &PlannedContent) {
+/// Single-payload assignment on the rebound request builder. Required JSON
+/// bodies were already bounded-encoded before `request` existed (`payload`
+/// binding); optional JSON bodies serialize HERE so an encode overflow still
+/// returns before any wire traffic (§34.2).
+fn emit_single_request_body(
+    emitter: &mut Emitter,
+    indent: usize,
+    content: &PlannedContent,
+    required: bool,
+    flags: &mut Flags,
+) {
+    if content.media_class == MediaClass::JsonFamily && !required {
+        flags.needs_serialize_json = true;
+        flags.needs_body_limit_direction = true;
+        flags.needs_encode_overflow = true;
+        emit_bounded_encode(emitter, indent, "body");
+    }
     emitter.line(indent, "request = request");
     match content.media_class {
         MediaClass::JsonFamily => {
@@ -2229,12 +2255,17 @@ fn emit_content_type_gate(emitter: &mut Emitter, contents: &[PlannedContent], fl
 /// Bounded JSON request serialization; an encode overflow returns
 /// `BodyTooLarge` without sending anything (§34.2).
 fn emit_bounded_encode(emitter: &mut Emitter, indent: usize, value_expr: &str) {
-    emitter.line(
-        indent,
-        &format!(
-            "let payload = match serialize_json_limited({value_expr}, self.limits.structured_encode_bytes) {{"
-        ),
+    let head = format!(
+        "let payload = match serialize_json_limited({value_expr}, self.limits.structured_encode_bytes) {{"
     );
+    if fits(indent, &head) {
+        emitter.line(indent, &head);
+    } else {
+        emitter.line(indent, "let payload = match serialize_json_limited(");
+        emitter.line(indent + 1, &format!("{value_expr},"));
+        emitter.line(indent + 1, "self.limits.structured_encode_bytes,");
+        emitter.line(indent, ") {");
+    }
     emitter.line(indent + 1, "Ok(payload) => payload,");
     let err_line =
         "Err(_) => return Err(encode_overflow_error(self.limits.structured_encode_bytes)),";
@@ -2807,7 +2838,7 @@ fn emit_error_type(
         "fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {",
     );
     match field {
-        Some(_) => emitter.line(2, &format!("write!(f, {display_format}, &self.0)")),
+        Some(_) => emitter.line(2, &format!("write!(f, {display_format}, self.0)")),
         None => emitter.line(2, &format!("f.write_str({display_format})")),
     }
     emitter.line(1, "}");

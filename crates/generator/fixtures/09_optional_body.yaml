@@ -1,0 +1,55 @@
+# Fixture 09 — optional request bodies and no-body statuses (main spec §26,
+# §35; §50 tests 21/22/46/47): echoNote carries a REQUIRED-false JSON body of
+# a nullable string so the generated pair distinguishes an ABSENT body
+# (trait `None`) from a JSON `null` document (`Some(None)`) from a value
+# (`Some(Some(..))`). deleteTask documents only 204 + 404, pinning the unit
+# no-body variant that must write zero body bytes.
+openapi: 3.1.0
+info:
+  title: optional-body shapes
+  version: "1"
+paths:
+  /echo-note:
+    post:
+      operationId: echoNote
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: [string, 'null']
+      responses:
+        '200':
+          description: Echoed note
+          content:
+            application/json:
+              schema:
+                type: [string, 'null']
+  /tasks/{id}:
+    delete:
+      operationId: deleteTask
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Deleted
+        '404':
+          description: Missing task
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+components:
+  schemas:
+    ProblemDetails:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+        detail:
+          type: string

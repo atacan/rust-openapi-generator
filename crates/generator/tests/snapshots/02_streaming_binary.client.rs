@@ -150,7 +150,6 @@ pub struct GetObject200 {
 
 impl GetObject200 {
     /// Consumes the wrapper into the raw chunk stream (main spec §32).
-    #[must_use]
     pub fn into_bytes_stream(
         self,
     ) -> impl ::futures_core::Stream<Item = ::reqwest::Result<::bytes::Bytes>> {
@@ -334,7 +333,7 @@ struct UnsupportedCharset(String);
 
 impl std::fmt::Display for UnsupportedCharset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "charset `{}` is outside the UTF-8 family", &self.0)
+        write!(f, "charset `{}` is outside the UTF-8 family", self.0)
     }
 }
 

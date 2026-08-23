@@ -346,10 +346,13 @@ fn fixture_03_nested_content_enum_carries_axum_streaming_payloads() {
     );
 
     // Encoder dispatches per nested variant behind the correct literal.
+    // (rustfmt canonicalizes short streaming arms into block form.)
     let encoder = item_block(&output, "impl GetArtifactResponse {");
     assert!(
-        encoder.contains("GetArtifact200Content::OctetStream(value) => stream_response(")
-            && encoder.contains("\"application/octet-stream\""),
+        encoder.contains("GetArtifact200Content::OctetStream(value) => {")
+            && encoder.contains(
+                "stream_response(::http::StatusCode::OK, \"application/octet-stream\", value)"
+            ),
         "\n{encoder}"
     );
     assert!(
