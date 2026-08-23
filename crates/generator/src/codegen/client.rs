@@ -31,7 +31,10 @@ use crate::ir::document::{
 use crate::normalize::naming;
 use crate::normalize::NormalizedDocument;
 
-use super::plan::{PlannedApi, PlannedContent, PlannedOperation, PlannedParameter, PlannedStatus};
+use super::plan::{
+    PlannedApi, PlannedContent, PlannedMultipart, PlannedMultipartField, PlannedMultipartFieldKind,
+    PlannedOperation, PlannedParameter, PlannedStatus,
+};
 use super::Emitter;
 
 const RUSTFMT_MAX_WIDTH: usize = 100;
@@ -90,18 +93,30 @@ fn fresh_name(used: &mut BTreeSet<String>, base: String) -> String {
 
 /// Module-level type-name registry for one API: content enums and streaming
 /// wrappers get `<Op><Status>[Content]` names with numeric collision
-/// suffixes ordered by document position (companion §10).
+/// suffixes ordered by document position (companion §10). Multipart request
+/// bodies register their `<Op>Request` input struct (§17 Output A).
 #[derive(Debug, Default)]
 struct Layout {
     /// (operation document index, status index) → generated type name.
     content_enums: BTreeMap<(usize, usize), String>,
     wrappers: BTreeMap<(usize, usize), String>,
+    /// Operation document index → `<Op>Request` multipart input struct.
+    request_structs: BTreeMap<usize, String>,
 }
 
 impl Layout {
     fn new(plan: &PlannedApi, used: &mut BTreeSet<String>) -> Self {
         let mut layout = Self::default();
         for (op_index, operation) in plan.operations.iter().enumerate() {
+            if operation
+                .request_contents
+                .iter()
+                .any(|content| content.media_class == MediaClass::Multipart)
+            {
+                let base = format!("{}Request", operation.pascal);
+                let name = fresh_name(used, base);
+                layout.request_structs.insert(op_index, name);
+            }
             for (status_index, status) in operation.statuses.iter().enumerate() {
                 if status.contents.len() >= 2 {
                     let base = format!("{}{}Content", operation.pascal, status_name_part(status));
@@ -115,6 +130,10 @@ impl Layout {
             }
         }
         layout
+    }
+
+    fn request_struct(&self, op_index: usize) -> Option<&str> {
+        self.request_structs.get(&op_index).map(String::as_str)
     }
 }
 
@@ -194,6 +213,9 @@ struct Flags {
     /// At least one OPTIONAL documented header exists → the optional
     /// variant of the parse helper is emitted.
     needs_optional_header_helper: bool,
+    /// A multipart request body exists somewhere (main spec §17): pulls in
+    /// the `reqwest::multipart` form builder plus the per-part mime helper.
+    needs_multipart: bool,
 }
 
 impl Flags {
@@ -234,6 +256,24 @@ impl Flags {
                 self.needs_body_limit_direction = true;
                 self.model_types
                     .extend(model_type_names(&content.model_expr));
+            }
+            MediaClass::Multipart => {
+                // §17 Output A: owned input struct; JSON parts serialize
+                // bounded BEFORE any wire traffic (§34.2); binary parts stay
+                // streaming (`reqwest::Body`).
+                self.needs_multipart = true;
+                self.needs_body_limit_direction = true;
+                if let Some(spec) = &content.multipart_spec {
+                    for field in &spec.fields {
+                        if let PlannedMultipartFieldKind::JsonPart(model) = &field.kind {
+                            self.needs_serialize_json = true;
+                            self.needs_encode_overflow = true;
+                            let cleaned = model.strip_prefix("Option<").unwrap_or(model);
+                            let cleaned = cleaned.strip_suffix(">").unwrap_or(cleaned);
+                            self.model_types.extend(model_type_names(cleaned));
+                        }
+                    }
+                }
             }
             MediaClass::PlainText => self.needs_body_limit_direction = true,
             MediaClass::Binary | MediaClass::RawUnknown => {}
@@ -423,6 +463,9 @@ fn emit_header(emitter: &mut Emitter, doc: &NormalizedDocument, flags: &Flags) {
         // rustfmt keeps short brace lists on one line.
         let joined = params.join(", ");
         imports.push(format!("use ::openapi_support::params::{{{joined}}};"));
+    }
+    if flags.needs_multipart {
+        imports.push("use ::reqwest::multipart::{Form, Part};".to_owned());
     }
 
     for import in &imports {
@@ -1031,7 +1074,19 @@ fn emit_operation_definitions(
     emitter.blank();
     let mut first = true;
     if operation.request_body_enum_name.is_some() {
-        emit_request_body_enum(emitter, operation);
+        emit_request_body_enum(emitter, op_index, operation, layout);
+        first = false;
+    }
+    if let Some(name) = layout.request_struct(op_index) {
+        if !first {
+            emitter.blank();
+        }
+        let spec = operation
+            .request_contents
+            .iter()
+            .find(|content| content.media_class == MediaClass::Multipart)
+            .and_then(|content| content.multipart_spec.as_ref());
+        emit_multipart_request_struct(emitter, operation, name, spec);
         first = false;
     }
     for (status_index, status) in operation.statuses.iter().enumerate() {
@@ -1056,7 +1111,12 @@ fn emit_operation_definitions(
     emit_response_enum(emitter, op_index, operation, layout);
 }
 
-fn emit_request_body_enum(emitter: &mut Emitter, operation: &PlannedOperation) {
+fn emit_request_body_enum(
+    emitter: &mut Emitter,
+    op_index: usize,
+    operation: &PlannedOperation,
+    layout: &Layout,
+) {
     let Some(enum_name) = &operation.request_body_enum_name else {
         return;
     };
@@ -1071,7 +1131,10 @@ fn emit_request_body_enum(emitter: &mut Emitter, operation: &PlannedOperation) {
     emitter.line(0, "#[derive(Debug)]");
     emitter.line(0, &format!("pub enum {enum_name} {{"));
     for content in &operation.request_contents {
-        let payload = request_payload_type(content);
+        let payload = match content.media_class {
+            MediaClass::Multipart => layout.request_struct(op_index).unwrap_or("()").to_owned(),
+            _ => request_payload_type(content),
+        };
         emitter.line(1, &format!("{}({}),", content.variant_name, payload));
     }
     emitter.line(0, "}");
@@ -1086,6 +1149,228 @@ fn request_payload_type(content: &PlannedContent) -> String {
         // Planning rejects the rest before emission.
         _ => "()".to_owned(),
     }
+}
+
+/// A planned multipart field plus its collision-resolved struct identifiers
+/// (companion §10 numeric suffixing inside one input struct).
+struct MultipartFieldIdents<'a> {
+    field: &'a PlannedMultipartField,
+    ident: String,
+    file_ident: String,
+    mime_ident: String,
+}
+
+/// Field identifier with numeric suffixing on collisions (companion §10).
+fn unique_field_name(base: &str, used: &mut BTreeMap<String, u32>) -> String {
+    let counter = used.entry(base.to_owned()).or_insert(0);
+    *counter += 1;
+    if *counter == 1 {
+        base.to_owned()
+    } else {
+        naming::sanitize_joined(&format!("{base}_{counter}"))
+    }
+}
+
+fn resolve_multipart_idents(fields: &[PlannedMultipartField]) -> Vec<MultipartFieldIdents<'_>> {
+    let mut used_fields: BTreeMap<String, u32> = BTreeMap::new();
+    fields
+        .iter()
+        .map(|field| {
+            let ident = unique_field_name(&field.rust_name, &mut used_fields);
+            let (file_ident, mime_ident) = match &field.kind {
+                PlannedMultipartFieldKind::BinaryPart => (
+                    unique_field_name(&format!("{ident}_name"), &mut used_fields),
+                    unique_field_name(&format!("{ident}_content_type"), &mut used_fields),
+                ),
+                _ => (String::new(), String::new()),
+            };
+            MultipartFieldIdents {
+                field,
+                ident,
+                file_ident,
+                mime_ident,
+            }
+        })
+        .collect()
+}
+
+/// The `<Op>Request` multipart input struct (main spec §17 Output A):
+/// scalar/JSON parts are owned values; every binary part stays a streaming
+/// `::reqwest::Body` (never `Vec<u8>`), carrying optional upload filename and
+/// content type beside it.
+fn emit_multipart_request_struct(
+    emitter: &mut Emitter,
+    operation: &PlannedOperation,
+    name: &str,
+    spec: Option<&PlannedMultipart>,
+) {
+    emitter.docs(
+        0,
+        &[format!(
+            "Multipart input for `{}` (main spec §17 Output A): scalar/JSON \
+                 parts are owned values; binary parts stay streaming \
+                 (`::reqwest::Body`, never buffered by generated code).",
+            operation.method
+        )],
+    );
+    emitter.line(0, "#[derive(Debug)]");
+    emitter.line(0, &format!("pub struct {name} {{"));
+    let resolved = resolve_multipart_idents(spec.map(|s| s.fields.as_slice()).unwrap_or(&[]));
+    for entry in &resolved {
+        match &entry.field.kind {
+            PlannedMultipartFieldKind::ScalarText(rust_type) => {
+                emit_part_field_doc(emitter, 1, entry.field, "owned textual");
+                let field_type = wrap_option_unless_required(rust_type, entry.field);
+                emitter.line(1, &format!("pub {}: {field_type},", entry.ident));
+            }
+            PlannedMultipartFieldKind::JsonPart(model) => {
+                emit_part_field_doc(emitter, 1, entry.field, "JSON");
+                let field_type = wrap_option_unless_required(model, entry.field);
+                emitter.line(1, &format!("pub {}: {field_type},", entry.ident));
+            }
+            PlannedMultipartFieldKind::BinaryPart => {
+                emit_part_field_doc(emitter, 1, entry.field, "streaming binary");
+                emitter.line(1, &format!("pub {}: ::reqwest::Body,", entry.ident));
+                emitter.docs(
+                    1,
+                    &[format!(
+                        "Upload filename reported for part `{}`, when set.",
+                        entry.field.wire_name
+                    )],
+                );
+                emitter.line(1, &format!("pub {}: Option<String>,", entry.file_ident));
+                emitter.docs(
+                    1,
+                    &[format!(
+                        "Content type for part `{}`, when set.",
+                        entry.field.wire_name
+                    )],
+                );
+                emitter.line(
+                    1,
+                    &format!("pub {}: Option<::mime::Mime>,", entry.mime_ident),
+                );
+            }
+        }
+    }
+    emitter.line(0, "}");
+
+    // One §17 from_file constructor per binary part: the named part streams
+    // straight off the opened file through tokio-util's ReaderStream; other
+    // binary parts start empty.
+    for target in resolved
+        .iter()
+        .filter(|entry| matches!(entry.field.kind, PlannedMultipartFieldKind::BinaryPart))
+    {
+        let ctor = format!("from_{}", target.ident);
+        emit_from_file_ctor(emitter, name, &ctor, &resolved, target);
+    }
+}
+
+fn emit_part_field_doc(
+    emitter: &mut Emitter,
+    indent: usize,
+    field: &PlannedMultipartField,
+    kind_label: &str,
+) {
+    let cardinality = if field.repeated {
+        "; repeated parts collect in wire order"
+    } else {
+        ""
+    };
+    emitter.docs(
+        indent,
+        &[format!(
+            "{kind_label} part `{}`{}.",
+            field.wire_name, cardinality
+        )],
+    );
+}
+
+/// Required single-valued scalar/JSON parts are plain; optional ones ride
+/// `Option<T>`; repeated parts are `Vec<T>` collecting in wire order.
+fn wrap_option_unless_required(rust_type: &str, field: &PlannedMultipartField) -> String {
+    if field.repeated {
+        format!("Vec<{rust_type}>")
+    } else if field.required {
+        rust_type.to_owned()
+    } else {
+        format!("Option<{rust_type}>")
+    }
+}
+
+/// Emits one §17 `from_file` constructor for one binary part: parameters are
+/// every scalar/JSON field in declaration order, then the path; other binary
+/// parts initialize to an empty streaming body.
+fn emit_from_file_ctor(
+    emitter: &mut Emitter,
+    struct_name: &str,
+    ctor: &str,
+    resolved: &[MultipartFieldIdents],
+    target: &MultipartFieldIdents,
+) {
+    emitter.blank();
+    emitter.line(0, &format!("impl {struct_name} {{"));
+    emitter.docs(
+        1,
+        &[format!(
+            "Opens `path` as the streaming payload of part `{}` (main spec \
+              §17): bytes flow through tokio-util's ReaderStream without \
+             whole-file buffering; other binary parts start empty.",
+            target.field.wire_name
+        )],
+    );
+    emitter.docs(
+        1,
+        &["Errors propagate `std::io::Error` from opening the file.".to_owned()],
+    );
+    emitter.line(1, "#[allow(clippy::missing_errors_doc)]");
+    emitter.line(1, &format!("pub async fn {ctor}("));
+    for entry in resolved {
+        if let PlannedMultipartFieldKind::ScalarText(rust_type)
+        | PlannedMultipartFieldKind::JsonPart(rust_type) = &entry.field.kind
+        {
+            let param_type = wrap_option_unless_required(rust_type, entry.field);
+            emitter.line(2, &format!("{}: {param_type},", entry.ident));
+        }
+    }
+    emitter.line(2, "path: impl AsRef<::std::path::Path>,");
+    emitter.line(1, ") -> Result<Self, ::std::io::Error> {");
+    emitter.line(
+        2,
+        "let file = ::tokio::fs::File::open(path.as_ref()).await?;",
+    );
+    emitter.line(2, "let stream = ::tokio_util::io::ReaderStream::new(file);");
+    emitter.line(2, "Ok(Self {");
+    for entry in resolved {
+        match &entry.field.kind {
+            PlannedMultipartFieldKind::ScalarText(_) | PlannedMultipartFieldKind::JsonPart(_) => {
+                emitter.line(3, &format!("{},", entry.ident));
+            }
+            PlannedMultipartFieldKind::BinaryPart => {
+                if entry.field.wire_name == target.field.wire_name {
+                    emitter.line(
+                        3,
+                        &format!("{}: ::reqwest::Body::wrap_stream(stream),", entry.ident),
+                    );
+                    emitter.line(3, &format!("{}: path", entry.file_ident));
+                    emitter.line(4, ".as_ref()");
+                    emitter.line(4, ".file_name()");
+                    emitter.line(4, ".map(|value| value.to_string_lossy().into_owned()),");
+                } else {
+                    emitter.line(
+                        3,
+                        &format!("{}: ::bytes::Bytes::new().into(),", entry.ident),
+                    );
+                    emitter.line(3, &format!("{}: None,", entry.file_ident));
+                }
+                emitter.line(3, &format!("{}: None,", entry.mime_ident));
+            }
+        }
+    }
+    emitter.line(2, "})");
+    emitter.line(1, "}");
+    emitter.line(0, "}");
 }
 
 fn emit_content_enum(
@@ -1374,7 +1659,11 @@ struct SignatureArgument {
     rust_type: String,
 }
 
-fn signature_arguments(operation: &PlannedOperation) -> Vec<SignatureArgument> {
+fn signature_arguments(
+    operation: &PlannedOperation,
+    layout: &Layout,
+    op_index: usize,
+) -> Vec<SignatureArgument> {
     let mut arguments: Vec<SignatureArgument> = operation
         .parameters
         .iter()
@@ -1413,7 +1702,7 @@ fn signature_arguments(operation: &PlannedOperation) -> Vec<SignatureArgument> {
                 }
             }
             (None, Some(content)) => {
-                let base = request_parameter_type(content);
+                let base = request_parameter_type(content, layout, op_index);
                 if operation.request_body_required {
                     base
                 } else {
@@ -1431,13 +1720,15 @@ fn signature_arguments(operation: &PlannedOperation) -> Vec<SignatureArgument> {
 }
 
 /// Direct request-parameter type for single-content operations (§6 table):
-/// `&T` for JSON and forms (D-§51.3 convenience), `&str` for text, owned
+/// `&T` for JSON and forms (D-§51.3 convenience), the owned `<Op>Request`
+/// input struct for multipart (§17 Output A), `&str` for text, owned
 /// `reqwest::Body` for streaming payloads.
-fn request_parameter_type(content: &PlannedContent) -> String {
+fn request_parameter_type(content: &PlannedContent, layout: &Layout, op_index: usize) -> String {
     match content.media_class {
         MediaClass::JsonFamily | MediaClass::UrlEncodedForm => {
             format!("&{}", content.model_expr)
         }
+        MediaClass::Multipart => layout.request_struct(op_index).unwrap_or("()").to_owned(),
         MediaClass::PlainText => "&str".to_owned(),
         MediaClass::Binary | MediaClass::RawUnknown => "::reqwest::Body".to_owned(),
         _ => "()".to_owned(),
@@ -1465,7 +1756,7 @@ fn emit_operation_method(
         emitter.line(1, "#[deprecated]");
     }
 
-    let arguments = signature_arguments(operation);
+    let arguments = signature_arguments(operation, layout, op_index);
     let args_inline: Vec<String> = std::iter::once("&self".to_owned())
         .chain(
             arguments
@@ -1760,22 +2051,35 @@ fn emit_request_construction(
     let multi_body = operation.request_body_enum_name.is_some();
     let optional_single =
         !multi_body && !operation.request_body_required && !operation.request_contents.is_empty();
+    let is_multipart = operation
+        .request_contents
+        .first()
+        .is_some_and(|content| content.media_class == MediaClass::Multipart);
     let needs_rebinding = multi_body
         || optional_single
+        || is_multipart
         || !header_parameters.is_empty()
         || !cookie_parameters.is_empty();
 
     // §30.1: redirects are off by default so documented 3xx statuses reach
     // the exhaustive enum; opt-in following never buffers bodies for replay.
     if needs_rebinding {
-        emitter.line(2, "let mut request =");
-        emitter.line(
-            3,
-            &format!(
-                "self.http.request(::http::Method::{}, &url);",
-                http_method_const(operation.http)
-            ),
+        let request_head = format!(
+            "let mut request = self.http.request(::http::Method::{}, &url);",
+            http_method_const(operation.http)
         );
+        if fits(2, &request_head) {
+            emitter.line(2, &request_head);
+        } else {
+            emitter.line(2, "let mut request =");
+            emitter.line(
+                3,
+                &format!(
+                    "self.http.request(::http::Method::{}, &url);",
+                    http_method_const(operation.http)
+                ),
+            );
+        }
         emit_header_params(emitter, &header_parameters, flags);
         emit_cookie_params(emitter, &cookie_parameters);
         emit_body_assignment(emitter, operation, flags);
@@ -1915,7 +2219,8 @@ fn emit_cookie_params(emitter: &mut Emitter, parameters: &[&PlannedParameter]) {
 }
 
 /// Body assignment for rebound requests: single payloads (required or
-/// optional) and multi-content enums (§12/§26/§43).
+/// optional), multi-content enums (§12/§26/§43), and multipart form
+/// builders (§17).
 fn emit_body_assignment(emitter: &mut Emitter, operation: &PlannedOperation, flags: &mut Flags) {
     if let Some(enum_name) = &operation.request_body_enum_name {
         match (
@@ -1946,6 +2251,19 @@ fn emit_body_assignment(emitter: &mut Emitter, operation: &PlannedOperation, fla
     let Some(content) = operation.request_contents.first() else {
         return;
     };
+    if content.media_class == MediaClass::Multipart {
+        let spec = content.multipart_spec.as_ref();
+        if operation.request_body_required {
+            emit_multipart_form_build(emitter, 2, "body", spec, flags);
+            emitter.line(2, "request = request.multipart(form);");
+        } else {
+            emitter.line(2, "if let Some(body) = body {");
+            emit_multipart_form_build(emitter, 3, "body", spec, flags);
+            emitter.line(3, "request = request.multipart(form);");
+            emitter.line(2, "}");
+        }
+        return;
+    }
     if operation.request_body_required {
         emit_single_request_body(emitter, 2, content, true, flags);
     } else {
@@ -2072,6 +2390,16 @@ fn emit_request_enum_arm(
             emitter.line(indent + 1, ".body(text)");
             emitter.line(indent, "}");
         }
+        MediaClass::Multipart => {
+            // §17: the form builder carries the multipart Content-Type with
+            // its boundary itself; a static header would break framing.
+            flags.needs_multipart = true;
+            emitter.line(indent, &format!("{variant}(value) => {{"));
+            let spec = content.multipart_spec.as_ref();
+            emit_multipart_form_build(emitter, indent + 1, "value", spec, flags);
+            emitter.line(indent + 1, "request.multipart(form)");
+            emitter.line(indent, "}");
+        }
         _ => {
             emitter.line(indent, &format!("{variant}(body) => {{"));
             emitter.line(indent + 1, "request");
@@ -2086,6 +2414,158 @@ fn emit_request_enum_arm(
             emitter.line(indent, "}");
         }
     }
+}
+
+// ----------------------------------------------------------------------
+// ----------------------------------------------------------------------
+// Multipart form building (main spec §17 Output A)
+// ----------------------------------------------------------------------
+
+/// Builds a `::reqwest::multipart::Form` from the `<Op>Request` value:
+/// scalar parts via `Part::text`, JSON parts serialized through the bounded
+/// `serialize_json_limited` FIRST (§34.2: overflow returns before any wire
+/// traffic) and attached with their declared (or `application/json`) media
+/// type, binary parts as unbuffered `Part::stream` payloads with optional
+/// filename/mime. Repeated scalar/JSON parts append one part per value in
+/// declaration order. The caller attaches with `request.multipart(form)`,
+/// which also writes the boundary-bearing Content-Type header.
+fn emit_multipart_form_build(
+    emitter: &mut Emitter,
+    indent: usize,
+    value_expr: &str,
+    spec: Option<&PlannedMultipart>,
+    flags: &mut Flags,
+) {
+    flags.needs_multipart = true;
+    emitter.line(indent, "let mut form = Form::new();");
+    let Some(spec) = spec else {
+        return;
+    };
+    for entry in &resolve_multipart_idents(&spec.fields) {
+        let field = entry.field;
+        let wire = rust_string_literal(&field.wire_name);
+        match &field.kind {
+            PlannedMultipartFieldKind::ScalarText(rust_type) => {
+                if field.repeated {
+                    emitter.line(
+                        indent,
+                        &format!("for value in &{}.{} {{", value_expr, entry.ident),
+                    );
+                    emitter.line(
+                        indent + 1,
+                        &format!(
+                            "form = form.part({wire}, Part::text({}));",
+                            scalar_text_expr(rust_type, "value")
+                        ),
+                    );
+                    emitter.line(indent, "}");
+                } else if field.required {
+                    let expr =
+                        scalar_text_expr(rust_type, &format!("{}.{}", value_expr, entry.ident));
+                    emitter.line(
+                        indent,
+                        &format!("form = form.part({wire}, Part::text({expr}));"),
+                    );
+                } else {
+                    emitter.line(
+                        indent,
+                        &format!("if let Some(value) = &{}.{} {{", value_expr, entry.ident),
+                    );
+                    emitter.line(
+                        indent + 1,
+                        &format!(
+                            "form = form.part({wire}, Part::text({}));",
+                            scalar_text_expr(rust_type, "value")
+                        ),
+                    );
+                    emitter.line(indent, "}");
+                }
+            }
+            PlannedMultipartFieldKind::JsonPart(_) => {
+                flags.needs_serialize_json = true;
+                let mime_literal = field
+                    .content_type
+                    .clone()
+                    .unwrap_or_else(|| "application/json".to_owned());
+                if field.repeated {
+                    emitter.line(
+                        indent,
+                        &format!("for element in &{}.{} {{", value_expr, entry.ident),
+                    );
+                    emit_bounded_encode(emitter, indent + 1, "element", "serialize_json_limited");
+                    emit_form_part_json(emitter, indent + 1, &wire, &mime_literal);
+                    emitter.line(indent, "}");
+                } else {
+                    let expr = format!("&{}.{}", value_expr, entry.ident);
+                    emit_bounded_encode(emitter, indent, &expr, "serialize_json_limited");
+                    emit_form_part_json(emitter, indent, &wire, &mime_literal);
+                }
+            }
+            PlannedMultipartFieldKind::BinaryPart => {
+                emitter.line(indent, &format!("form = form.part({wire}, {{"));
+                emitter.line(
+                    indent + 1,
+                    &format!(
+                        "let mut part = Part::stream({}.{});",
+                        value_expr, entry.ident
+                    ),
+                );
+                emitter.line(
+                    indent + 1,
+                    &format!(
+                        "if let Some(value) = {}.{} {{",
+                        value_expr, entry.file_ident
+                    ),
+                );
+                emitter.line(indent + 2, "part = part.file_name(value.clone());");
+                emitter.line(indent + 1, "}");
+                emitter.line(
+                    indent + 1,
+                    &format!(
+                        "if let Some(value) = {}.{} {{",
+                        value_expr, entry.mime_ident
+                    ),
+                );
+                emitter.line(indent + 2, "part = part_with_mime(part, value.as_ref())?;");
+                emitter.line(indent + 1, "}");
+                emitter.line(indent + 1, "part");
+                emitter.line(indent, "});");
+            }
+        }
+    }
+}
+
+/// Text conversion for one scalar part value (`String` clones; typed
+/// scalars render through `Display`).
+fn scalar_text_expr(rust_type: &str, expr: &str) -> String {
+    if rust_type == "String" {
+        format!("{expr}.clone()")
+    } else {
+        format!("{expr}.to_string()")
+    }
+}
+
+/// Appends one already-serialized JSON payload as a mime-typed part.
+fn emit_form_part_json(emitter: &mut Emitter, indent: usize, wire: &str, mime_literal: &str) {
+    let mime = rust_string_literal(mime_literal);
+    let inner = format!("part_with_mime(Part::bytes(Vec::from(&payload[..])), {mime})?");
+    let outer_args = format!("{wire}, {inner}");
+    let inline = format!("form = form.part({outer_args});");
+    if fits(indent, &inline) && outer_args.chars().count() <= FN_CALL_WIDTH {
+        emitter.line(indent, &inline);
+        return;
+    }
+    emitter.line(indent, "form = form.part(");
+    emitter.line(indent + 1, &format!("{wire},"));
+    if fits(indent + 1, &format!("{inner},")) {
+        emitter.line(indent + 1, &format!("{inner},"));
+    } else {
+        emitter.line(indent + 2, "part_with_mime(");
+        emitter.line(indent + 3, "Part::bytes(Vec::from(&payload[..])),");
+        emitter.line(indent + 3, &format!("{mime},"));
+        emitter.line(indent + 2, ")?,");
+    }
+    emitter.line(indent, ");");
 }
 
 // ----------------------------------------------------------------------
@@ -2589,28 +3069,36 @@ fn emit_content_type_gate(emitter: &mut Emitter, contents: &[PlannedContent], fl
 /// `BodyTooLarge` without sending anything (§34.2). `serializer` selects
 /// `serialize_json_limited` or `serialize_form_limited`.
 fn emit_bounded_encode(emitter: &mut Emitter, indent: usize, value_expr: &str, serializer: &str) {
-    let head = format!(
-        "let payload = match {serializer}({value_expr}, self.limits.structured_encode_bytes) {{"
-    );
+    let call = format!("{serializer}({value_expr}, self.limits.structured_encode_bytes)");
+    let head = format!("let payload = match {call} {{");
+    let mut arm_indent = indent + 1;
+    let mut close_indent = indent;
     if fits(indent, &head) {
         emitter.line(indent, &head);
+    } else if fits(indent + 1, &format!("match {call} {{")) {
+        // rustfmt prefers breaking after `=` so the whole match head stays
+        // horizontal on its own continuation line.
+        emitter.line(indent, "let payload =");
+        emitter.line(indent + 1, &format!("match {call} {{"));
+        arm_indent = indent + 2;
+        close_indent = indent + 1;
     } else {
         emitter.line(indent, &format!("let payload = match {serializer}("));
         emitter.line(indent + 1, &format!("{value_expr},"));
         emitter.line(indent + 1, "self.limits.structured_encode_bytes,");
         emitter.line(indent, ") {");
     }
-    emitter.line(indent + 1, "Ok(payload) => payload,");
+    emitter.line(arm_indent, "Ok(payload) => payload,");
     let err_line =
         "Err(_) => return Err(encode_overflow_error(self.limits.structured_encode_bytes)),";
-    if fits(indent + 1, err_line) {
-        emitter.line(indent + 1, err_line);
+    if fits(arm_indent, err_line) {
+        emitter.line(arm_indent, err_line);
     } else {
-        emitter.line(indent + 1, "Err(_) => return Err(encode_overflow_error(");
-        emitter.line(indent + 2, "self.limits.structured_encode_bytes,");
-        emitter.line(indent + 1, ")),");
+        emitter.line(arm_indent, "Err(_) => return Err(encode_overflow_error(");
+        emitter.line(arm_indent + 1, "self.limits.structured_encode_bytes,");
+        emitter.line(arm_indent, ")),");
     }
-    emitter.line(indent, "};");
+    emitter.line(close_indent, "};");
 }
 
 /// Plain-text request length check against the encode budget (§34.2).
@@ -2818,6 +3306,37 @@ fn emit_wrapper_fields_opt(emitter: &mut Emitter, indent: usize, status: &Planne
 // ----------------------------------------------------------------------
 
 fn emit_module_helpers(emitter: &mut Emitter, flags: &Flags, has_variables: bool) {
+    if flags.needs_multipart {
+        emitter.blank();
+        emitter.docs(
+            0,
+            &[
+                "Attaches a declared media type to one multipart part (main \
+                  spec §17). The literal was planned from the document's \
+                 `encoding.contentType`; a value the MIME parser refuses is \
+                 a malformed content type, never silently defaulted."
+                    .to_owned(),
+            ],
+        );
+        emitter.line(0, "#[allow(clippy::missing_errors_doc)]");
+        let sig =
+            "fn part_with_mime(part: Part, mime_literal: &str) -> Result<Part, ClientError> {";
+        if fits(0, sig) {
+            emitter.line(0, sig);
+        } else {
+            emitter.line(0, "fn part_with_mime(");
+            emitter.line(1, "part: Part,");
+            emitter.line(1, "mime_literal: &str,");
+            emitter.line(0, ") -> Result<Part, ClientError> {");
+        }
+        emitter.line(1, "part.mime_str(mime_literal).map_err(|_| {");
+        emitter.line(
+            2,
+            "ClientError::MalformedContentType(::openapi_support::mediatype::MalformedContentType)",
+        );
+        emitter.line(1, "})");
+        emitter.line(0, "}");
+    }
     if flags.needs_content_type_helpers {
         emitter.blank();
         emitter.docs(

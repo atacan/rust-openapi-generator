@@ -117,6 +117,53 @@ pub struct PlannedContent {
     /// payload type from [`MediaClass`]).
     pub model_expr: String,
     pub is_wildcard: bool,
+    /// Typed field plan for `multipart/form-data` request entries (§17):
+    /// populated when [`MediaClass::Multipart`] is planned for a REQUEST;
+    /// always `None` elsewhere (response-side multipart still
+    /// stop-and-reports).
+    pub multipart_spec: Option<PlannedMultipart>,
+}
+
+/// Planned field set of one `multipart/form-data` schema (main spec §17):
+/// object properties in declaration order with their per-part typing,
+/// cardinality, and declared per-part content type (`encoding.contentType`).
+#[derive(Debug, Clone)]
+pub struct PlannedMultipart {
+    pub fields: Vec<PlannedMultipartField>,
+}
+
+/// One planned multipart part (main spec §17/§17.1).
+#[derive(Debug, Clone)]
+pub struct PlannedMultipartField {
+    /// Object property name verbatim; it IS the wire part name.
+    pub wire_name: String,
+    /// snake_case Rust identifier from the naming pipeline (companion §10),
+    /// numeric-suffixed on collisions by declaration order.
+    pub rust_name: String,
+    pub kind: PlannedMultipartFieldKind,
+    /// Required per the object's `required` array.
+    pub required: bool,
+    /// Declared per-part content type from the media type's `encoding`
+    /// object (`encoding.{field}.contentType`), verbatim; `None` when
+    /// undeclared.
+    pub content_type: Option<String>,
+    /// True when the property schema is an array; the wire may then repeat
+    /// the part name and values collect in arrival order (§17.1).
+    pub repeated: bool,
+}
+
+/// Per-part payload representation (§17 source mapping).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlannedMultipartFieldKind {
+    /// Textual scalar part decoded into the carried Rust type (parameter
+    /// typing rules: string→String, int32→i32 else i64, number→f64,
+    /// boolean→bool).
+    ScalarText(String),
+    /// Bounded JSON part decoded into the named `super::models` type (or an
+    /// inline-expressible JSON target such as `serde_json::Value`).
+    JsonPart(String),
+    /// Streaming binary part (`format: binary`); never buffered.
+    BinaryPart,
 }
 
 /// One merged parameter with its Phase 1 Rust representation.
@@ -381,9 +428,10 @@ pub(crate) fn reason_phrase(code: u16) -> Option<&'static str> {
     })
 }
 
-/// Which side of an operation a content list belongs to: UrlEncodedForm is
-/// honored for REQUESTS in this phase (main spec §16) while every response
-/// list still stops on it (D-impl-forms-phase2 scope note).
+/// Which side of an operation a content list belongs to: UrlEncodedForm and
+/// Multipart are honored for REQUESTS in this phase (main spec §16/§17,
+/// superseding the D-impl-forms-phase2 deferral) while every response list
+/// still stops on them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContentSide {
     Request,
@@ -391,9 +439,9 @@ enum ContentSide {
 }
 
 /// Plans one content list: Phase 1 media classes plus request-side
-/// UrlEncodedForm; everything else stop-and-reports (Multipart/EventStream/
-/// Ndjson/JsonSeq and response-side forms are later-phase deliverables,
-/// DECISIONS.md D-impl-forms-phase2 and main spec §52).
+/// UrlEncodedForm and Multipart; everything else stop-and-reports
+/// (EventStream/Ndjson/JsonSeq and response-side forms/multipart are
+/// later-phase deliverables, main spec §52).
 fn plan_contents(
     doc: &NormalizedDocument,
     location: &DocumentPath,
@@ -406,34 +454,61 @@ fn plan_contents(
     for entry in contents {
         let form_rejected = matches!(entry.media_class, MediaClass::UrlEncodedForm)
             && side == ContentSide::Response;
-        if form_rejected
-            || matches!(
-                entry.media_class,
-                MediaClass::Multipart
-                    | MediaClass::EventStream
-                    | MediaClass::Ndjson
-                    | MediaClass::JsonSeq
-            )
-        {
-            diags.error(
-                location.key("content").key(entry.media_type.clone()),
-                "client_media_class_phase1",
-                format!(
-                    "this phase does not generate media class {:?} for `{}` \
-                     here; forms decode on requests only, multipart, SSE, \
-                     NDJSON, and JSON sequences remain later phases",
-                    entry.media_class, entry.media_type
-                ),
-            );
+        let multipart_rejected = matches!(entry.media_class, MediaClass::Multipart)
+            && (side == ContentSide::Response || entry.is_wildcard);
+        if form_rejected || multipart_rejected {
+            if matches!(entry.media_class, MediaClass::UrlEncodedForm) {
+                diags.error(
+                    location.key("content").key(entry.media_type.clone()),
+                    "client_media_class_phase1",
+                    format!(
+                        "this phase does not generate media class {:?} for `{}` \
+                         here; forms decode on requests only",
+                        entry.media_class, entry.media_type
+                    ),
+                );
+            } else {
+                diags.error(
+                    location.key("content").key(entry.media_type.clone()),
+                    "multipart_media_class_phase1",
+                    format!(
+                        "this phase does not generate media class {:?} for `{}` \
+                         here; multipart generates on requests with a concrete \
+                         media type only, and SSE/NDJSON/JSON sequences remain \
+                         later phases",
+                        entry.media_class, entry.media_type
+                    ),
+                );
+            }
             continue;
+        }
+        match entry.media_class {
+            MediaClass::EventStream | MediaClass::Ndjson | MediaClass::JsonSeq => {
+                diags.error(
+                    location.key("content").key(entry.media_type.clone()),
+                    "client_media_class_phase1",
+                    format!(
+                        "this phase does not generate media class {:?} for `{}` \
+                         here; streaming record formats remain later phases",
+                        entry.media_class, entry.media_type
+                    ),
+                );
+                continue;
+            }
+            _ => {}
         }
         let base_literal = base_media_literal(&entry.media_type);
         let variant_base = content_variant_base(&base_literal, entry.is_wildcard);
         let variant = unique_variant(&variant_base, &mut used_variants);
+        let mut multipart_spec = None;
         let model_expr = match entry.media_class {
             MediaClass::JsonFamily => json_model_expr(doc, entry.schema, location, diags),
             MediaClass::UrlEncodedForm => json_model_expr(doc, entry.schema, location, diags),
             MediaClass::PlainText => "String".to_owned(),
+            MediaClass::Multipart => {
+                multipart_spec = plan_multipart_spec(doc, entry, location, diags);
+                String::new()
+            }
             // Binary/RawUnknown stream; each emitter renders its own payload.
             _ => String::new(),
         };
@@ -443,9 +518,273 @@ fn plan_contents(
             media_type_literal: base_literal,
             model_expr,
             is_wildcard: entry.is_wildcard,
+            multipart_spec,
         });
     }
     planned
+}
+
+// ----------------------------------------------------------------------
+// Multipart request planning (main spec §17, §17.1)
+// ----------------------------------------------------------------------
+
+/// Plans the typed field set of one `multipart/form-data` schema: the top
+/// schema must be an object (stop-and-report otherwise); each property maps
+/// per the §17 source rules — scalars via the parameter typing table,
+/// object-typed properties through their models.rs name, binary strings to
+/// streaming parts — with arrays marked repeated and
+/// `encoding.{field}.contentType` carried verbatim. A body may carry AT MOST
+/// ONE binary part (§51.4 sequential semantics; see the diagnostic below).
+fn plan_multipart_spec(
+    doc: &NormalizedDocument,
+    entry: &ContentEntryIr,
+    location: &DocumentPath,
+    diags: &mut Diagnostics,
+) -> Option<PlannedMultipart> {
+    let schema_location = location.key("content").key(entry.media_type.clone());
+    let effective = doc.resolve_alias(entry.schema);
+    let properties = match doc.resolution(effective).kind.clone() {
+        ResolvedKind::MergedObject(merged) => merged.properties,
+        ResolvedKind::ClosedEnum(_) => {
+            diags.error(
+                schema_location.key("schema"),
+                "multipart_schema_unsupported",
+                "multipart/form-data schemas must be objects whose properties \
+                 map onto parts (main spec §17); an enum cannot",
+            );
+            return None;
+        }
+        ResolvedKind::Plain => match doc.arena.get(effective).kind.clone() {
+            SchemaKind::Object { properties, .. } => properties,
+            _ => {
+                diags.error(
+                    schema_location.key("schema"),
+                    "multipart_schema_unsupported",
+                    "multipart/form-data schemas must be objects whose \
+                     properties map onto parts (main spec §17)",
+                );
+                return None;
+            }
+        },
+        ResolvedKind::IntersectedScalar(_) | ResolvedKind::RawValueFallback(_) => {
+            diags.error(
+                schema_location.key("schema"),
+                "multipart_schema_unsupported",
+                "multipart/form-data schemas must be plain or merged objects \
+                 whose properties map onto parts (main spec §17); composite \
+                 fallbacks cannot become part lists",
+            );
+            return None;
+        }
+        ResolvedKind::Alias(_) => unreachable!("aliases chased by resolve_alias"),
+    };
+
+    let encoding: BTreeMap<&str, &str> = entry
+        .encoding
+        .iter()
+        .map(|(field, content_type)| (field.as_str(), content_type.as_str()))
+        .collect();
+    // rust_name collisions inside one body get numeric suffixes by property
+    // declaration order (companion §10 rule).
+    let mut used_names: BTreeMap<String, u32> = BTreeMap::new();
+    let mut fields = Vec::with_capacity(properties.len());
+    for property in &properties {
+        let base = naming::ident(&property.wire_name, NameStyle::Snake);
+        let counter = used_names.entry(base.clone()).or_insert(0);
+        *counter += 1;
+        let rust_name = if *counter == 1 {
+            base
+        } else {
+            naming::sanitize_joined(&format!("{base}_{counter}"))
+        };
+        let field_location = schema_location
+            .key("properties")
+            .key(property.wire_name.clone());
+        let Some((kind, repeated)) =
+            plan_multipart_field_kind(doc, property.schema.target, &field_location, diags)
+        else {
+            continue;
+        };
+        fields.push(PlannedMultipartField {
+            wire_name: property.wire_name.clone(),
+            rust_name,
+            kind,
+            required: property.required,
+            content_type: encoding
+                .get(property.wire_name.as_str())
+                .map(|content_type| (*content_type).to_owned()),
+            repeated,
+        });
+    }
+    // One live-part slot exists on the server (§51.4 sequential semantics):
+    // a SECOND binary field would reach the collector's unknown/drain arm
+    // and silently discard an application-meaningful stream. Mirroring the
+    // conservative stop-and-report style, this is a plan-time Error instead
+    // of improvised queueing of unbounded streams.
+    let binary_parts = fields
+        .iter()
+        .filter(|field| matches!(field.kind, PlannedMultipartFieldKind::BinaryPart))
+        .count();
+    if binary_parts > 1 {
+        diags.error(
+            schema_location.key("schema"),
+            "multipart_schema_unsupported",
+            "multipart/form-data bodies support at most one binary (format: \
+             binary) part: parts stream sequentially behind a single \
+             live-part slot (main spec §51.4), so further binary parts would \
+             silently drain; merge them into one part or split the operation",
+        );
+        return None;
+    }
+    Some(PlannedMultipart { fields })
+}
+
+/// Maps one property schema onto its part representation, returning the kind
+/// plus whether the schema is an array (`repeated`).
+///
+/// Scalars follow the parameter typing table; `format: binary` streams;
+/// object/enum shapes resolve through their assigned models.rs name (an
+/// anonymous composite stops with an Error diagnostic instead of
+/// improvising one); free-form objects and unconstrained schemas decode as
+/// raw JSON targets mirroring [`scalar_target`]. Nullability wraps JSON
+/// parts in `Option<T>` (a textual scalar part has no null form on the
+/// wire). Arrays map onto repeated parts; nested arrays stop-and-report.
+fn plan_multipart_field_kind(
+    doc: &NormalizedDocument,
+    schema: SchemaId,
+    location: &DocumentPath,
+    diags: &mut Diagnostics,
+) -> Option<(PlannedMultipartFieldKind, bool)> {
+    let effective = doc.resolve_alias(schema);
+    let nullable = doc.resolution(effective).nullable;
+    let json_part = |model: &str| Some((wrap_optional(model.to_owned(), nullable), false));
+    let resolved_kind = doc.resolution(effective).kind.clone();
+    let (kind, repeated) = match resolved_kind {
+        // Nominal definitions in models.rs.
+        ResolvedKind::MergedObject(_) | ResolvedKind::ClosedEnum(_) => {
+            match component_name(doc, effective) {
+                Some(model) => (wrap_optional(model, nullable), false),
+                None => {
+                    diags.error(
+                        location.clone(),
+                        "client_anonymous_json_schema",
+                        "multipart JSON parts reference JSON bodies through \
+                         super::models; this composite schema has no models.rs \
+                         type. Promote it to components/schemas",
+                    );
+                    return None;
+                }
+            }
+        }
+        ResolvedKind::IntersectedScalar(scalar) => (
+            multipart_scalar_kind(&scalar.base_kind).unwrap_or_else(|| {
+                PlannedMultipartFieldKind::JsonPart("serde_json::Value".to_owned())
+            }),
+            matches!(scalar.base_kind, SchemaKind::Array { .. }),
+        ),
+        ResolvedKind::RawValueFallback(_) => (
+            wrap_optional(named_or_value(doc, effective), nullable),
+            false,
+        ),
+        ResolvedKind::Alias(_) => unreachable!("aliases chased by resolve_alias"),
+        ResolvedKind::Plain => match doc.arena.get(effective).kind.clone() {
+            SchemaKind::Object { .. } | SchemaKind::Enum { .. } => {
+                match component_name(doc, effective) {
+                    Some(model) => (wrap_optional(model, nullable), false),
+                    None => {
+                        diags.error(
+                            location.clone(),
+                            "client_anonymous_json_schema",
+                            "multipart JSON parts reference JSON bodies \
+                             through super::models; an anonymous composite \
+                             schema has no models.rs type. Promote it to \
+                             components/schemas",
+                        );
+                        return None;
+                    }
+                }
+            }
+            other => match multipart_scalar_kind(&other) {
+                Some(kind) => (kind, false),
+                None => match other {
+                    SchemaKind::Array { items } => {
+                        let nested_location = location.clone();
+                        let (inner, inner_repeated) =
+                            plan_multipart_field_kind(doc, items.target, &nested_location, diags)?;
+                        if inner_repeated {
+                            diags.error(
+                                nested_location,
+                                "multipart_schema_unsupported",
+                                "arrays of arrays have no single-part text \
+                                 form; flatten the schema or use a JSON part",
+                            );
+                            return None;
+                        }
+                        (inner, true)
+                    }
+                    SchemaKind::Tuple { .. } => {
+                        diags.error(
+                            location.clone(),
+                            "multipart_schema_unsupported",
+                            "tuple schemas have no single-part text form; use \
+                             a JSON part instead",
+                        );
+                        return None;
+                    }
+                    SchemaKind::FreeFormObject => {
+                        return json_part("serde_json::Map<String, serde_json::Value>");
+                    }
+                    SchemaKind::AnyValue | SchemaKind::NotSupported { .. } => {
+                        return json_part("serde_json::Value");
+                    }
+                    // Object/Enum handled above.
+                    _ => unreachable!("object and enum kinds matched above"),
+                },
+            },
+        },
+    };
+    if repeated && matches!(kind, PlannedMultipartFieldKind::BinaryPart) {
+        // Arrays of streaming parts have no single live-part home on the
+        // server (§51.4 sequential semantics) and cannot be cloned into
+        // repeated reqwest parts on the client; stop-and-report instead of
+        // improvising a queue of unbounded streams.
+        diags.error(
+            location.clone(),
+            "multipart_schema_unsupported",
+            "repeated (array) binary parts are not representable by this \
+             phase's streaming input shape; declare a single binary part or a \
+             non-binary array",
+        );
+        return None;
+    }
+    Some((kind, repeated))
+}
+
+/// Scalar/array-of-scalar part typing shared by plain and intersected
+/// shapes: binary strings stream; everything else follows the parameter
+/// table. `None` marks shapes needing the caller's composite handling.
+fn multipart_scalar_kind(kind: &SchemaKind) -> Option<PlannedMultipartFieldKind> {
+    Some(match kind {
+        SchemaKind::String_ { binary: true, .. } => PlannedMultipartFieldKind::BinaryPart,
+        SchemaKind::String_ { .. } => PlannedMultipartFieldKind::ScalarText("String".to_owned()),
+        SchemaKind::Boolean => PlannedMultipartFieldKind::ScalarText("bool".to_owned()),
+        SchemaKind::Integer { format } => {
+            PlannedMultipartFieldKind::ScalarText(match format.as_deref() {
+                Some("int32") => "i32".to_owned(),
+                _ => "i64".to_owned(),
+            })
+        }
+        SchemaKind::Number { .. } => PlannedMultipartFieldKind::ScalarText("f64".to_owned()),
+        _ => return None,
+    })
+}
+
+fn wrap_optional(model: String, nullable: bool) -> PlannedMultipartFieldKind {
+    if nullable {
+        PlannedMultipartFieldKind::JsonPart(format!("Option<{model}>"))
+    } else {
+        PlannedMultipartFieldKind::JsonPart(model)
+    }
 }
 
 /// `application/problem+json;charset=utf-8` → `application/problem+json`.

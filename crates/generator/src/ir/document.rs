@@ -209,6 +209,12 @@ pub struct ContentEntryIr {
     /// `x-rust-stream-item` override: when present it names the streamed
     /// item type while `schema` describes the envelope (main spec §18.1).
     pub stream_item_override: Option<SchemaId>,
+    /// Media Type Object `encoding` map, reduced to the per-part
+    /// `contentType` declarations multipart codegen consumes (§17): property
+    /// name → declared content-type literal, declaration order, only entries
+    /// that actually declare `contentType`. Every other encoding keyword is a
+    /// later-phase concern.
+    pub encoding: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

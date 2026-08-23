@@ -1813,12 +1813,14 @@ impl Loader {
                         0,
                     )
                 });
+            let encoding = parse_encoding_map(media_object);
             entries.push(ContentEntryIr {
                 media_type,
                 media_class,
                 is_wildcard,
                 schema,
                 stream_item_override,
+                encoding,
             });
         }
         entries
@@ -2296,6 +2298,27 @@ fn bool_field(value: &Yaml, key: &str) -> Option<bool> {
 
 fn mapping_get_opt<'a>(value: &'a Yaml, key: &str) -> Option<&'a Yaml> {
     as_mapping(value).and_then(|m| mapping_get(m, key))
+}
+
+/// Reduces a Media Type Object's `encoding` map to its per-property
+/// `contentType` declarations (main spec §17): declaration order, only
+/// string-valued entries kept. Every other encoding keyword (`headers`,
+/// `style`, …) is a later-phase concern and silently skipped here.
+fn parse_encoding_map(media_object: &Yaml) -> Vec<(String, String)> {
+    let Some(encoding) = mapping_get_opt(media_object, "encoding").and_then(as_mapping) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (property, encoding_value) in encoding {
+        let property = property
+            .as_str()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| stringify_scalar(property));
+        if let Some(content_type) = string_field(encoding_value, "contentType") {
+            out.push((property, content_type.to_owned()));
+        }
+    }
+    out
 }
 
 fn mapping_has_opt(value: &Yaml, key: &str) -> bool {

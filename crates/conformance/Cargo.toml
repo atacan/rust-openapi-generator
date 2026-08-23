@@ -22,6 +22,10 @@ reqwest = { workspace = true }
 futures-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Referenced by the generated §17 client (`from_file` streams files through
+# tokio-util's ReaderStream); the generated code is included! into this lib.
+tokio = { workspace = true, features = ["fs", "io-util"] }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }

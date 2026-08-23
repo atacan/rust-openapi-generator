@@ -24,6 +24,8 @@ const SNAPSHOT_FIXTURES: &[&str] = &[
     "03_nested_content.yaml",
     "04_status_ranges.yaml",
     "10_forms_headers.yaml",
+    "11_multipart.yaml",
+    "12_multipart_order.yaml",
 ];
 
 /// Every fixture must plan + render without diagnostics (07/08 included).
@@ -38,6 +40,8 @@ const ALL_FIXTURES: &[&str] = &[
     "07_matrix.yaml",
     "08_views.yaml",
     "10_forms_headers.yaml",
+    "11_multipart.yaml",
+    "12_multipart_order.yaml",
 ];
 
 fn fixtures_dir() -> PathBuf {
@@ -616,5 +620,69 @@ fn headers_fixture_client_is_rustfmt_clean() {
         "synthetic headers client is not rustfmt-clean\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&checked.stdout),
         String::from_utf8_lossy(&checked.stderr),
+    );
+}
+
+// ----------------------------------------------------------------------
+// Fixture 11 — multipart input builder (§17 Output A)
+// ----------------------------------------------------------------------
+
+#[test]
+fn fixture_11_multipart_request_struct_streams_files_and_has_from_file() {
+    let output = generate_fixture("11_multipart.yaml");
+
+    // §17 Output A struct: owned scalar/JSON parts, streaming binary part,
+    // optional filename/content-type beside it, and NO Vec<u8> anywhere.
+    let request = struct_block(&output, "UploadDocumentRequest");
+    assert!(
+        request.contains("pub metadata: DocumentMetadata,"),
+        "{request}"
+    );
+    assert!(
+        request.contains("pub tags: Vec<String>,"),
+        "repeated textual parts collect in wire order:\n{request}"
+    );
+    assert!(
+        request.contains("pub file: ::reqwest::Body,"),
+        "binary parts stay streaming:\n{request}"
+    );
+    assert!(request.contains("pub file_name: Option<String>,"));
+    assert!(request.contains("pub file_content_type: Option<::mime::Mime>,"));
+    assert!(!output.contains("Vec<u8>"), "\n{output}");
+
+    // §17 from_file constructor streams the opened file through
+    // tokio-util's ReaderStream into reqwest::Body::wrap_stream.
+    let ctor = item_block(&output, "pub async fn from_file(");
+    assert!(ctor.contains("::tokio::fs::File::open(path.as_ref()).await?"),);
+    assert!(ctor.contains("::tokio_util::io::ReaderStream::new(file)"),);
+    assert!(ctor.contains("::reqwest::Body::wrap_stream(stream)"),);
+
+    // The method takes the OWNED input struct (§17; no `&T` convenience).
+    assert!(
+        output.contains(&format!("body: {}Request,", "UploadDocument"))
+            || output.contains("body: UploadDocumentRequest,"),
+        "\n{output}"
+    );
+
+    // JSON parts serialize bounded BEFORE any wire traffic (§34.2) and are
+    // attached with their declared encoding content type.
+    let method = item_block(&output, "pub async fn upload_document(");
+    assert!(
+        method.contains(
+            "match serialize_json_limited(&body.metadata, self.limits.structured_encode_bytes)"
+        ),
+        "\n{method}"
+    );
+    assert!(
+        method.contains(
+            "part_with_mime(Part::bytes(Vec::from(&payload[..])), \"application/json\")?"
+        ),
+        "{method}"
+    );
+    assert!(method.contains(".multipart(form);"), "{method}");
+    // The boundary-bearing Content-Type is written by reqwest itself.
+    assert!(
+        !method.contains("CONTENT_TYPE"),
+        "static Content-Type headers would drop the multipart boundary:\n{method}"
     );
 }

@@ -29,6 +29,8 @@ const SNAPSHOT_FIXTURES: &[&str] = &[
     "07_matrix.yaml",
     "08_views.yaml",
     "10_forms_headers.yaml",
+    "11_multipart.yaml",
+    "12_multipart_order.yaml",
 ];
 
 /// Every fixture must plan + render without diagnostics.
@@ -43,6 +45,8 @@ const ALL_FIXTURES: &[&str] = &[
     "07_matrix.yaml",
     "08_views.yaml",
     "10_forms_headers.yaml",
+    "11_multipart.yaml",
+    "12_multipart_order.yaml",
 ];
 
 fn fixtures_dir() -> PathBuf {
@@ -734,4 +738,214 @@ fn headers_fixture_server_is_rustfmt_clean() {
         String::from_utf8_lossy(&checked.stdout),
         String::from_utf8_lossy(&checked.stderr),
     );
+}
+
+// ----------------------------------------------------------------------
+// Fixture 11 — typed streaming multipart input (§17 Output B, §17.1)
+// ----------------------------------------------------------------------
+
+#[test]
+fn fixture_11_multipart_input_streams_and_enforces_cardinality_pre_handler() {
+    let output = generate_fixture("11_multipart.yaml");
+
+    // The trait receives the owned streaming input struct, never Bytes.
+    assert!(
+        output.contains(
+            "async fn upload_document(&self, body: UploadDocumentMultipartInput) -> UploadDocumentResponse;"
+        ),
+        "\n{output}"
+    );
+    let input = struct_block(&output, "UploadDocumentMultipartInput");
+    // Required metadata MAY still arrive behind the streaming handoff, so
+    // its value defers onto the live part (wire-arrival-based §17.1).
+    assert!(
+        input.contains("pub metadata: Option<DocumentMetadata>,"),
+        "{input}"
+    );
+    assert!(
+        input.contains("pub tags: Vec<String>,"),
+        "repeated array parts collect in wire order:\n{input}"
+    );
+    assert!(
+        input.contains("pub file: UploadDocumentFilePart,"),
+        "binary part stays a live stream:\n{input}"
+    );
+
+    // The streaming part exposes chunked delivery; no buffered byte fields.
+    let part = struct_block(&output, "UploadDocumentFilePart");
+    assert!(
+        output.contains("pub async fn next_chunk("),
+        "chunks are pulled through next_chunk:\n{output}"
+    );
+    let input_and_part = format!("{input}{part}");
+    // Binary payloads never rest in a field: every PUBLIC field stays free
+    // of byte storage. (The live part keeps one PRIVATE bounded `Vec<u8>`
+    // solely to decode trailing scalar/JSON parts behind the stream.)
+    for field_line in input_and_part
+        .lines()
+        .filter(|line| line.trim_start().starts_with("pub "))
+    {
+        assert!(
+            !field_line.contains("u8"),
+            "binary payloads never rest in a public field:\n{field_line}"
+        );
+        assert!(
+            !field_line.contains(": ::bytes::Bytes,"),
+            "binary payloads never rest in a public field:\n{field_line}"
+        );
+    }
+    assert!(
+        part.contains("pending_required: Vec<&'static str>,")
+            && part.contains("seen_single_valued: Vec<String>,")
+            && part.contains("pub trailing_parts: UploadDocumentTrailingParts,"),
+        "the live part carries the deferred enforcement state:\n{part}"
+    );
+    // A clean end-of-message with pending names reports exactly once.
+    assert!(
+        output.contains("missing required part(s) `{names}`"),
+        "the terminal error names every outstanding required part:\n{output}"
+    );
+    // Trailing declared scalar/JSON parts decode instead of draining.
+    assert!(
+        output.contains("UploadDocumentFilePartTailStage::Metadata")
+            && output.contains("UploadDocumentFilePartTailStage::TagsElement"),
+        "trailing scalar/JSON parts decode behind the stream:\n{output}"
+    );
+
+    // §38/§17.1: the collector rejects duplicates and cardinality violations
+    // pre-handler, and required parts missing at the natural end of the
+    // stream (no handoff happened). (Whole-output greps: the collector spans
+    // several blank-line-separated sections, so item_block would truncate.)
+    assert!(
+        output.contains("stream_multipart(") && output.contains("extract_boundary(parsed)"),
+        "the router drives our framing engine itself:\n{output}"
+    );
+    assert!(
+        output.contains("let handed_off = file_part.is_some();")
+            && output.contains("None if handed_off => None,")
+            && output.contains("missing required part `metadata`")
+            && output.contains("missing required part `file`"),
+        "required parts missing at stream end reject 422 pre-handler:\n{output}"
+    );
+    assert!(
+        output.contains("duplicate single-valued part"),
+        "duplicate single-valued parts reject 422:\n{output}"
+    );
+    assert!(
+        output.contains("limits.multipart_scalar_part_bytes"),
+        "scalar/JSON parts stay bounded (§17.1):\n{output}"
+    );
+    assert!(
+        handler_block_contains(
+            &output,
+            "collect_upload_document_multipart(body, parsed.as_ref(), &limits)"
+        ),
+        "the handler collects before invoking the trait"
+    );
+
+    // Multipart routes are buffered-exempt (nothing aggregates the body).
+    let route = item_block(&output, "pub fn router(");
+    assert!(
+        !route.contains(".layer("),
+        "streaming multipart routes must not install DefaultBodyLimit:\n{route}"
+    );
+}
+
+// ----------------------------------------------------------------------
+// Fixture 12 — file-first wire order (§17.1/§38): wire-arrival-based
+// ----------------------------------------------------------------------
+
+#[test]
+fn fixture_12_file_first_order_defers_required_parts_to_the_live_part() {
+    let output = generate_fixture("12_multipart_order.yaml");
+
+    // Required scalar/JSON parts ride Option in the input struct because
+    // they may lawfully arrive behind the file-first handoff.
+    let input = struct_block(&output, "UploadDocumentMultipartInput");
+    assert!(
+        input.contains("pub file: UploadDocumentFilePart,"),
+        "{input}"
+    );
+    assert!(
+        input.contains("pub metadata: Option<DocumentMetadata>,"),
+        "{input}"
+    );
+    assert!(input.contains("pub source: Option<String>,"), "{input}");
+
+    // Handoff seeds BOTH unseen required names plus duplicate protection.
+    assert!(
+        output.contains("pending_required.push(\"metadata\");")
+            && output.contains("pending_required.push(\"source\");"),
+        "unseen required names defer to the live part:\n{output}"
+    );
+    assert!(
+        output.contains("self.pending_required.retain(|name| *name != \"metadata\");")
+            && output.contains("self.pending_required.retain(|name| *name != \"source\");"),
+        "trailing arrivals satisfy their pending names:\n{output}"
+    );
+    assert!(
+        output.contains("\"missing required part(s) `{names}`\""),
+        "one terminal SchemaViolation covers the plural case:\n{output}"
+    );
+}
+
+/// Two binary fields have no representable server shape (one live-part slot,
+/// §51.4 sequential semantics): planning stops with an Error diagnostic.
+#[test]
+fn two_binary_parts_stop_at_plan_time_with_a_diagnostic() {
+    let dir = std::env::temp_dir().join(format!("o2r-two-binary-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create fixture dir");
+    let fixture_path = dir.join("two_binary_parts.yaml");
+    std::fs::write(
+        &fixture_path,
+        r#"openapi: 3.1.0
+info:
+  title: two binary parts
+  version: "1"
+paths:
+  /bundles:
+    post:
+      operationId: uploadBundle
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [primary, attachment]
+              properties:
+                primary:
+                  type: string
+                  format: binary
+                attachment:
+                  type: string
+                  format: binary
+      responses:
+        '204':
+          description: Stored
+"#,
+    )
+    .expect("write synthetic fixture");
+
+    let ir = load_document("two_binary_parts.yaml", &dir, &LoadConfig::default())
+        .unwrap_or_else(|diags| panic!("fixture must load: {diags:?}"));
+    let doc = normalize_with_config(ir, &NormalizeConfig::default())
+        .unwrap_or_else(|diags| panic!("fixture must normalize: {diags:?}"));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let error = plan_api(&doc).expect_err("two binary parts must stop at plan time");
+    let diagnostic = error
+        .iter()
+        .find(|d| d.code == "multipart_schema_unsupported")
+        .expect("diagnostic present");
+    assert_eq!(
+        diagnostic.severity,
+        openapi_to_rust_generator::diagnostics::Severity::Error
+    );
+}
+
+fn handler_block_contains(output: &str, needle: &str) -> bool {
+    let handler = item_block(output, "async fn route_upload_document(");
+    let trimmed = needle.replace(", ", ",\n            ");
+    handler.contains(needle) || handler.contains(&trimmed)
 }

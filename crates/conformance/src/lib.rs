@@ -176,4 +176,34 @@ pub mod fixtures {
             include!(concat!(env!("OUT_DIR"), "/10_forms_headers/server.rs"));
         }
     }
+
+    pub mod fixture_11_multipart {
+        pub mod models {
+            include!(concat!(env!("OUT_DIR"), "/11_multipart/models.rs"));
+        }
+        pub mod views {
+            include!(concat!(env!("OUT_DIR"), "/11_multipart/views.rs"));
+        }
+        pub mod client {
+            include!(concat!(env!("OUT_DIR"), "/11_multipart/client.rs"));
+        }
+        pub mod server {
+            include!(concat!(env!("OUT_DIR"), "/11_multipart/server.rs"));
+        }
+    }
+
+    pub mod fixture_12_multipart_order {
+        pub mod models {
+            include!(concat!(env!("OUT_DIR"), "/12_multipart_order/models.rs"));
+        }
+        pub mod views {
+            include!(concat!(env!("OUT_DIR"), "/12_multipart_order/views.rs"));
+        }
+        pub mod client {
+            include!(concat!(env!("OUT_DIR"), "/12_multipart_order/client.rs"));
+        }
+        pub mod server {
+            include!(concat!(env!("OUT_DIR"), "/12_multipart_order/server.rs"));
+        }
+    }
 }

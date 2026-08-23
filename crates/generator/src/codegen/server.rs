@@ -24,7 +24,10 @@ use crate::ir::document::{
 use crate::normalize::naming::{self, NameStyle};
 use crate::normalize::NormalizedDocument;
 
-use super::plan::{PlannedApi, PlannedContent, PlannedOperation, PlannedParameter, PlannedStatus};
+use super::plan::{
+    PlannedApi, PlannedContent, PlannedMultipartFieldKind, PlannedOperation, PlannedParameter,
+    PlannedStatus,
+};
 use super::Emitter;
 
 const RUSTFMT_MAX_WIDTH: usize = 100;
@@ -79,7 +82,8 @@ pub fn generate_server(doc: &NormalizedDocument, plan: &PlannedApi) -> String {
         || flags.needs_text_decode
         || flags.needs_form_decode
         || flags.needs_charset_check
-        || flags.needs_cookie_decode;
+        || flags.needs_cookie_decode
+        || flags.needs_multipart;
     emit_imports(&mut emitter, &flags);
 
     let mut invalid_status_range_emitted = false;
@@ -97,6 +101,9 @@ pub fn generate_server(doc: &NormalizedDocument, plan: &PlannedApi) -> String {
     emit_state(&mut emitter, &api_trait);
     for (op_index, operation) in plan.operations.iter().enumerate() {
         emit_handler(&mut emitter, op_index, operation, &layout);
+        if layout.multipart_input(op_index).is_some() {
+            emit_multipart_collector(&mut emitter, op_index, operation, &layout);
+        }
     }
     emit_router(&mut emitter, plan, &api_trait);
     emit_module_helpers(&mut emitter, &flags);
@@ -183,6 +190,13 @@ struct ServerLayout {
     wrappers: BTreeMap<(usize, usize), (String, WrapperShape)>,
     /// Operation index → wildcard single-request struct name (§22).
     wildcard_requests: BTreeMap<usize, String>,
+    /// Operation index → `<Op>MultipartInput` streaming input struct (§17).
+    multipart_inputs: BTreeMap<usize, String>,
+    /// (operation index, field index) → `<Op><Field>Part` streaming part.
+    multipart_parts: BTreeMap<(usize, usize), String>,
+    /// Operation index → `<Op>TrailingParts` carrier for scalar/JSON parts
+    /// decoded BEHIND a live streaming part (wire-arrival-based §17.1).
+    multipart_trailing: BTreeMap<usize, String>,
 }
 
 impl ServerLayout {
@@ -210,8 +224,65 @@ impl ServerLayout {
                     layout.wildcard_requests.insert(op_index, name);
                 }
             }
+            if operation
+                .request_contents
+                .iter()
+                .any(|content| content.media_class == MediaClass::Multipart)
+            {
+                let base = format!("{}MultipartInput", operation.pascal);
+                let name = fresh_name(used, base);
+                layout.multipart_inputs.insert(op_index, name);
+                let Some(spec) = operation
+                    .request_contents
+                    .iter()
+                    .find(|content| content.media_class == MediaClass::Multipart)
+                    .and_then(|content| content.multipart_spec.as_ref())
+                else {
+                    continue;
+                };
+                for (field_index, field) in spec.fields.iter().enumerate() {
+                    if matches!(field.kind, PlannedMultipartFieldKind::BinaryPart) {
+                        let field_pascal = naming::ident(&field.rust_name, NameStyle::Pascal);
+                        let base = format!("{}{field_pascal}Part", operation.pascal);
+                        let name = fresh_name(used, base);
+                        layout.multipart_parts.insert((op_index, field_index), name);
+                    }
+                }
+                // The trailing carrier exists only when a live part can
+                // actually decode scalar/JSON fields behind itself.
+                let has_binary = spec
+                    .fields
+                    .iter()
+                    .any(|field| matches!(field.kind, PlannedMultipartFieldKind::BinaryPart));
+                let has_buffered = spec.fields.iter().any(|field| {
+                    matches!(
+                        field.kind,
+                        PlannedMultipartFieldKind::JsonPart(_)
+                            | PlannedMultipartFieldKind::ScalarText(_)
+                    )
+                });
+                if has_binary && has_buffered {
+                    let base = format!("{}TrailingParts", operation.pascal);
+                    let name = fresh_name(used, base);
+                    layout.multipart_trailing.insert(op_index, name);
+                }
+            }
         }
         layout
+    }
+
+    fn multipart_input(&self, op_index: usize) -> Option<&str> {
+        self.multipart_inputs.get(&op_index).map(String::as_str)
+    }
+
+    fn multipart_part(&self, op_index: usize, field_index: usize) -> Option<&str> {
+        self.multipart_parts
+            .get(&(op_index, field_index))
+            .map(String::as_str)
+    }
+
+    fn multipart_trailing(&self, op_index: usize) -> Option<&str> {
+        self.multipart_trailing.get(&op_index).map(String::as_str)
     }
 
     fn content_enum(&self, op_index: usize, status_index: usize) -> Option<&str> {
@@ -347,6 +418,12 @@ struct Flags {
     /// Documented response headers exist somewhere (main spec §15): pulls in
     /// the typed-header writer plus its §34.1-style failure fallback.
     needs_typed_headers: bool,
+    /// A multipart request body exists somewhere (main spec §17 Output B):
+    /// pulls in the streaming engine wiring plus rejection mapping.
+    needs_multipart: bool,
+    /// A typed (non-String) textual multipart part exists somewhere: pulls
+    /// in the FromStr-based scalar part decoder.
+    needs_multipart_scalar: bool,
 }
 
 impl Flags {
@@ -408,9 +485,30 @@ impl Flags {
                 self.needs_text_decode = true;
                 self.needs_charset_check = true;
             }
+            MediaClass::Multipart => {
+                // §17 Output B: one incremental pass buffers only bounded
+                // scalar/JSON payloads; binary parts stay streaming.
+                self.needs_multipart = true;
+                if let Some(spec) = &content.multipart_spec {
+                    for field in &spec.fields {
+                        match &field.kind {
+                            PlannedMultipartFieldKind::JsonPart(model) => {
+                                self.model_types.extend(model_type_names(model));
+                                self.needs_json_decode = true;
+                            }
+                            PlannedMultipartFieldKind::ScalarText(_) => {
+                                // Even `String` parts decode through the
+                                // strict-UTF-8 helper.
+                                self.needs_multipart_scalar = true;
+                            }
+                            PlannedMultipartFieldKind::BinaryPart => {}
+                        }
+                    }
+                }
+            }
             MediaClass::Binary | MediaClass::RawUnknown => {}
-            // Planning rejects multipart/SSE/NDJSON/JSON-seq; they are later
-            // deliverables (D-impl-forms-phase2) and never reach us.
+            // Planning rejects SSE/NDJSON/JSON-seq; they are later
+            // deliverables and never reach us.
             _ => unreachable!(
                 "planner emitted Phase 2 media class {:?}",
                 content.media_class
@@ -637,6 +735,19 @@ fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
                 ],
             );
         }
+        if flags.needs_multipart {
+            emit_brace_import(
+                emitter,
+                "use ::openapi_support::multipart::",
+                &[
+                    "extract_boundary",
+                    "stream_multipart",
+                    "MultipartError",
+                    "MultipartEvent",
+                    "MultipartLimits",
+                ],
+            );
+        }
         emit_params_import(emitter, flags);
         if flags.needs_peek {
             emitter.line(
@@ -652,6 +763,7 @@ fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
             || flags.needs_collect_body
             || flags.needs_collect_stream
             || flags.needs_json_decode
+            || flags.needs_multipart
         {
             emitter.line(
                 0,
@@ -713,7 +825,7 @@ fn emit_operation_types(
     emitter.blank();
     let mut first = true;
     if let Some(enum_name) = &operation.request_body_enum_name {
-        emit_request_body_enum(emitter, operation, enum_name);
+        emit_request_body_enum(emitter, op_index, operation, layout, enum_name);
         first = false;
     }
     if let Some(name) = layout.wildcard_request(op_index) {
@@ -721,6 +833,13 @@ fn emit_operation_types(
             emitter.blank();
         }
         emit_wildcard_request_struct(emitter, operation, name);
+        first = false;
+    }
+    if let Some(name) = layout.multipart_input(op_index) {
+        if !first {
+            emitter.blank();
+        }
+        emit_multipart_types(emitter, op_index, operation, layout, name);
         first = false;
     }
     for (status_index, status) in operation.statuses.iter().enumerate() {
@@ -760,7 +879,13 @@ fn payload_type(content: &PlannedContent) -> String {
     }
 }
 
-fn emit_request_body_enum(emitter: &mut Emitter, operation: &PlannedOperation, enum_name: &str) {
+fn emit_request_body_enum(
+    emitter: &mut Emitter,
+    op_index: usize,
+    operation: &PlannedOperation,
+    layout: &ServerLayout,
+    enum_name: &str,
+) {
     emitter.docs(
         0,
         &[format!(
@@ -778,10 +903,11 @@ fn emit_request_body_enum(emitter: &mut Emitter, operation: &PlannedOperation, e
             emit_any_struct_variant(emitter, 1, &content.variant_name);
             continue;
         }
-        emitter.line(
-            1,
-            &format!("{}({}),", content.variant_name, payload_type(content)),
-        );
+        let payload = match content.media_class {
+            MediaClass::Multipart => layout.multipart_input(op_index).unwrap_or("()").to_owned(),
+            _ => payload_type(content),
+        };
+        emitter.line(1, &format!("{}({payload}),", content.variant_name));
     }
     emitter.line(0, "}");
 }
@@ -1569,7 +1695,19 @@ fn emit_header_write(emitter: &mut Emitter, indent: usize, op_id: &str, variant:
         rust_string_literal(op_id),
         rust_string_literal(variant)
     );
-    if fits(indent, &line) {
+    // The argument list must also respect rustfmt's `fn_call_width` budget,
+    // which forces vertical arguments even when the whole call would fit.
+    let args_len = format!(
+        "encoded, hook, {}, {}, &typed_headers",
+        rust_string_literal(op_id),
+        rust_string_literal(variant)
+    )
+    .chars()
+    .count();
+    if fits(indent, &line)
+        && args_len <= FN_CALL_WIDTH
+        && line.chars().count() + indent * 4 < RUSTFMT_MAX_WIDTH
+    {
         emitter.line(indent, &line);
     } else {
         emitter.line(indent, "write_typed_headers(");
@@ -2215,6 +2353,10 @@ fn trait_body_type(operation: &PlannedOperation, layout: &ServerLayout, op_index
         let name = layout.wildcard_request(op_index).expect("registered");
         return wrap(name.to_owned());
     }
+    if content.media_class == MediaClass::Multipart {
+        let name = layout.multipart_input(op_index).expect("registered");
+        return wrap(name.to_owned());
+    }
     wrap(payload_type(content))
 }
 
@@ -2710,6 +2852,13 @@ enum EntryPayload {
         enum_name: String,
         variant: String,
     },
+    /// Single-content multipart (§17): the router runs one incremental pass
+    /// and hands the application the owned streaming input struct. The
+    /// optional enum pair wraps the value into a `<Op>RequestBody` variant.
+    Multipart {
+        collector: String,
+        enum_variant: Option<(String, String)>,
+    },
 }
 
 impl EntryPayload {
@@ -2788,6 +2937,10 @@ fn entry_payload(
                 variant: content.variant_name.clone(),
             },
             None => EntryPayload::RawBody,
+        },
+        MediaClass::Multipart => EntryPayload::Multipart {
+            collector: format!("collect_{}_multipart", operation.method),
+            enum_variant: enum_name.map(|enum_name| (enum_name, content.variant_name.clone())),
         },
         other => unreachable!("Phase 2 media class {other:?}"),
     }
@@ -2999,6 +3152,43 @@ fn emit_entry_arm(
     indent: usize,
     required: bool,
 ) {
+    if let EntryPayload::Multipart {
+        collector,
+        enum_variant,
+    } = payload
+    {
+        emitter.line(indent, &format!("RequestEntryMatch::Entry({index}) => {{"));
+        let call = format!("{collector}(body, parsed.as_ref(), &limits).await?");
+        let bind = format!("let request_body = {call}");
+        if fits(indent + 1, &bind) {
+            emitter.line(indent + 1, &bind);
+        } else {
+            emitter.line(indent + 1, "let request_body =");
+            emitter.line(
+                indent + 2,
+                &format!("{collector}(body, parsed.as_ref(), &limits).await?;"),
+            );
+        }
+        match enum_variant {
+            Some((enum_name, variant)) => {
+                let inner = format!("{enum_name}::{variant}(request_body)");
+                if required {
+                    emitter.line(indent + 1, &inner);
+                } else {
+                    emitter.line(indent + 1, &format!("Some({inner})"));
+                }
+            }
+            None => {
+                if required {
+                    emitter.line(indent + 1, "request_body");
+                } else {
+                    emitter.line(indent + 1, "Some(request_body)");
+                }
+            }
+        }
+        emitter.line(indent, "}");
+        return;
+    }
     // Streaming/wildcard arms carry no statements, so rustfmt renders them
     // as expression arms; structured arms keep block form around their
     // charset check, bounded collection, and decode.
@@ -3092,6 +3282,9 @@ fn emit_entry_yield_expr(
             } else {
                 emit_inline(emitter, format!("Some({replay_body})"));
             }
+        }
+        EntryPayload::Multipart { .. } => {
+            unreachable!("multipart payloads are handled in emit_entry_arm")
         }
         EntryPayload::WildcardStruct { struct_name } => {
             let head_line = if required {
@@ -3191,6 +3384,9 @@ fn emit_entry_yield(emitter: &mut Emitter, indent: usize, payload: &EntryPayload
                 emitter.line(indent, &format!("Some({replay_body})"));
             }
         }
+        EntryPayload::Multipart { .. } => {
+            unreachable!("multipart payloads are handled in emit_entry_arm")
+        }
         EntryPayload::WildcardStruct { struct_name } => {
             wrap(
                 emitter,
@@ -3249,6 +3445,1077 @@ fn emit_entry_yield(emitter: &mut Emitter, indent: usize, payload: &EntryPayload
             );
         }
     }
+}
+
+// ----------------------------------------------------------------------
+// Multipart streaming input (main spec §17 Output B, §17.1)
+// ----------------------------------------------------------------------
+
+/// A planned multipart field with its collision-resolved struct identifier
+/// (companion §10 numeric suffixing inside one input struct).
+struct MultipartFieldIdents<'a> {
+    field: &'a crate::codegen::plan::PlannedMultipartField,
+    ident: String,
+}
+
+fn unique_multipart_field_name(base: &str, used: &mut BTreeMap<String, u32>) -> String {
+    let counter = used.entry(base.to_owned()).or_insert(0);
+    *counter += 1;
+    if *counter == 1 {
+        base.to_owned()
+    } else {
+        naming::sanitize_joined(&format!("{base}_{counter}"))
+    }
+}
+
+fn resolve_multipart_field_idents(
+    fields: &[crate::codegen::plan::PlannedMultipartField],
+) -> Vec<MultipartFieldIdents<'_>> {
+    let mut used: BTreeMap<String, u32> = BTreeMap::new();
+    fields
+        .iter()
+        .map(|field| MultipartFieldIdents {
+            field,
+            ident: unique_multipart_field_name(&field.rust_name, &mut used),
+        })
+        .collect()
+}
+
+/// Server-side scalar/JSON part type with the companion §2.1 presence
+/// matrix applied: required single-valued parts are plain; optional ones
+/// ride `Option<T>`; repeated parts are `Vec<T>` in wire order.
+fn multipart_input_field_type(
+    kind: &PlannedMultipartFieldKind,
+    repeated: bool,
+    required: bool,
+) -> String {
+    let base = match kind {
+        PlannedMultipartFieldKind::ScalarText(rust_type)
+        | PlannedMultipartFieldKind::JsonPart(rust_type) => rust_type.clone(),
+        PlannedMultipartFieldKind::BinaryPart => String::new(),
+    };
+    if repeated {
+        format!("Vec<{base}>")
+    } else if required {
+        base
+    } else {
+        format!("Option<{base}>")
+    }
+}
+
+/// Emits the per-operation streaming input struct plus one live streaming
+/// part type per binary field (main spec §17 Output B). Required-part
+/// enforcement is wire-arrival-based (§17.1/§38): scalar/JSON parts consumed
+/// before the streaming handoff validated inside the collector; parts
+/// arriving behind the live part decode onto `<Op>TrailingParts`, and
+/// required names a clean end-of-message still lacks surface exactly one
+/// terminal SchemaViolation from `next_chunk`.
+fn emit_multipart_types(
+    emitter: &mut Emitter,
+    op_index: usize,
+    operation: &PlannedOperation,
+    layout: &ServerLayout,
+    input_name: &str,
+) {
+    let Some(spec) = operation
+        .request_contents
+        .iter()
+        .find(|content| content.media_class == MediaClass::Multipart)
+        .and_then(|content| content.multipart_spec.as_ref())
+    else {
+        return;
+    };
+    let resolved = resolve_multipart_field_idents(&spec.fields);
+    let trailing_name = layout.multipart_trailing(op_index);
+
+    for (field_index, _) in resolved.iter().enumerate() {
+        let Some(part_name) = layout.multipart_part(op_index, field_index) else {
+            continue;
+        };
+        // Plan time caps each multipart body at ONE binary part (§51.4), so
+        // this emits at most one live part type per operation.
+        emit_live_part_type(
+            emitter,
+            operation,
+            input_name,
+            part_name,
+            &resolved,
+            trailing_name,
+        );
+    }
+    let has_binary = resolved
+        .iter()
+        .any(|entry| matches!(entry.field.kind, PlannedMultipartFieldKind::BinaryPart));
+
+    emitter.blank();
+    emitter.docs(
+        0,
+        &[format!(
+            "Streaming multipart input for `{}` (main spec §17 Output B): \
+              scalar/JSON parts were bounded-buffered and decoded during the \
+             router's single incremental pass up to the streaming handoff; \
+              binary parts stay live streams over the request body.",
+            operation.method
+        )],
+    );
+    if has_binary {
+        emitter.docs(
+            0,
+            &[String::from(
+                "Required-part enforcement is wire-arrival-based (§17.1, \
+                  §38): parts arriving BEFORE the first binary validate \
+                  pre-handler in that pass; parts arriving behind the live \
+                 stream decode onto its `trailing_parts`, and required names \
+                  a clean end-of-message never delivers reject through the \
+                  live part's terminal error instead of a pre-handler \
+                  rejection.",
+            )],
+        );
+    } else {
+        emitter.docs(
+            0,
+            &[String::from(
+                "Required-part enforcement ran entirely inside that pass, so \
+                  missing required parts reject 422 BEFORE the application \
+                  handler runs (§17.1).",
+            )],
+        );
+    }
+    emitter.line(0, &format!("pub struct {input_name} {{"));
+    for (field_index, entry) in resolved.iter().enumerate() {
+        emit_multipart_input_field(emitter, op_index, layout, field_index, entry, has_binary);
+    }
+    emitter.line(
+        1,
+        "unknown_log: ::std::sync::Arc<::std::sync::Mutex<MultipartUnknownLog>>,",
+    );
+    emitter.line(0, "}");
+    emitter.blank();
+    emitter.line(0, &format!("impl {input_name} {{"));
+    emitter.docs(
+        1,
+        &[String::from(
+            "Wire names of every unrecognized or late-arriving part observed \
+             so far (§17.1 unknown-fields-ignore default): their payloads \
+             stream past without buffering and never reject. Names behind a \
+             streaming part appear once the application drains it through \
+             `next_chunk`.",
+        )],
+    );
+    emitter.line(1, "pub fn unknown_part_names(&self) -> Vec<String> {");
+    emitter.line(2, "match self.unknown_log.lock() {");
+    emitter.line(3, "Ok(guard) => guard.names.clone(),");
+    emitter.line(3, "Err(poisoned) => poisoned.into_inner().names.clone(),");
+    emitter.line(2, "}");
+    emitter.line(1, "}");
+    emitter.line(0, "}");
+}
+
+/// One declared field of the `<Op>MultipartInput` struct.
+fn emit_multipart_input_field(
+    emitter: &mut Emitter,
+    op_index: usize,
+    layout: &ServerLayout,
+    field_index: usize,
+    entry: &MultipartFieldIdents,
+    has_binary: bool,
+) {
+    match &entry.field.kind {
+        PlannedMultipartFieldKind::BinaryPart => {
+            emit_multipart_field_doc(emitter, 1, entry);
+            let part_name = layout
+                .multipart_part(op_index, field_index)
+                .expect("binary part registered");
+            let field_type = if entry.field.required {
+                part_name.to_owned()
+            } else {
+                format!("Option<{part_name}>")
+            };
+            emitter.line(1, &format!("pub {}: {field_type},", entry.ident));
+        }
+        kind @ (PlannedMultipartFieldKind::ScalarText(_)
+        | PlannedMultipartFieldKind::JsonPart(_)) => {
+            // With a live part in the body a required single-valued field
+            // may still arrive behind the stream, so its value defers onto
+            // `trailing_parts` and enforcement is wire-arrival-based.
+            let deferred = has_binary && entry.field.required && !entry.field.repeated;
+            if deferred {
+                let cardinality = if entry.field.repeated {
+                    "; repeated parts collect in wire order"
+                } else {
+                    ""
+                };
+                emitter.docs(
+                    1,
+                    &[format!(
+                        "{} part `{}`{}: `Some` when it arrived before the \
+                          streaming part; otherwise decoded onto the live \
+                          part's `trailing_parts`.",
+                        part_label(&entry.field.kind),
+                        entry.field.wire_name,
+                        cardinality
+                    )],
+                );
+                let base = match kind {
+                    PlannedMultipartFieldKind::ScalarText(rust_type)
+                    | PlannedMultipartFieldKind::JsonPart(rust_type) => rust_type.clone(),
+                    PlannedMultipartFieldKind::BinaryPart => String::new(),
+                };
+                emitter.line(1, &format!("pub {}: Option<{base}>,", entry.ident));
+            } else {
+                emit_multipart_field_doc(emitter, 1, entry);
+                let field_type =
+                    multipart_input_field_type(kind, entry.field.repeated, entry.field.required);
+                emitter.line(1, &format!("pub {}: {field_type},", entry.ident));
+            }
+        }
+    }
+}
+
+/// The human label for one multipart field's kind.
+fn part_label(kind: &PlannedMultipartFieldKind) -> &'static str {
+    match kind {
+        PlannedMultipartFieldKind::ScalarText(_) => "Textual",
+        PlannedMultipartFieldKind::JsonPart(_) => "JSON",
+        PlannedMultipartFieldKind::BinaryPart => "Streaming binary",
+    }
+}
+
+/// The standard one-line field doc for a multipart input/trailing field.
+fn emit_multipart_field_doc(emitter: &mut Emitter, indent: usize, entry: &MultipartFieldIdents) {
+    let cardinality = if entry.field.repeated {
+        "; repeated parts collect in wire order"
+    } else {
+        ""
+    };
+    emitter.docs(
+        indent,
+        &[format!(
+            "{} part `{}`{}.",
+            part_label(&entry.field.kind),
+            entry.field.wire_name,
+            cardinality
+        )],
+    );
+}
+
+/// One live streaming part type plus its private tail-scan stage enum and
+/// (when scalar/JSON fields exist) the operation's trailing-parts carrier.
+fn emit_live_part_type(
+    emitter: &mut Emitter,
+    operation: &PlannedOperation,
+    input_name: &str,
+    part_name: &str,
+    resolved: &[MultipartFieldIdents],
+    trailing_name: Option<&str>,
+) {
+    // The single binary entry of this body (plan time caps bodies at one).
+    let entry = resolved
+        .iter()
+        .find(|entry| matches!(entry.field.kind, PlannedMultipartFieldKind::BinaryPart))
+        .expect("live part requires a binary field");
+    let tail_stage = format!("{part_name}TailStage");
+    let buffered: Vec<&MultipartFieldIdents> = resolved
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.field.kind,
+                PlannedMultipartFieldKind::ScalarText(_) | PlannedMultipartFieldKind::JsonPart(_)
+            )
+        })
+        .collect();
+
+    emitter.docs(
+        0,
+        &[format!(
+            "Live streaming view over binary part `{}` of `{}` (main \
+              spec §17 Output B): `next_chunk` yields payload bytes with \
+              backpressure as they arrive; nothing aggregates the part.",
+            entry.field.wire_name, operation.method
+        )],
+    );
+    emitter.docs(
+        0,
+        &[String::from(
+            "Sequential semantics (§51.4): while this part is open the rest \
+              of the message cannot advance. Trailing parts flow through \
+              this type's tail scan instead of the pre-handler pass: \
+              declared scalar/JSON parts arriving behind the stream decode \
+             bounded onto `trailing_parts`, required wire names the clean \
+              end-of-message still lacks surface exactly one terminal \
+              SchemaViolation from `next_chunk` (§17.1 enforced on wire \
+              arrival), duplicate single-valued reopenings reject, every \
+              observed name is recorded for `unknown_part_names`, and all \
+              remaining payloads drain without buffering.",
+        )],
+    );
+    emitter.line(0, &format!("pub struct {part_name} {{"));
+    emitter.line(1, "pub file_name: Option<String>,");
+    emitter.line(1, "pub content_type: Option<::mime::Mime>,");
+    if let Some(trailing) = trailing_name {
+        emitter.docs(
+            1,
+            &[format!(
+                "Scalar/JSON parts that arrived BEHIND this streaming part, \
+                  decoded bounded as their boundaries closed (§38 \
+                 application-owned tail); their pre-handoff siblings live on \
+                  [`{input_name}`]."
+            )],
+        );
+        emitter.line(1, &format!("pub trailing_parts: {trailing},"));
+    }
+    emitter.line(1, "events: MultipartEvents,");
+    emitter.line(
+        1,
+        "log: ::std::sync::Arc<::std::sync::Mutex<MultipartUnknownLog>>,",
+    );
+    emitter.line(1, &format!("stage: {tail_stage},"));
+    emitter.line(1, "scalar_limit: usize,");
+    emitter.line(1, "buffer: Vec<u8>,");
+    emitter.line(1, "finished: bool,");
+    emitter.docs(
+        1,
+        &[String::from(
+            "Required scalar/JSON wire names still unseen at the streaming \
+              handoff (§17.1): satisfied by trailing arrivals, otherwise \
+              reported once at the clean end-of-message.",
+        )],
+    );
+    emitter.line(1, "pending_required: Vec<&'static str>,");
+    emitter.docs(
+        1,
+        &[String::from(
+            "Declared SINGLE-VALUED wire names already consumed anywhere \
+              before now (pre-handoff or behind the stream): any reopening \
+              violates §17.1.",
+        )],
+    );
+    emitter.line(1, "seen_single_valued: Vec<String>,");
+    emitter.line(0, "}");
+    emitter.blank();
+    emit_tail_stage_enum(emitter, part_name, &tail_stage, &buffered);
+    if let Some(trailing) = trailing_name {
+        emitter.blank();
+        emit_trailing_parts_struct(emitter, input_name, part_name, trailing, &buffered);
+    }
+    emitter.blank();
+    emitter.line(0, &format!("impl {part_name} {{"));
+    emit_next_chunk(emitter, &tail_stage, &buffered, !buffered.is_empty());
+    emitter.line(0, "}");
+}
+
+/// Private per-part tail-scan stages: `Idle` delivers payload chunks to the
+/// application, `Drain` discards them, and one stage per scalar/JSON field
+/// bounded-buffers that trailing part for decoding when its boundary closes.
+fn emit_tail_stage_enum(
+    emitter: &mut Emitter,
+    part_name: &str,
+    tail_stage: &str,
+    buffered: &[&MultipartFieldIdents],
+) {
+    emitter.docs(
+        0,
+        &[format!(
+            "Tail-scan stages of [`{part_name}`] (§51.4 sequential \
+              semantics): `Idle` delivers payload chunks to the application; \
+              `Drain` discards them; the remaining stages bounded-buffer one \
+              trailing scalar/JSON part behind the stream."
+        )],
+    );
+    emitter.line(0, "#[derive(Debug, Clone, Copy)]");
+    emitter.line(0, &format!("enum {tail_stage} {{"));
+    emitter.line(1, "Idle,");
+    emitter.line(1, "Drain,");
+    for entry in buffered {
+        let variant = naming::ident(&entry.field.rust_name, NameStyle::Pascal);
+        if entry.field.repeated {
+            emitter.line(1, &format!("{variant}Element,"));
+        } else {
+            emitter.line(1, &format!("{variant},"));
+        }
+    }
+    emitter.line(0, "}");
+}
+
+/// The `<Op>TrailingParts` carrier: every scalar/JSON field may still arrive
+/// behind the streaming handoff, so singles ride `Option<T>` and repeated
+/// fields collect `Vec<T>` in wire order.
+fn emit_trailing_parts_struct(
+    emitter: &mut Emitter,
+    input_name: &str,
+    part_name: &str,
+    trailing_name: &str,
+    buffered: &[&MultipartFieldIdents],
+) {
+    emitter.docs(
+        0,
+        &[format!(
+            "Scalar/JSON parts observed BEHIND [`{part_name}`] (main spec \
+              §17 Output B): decoded bounded as their boundaries closed. \
+              Parts consumed BEFORE the streaming handoff live on \
+              [`{input_name}`]; the split mirrors wire arrival (§38 \
+              application-owned tail)."
+        )],
+    );
+    emitter.line(0, "#[derive(Debug, Default)]");
+    emitter.line(0, &format!("pub struct {trailing_name} {{"));
+    for entry in buffered {
+        emit_multipart_field_doc(emitter, 1, entry);
+        let field_type = multipart_input_field_type(&entry.field.kind, entry.field.repeated, false);
+        emitter.line(1, &format!("pub {}: {field_type},", entry.ident));
+    }
+    emitter.line(0, "}");
+}
+
+/// `next_chunk`: chunk delivery plus the wire-arrival-based tail scan.
+fn emit_next_chunk(
+    emitter: &mut Emitter,
+    tail_stage: &str,
+    buffered: &[&MultipartFieldIdents],
+    has_buffered: bool,
+) {
+    emitter.docs(
+        1,
+        &[String::from(
+            "Advances to the next payload chunk of this part (`None` at its \
+              clean end). Violations encountered while scanning trailing \
+              parts surface here as protocol rejections because sequential \
+              streaming cannot validate them any earlier; at the clean \
+              end-of-message, required parts still pending produce exactly \
+              one terminal SchemaViolation naming them (§17.1) and later \
+              calls keep returning `None`.",
+        )],
+    );
+    emitter.line(1, "#[allow(clippy::missing_errors_doc)]");
+    let chunk_head =
+        "pub async fn next_chunk(&mut self) -> Result<Option<::bytes::Bytes>, ProtocolRejection> {";
+    if fits(1, chunk_head) {
+        emitter.line(1, chunk_head);
+    } else {
+        emitter.line(1, "pub async fn next_chunk(");
+        emitter.line(2, "&mut self,");
+        emitter.line(
+            1,
+            ") -> Result<Option<::bytes::Bytes>, ProtocolRejection> {",
+        );
+    }
+    emitter.line(2, "if self.finished {");
+    emitter.line(3, "return Ok(None);");
+    emitter.line(2, "}");
+    emitter.line(2, "loop {");
+    emitter.line(
+        3,
+        "let event = match next_multipart_event(&mut self.events).await {",
+    );
+    emitter.line(4, "Some(event) => event,");
+    emitter.line(4, "None => {");
+    emitter.line(5, "self.finished = true;");
+    if has_buffered {
+        emitter.line(5, "if !self.pending_required.is_empty() {");
+        emitter.line(6, "let names = self.pending_required.join(\"`, `\");");
+        emitter.line(6, "return Err(schema_violation(format!(");
+        emitter.line(7, "\"missing required part(s) `{names}`\",");
+        emitter.line(6, ")));");
+        emitter.line(5, "}");
+    }
+    emitter.line(5, "return Ok(None);");
+    emitter.line(4, "}");
+    emitter.line(3, "};");
+    emitter.line(3, "match event {");
+    emitter.line(4, "Err(error) => return Err(multipart_rejection(&error)),");
+    emitter.line(4, "Ok(MultipartEvent::PartBegin(headers)) => {");
+    emitter.line(5, "if self.seen_single_valued.contains(&headers.name) {");
+    emitter.line(6, "return Err(schema_violation(format!(");
+    emitter.line(
+        7,
+        "\"duplicate single-valued part `{}` after the streaming part\",",
+    );
+    emitter.line(7, "headers.name");
+    emitter.line(6, ")));");
+    emitter.line(5, "}");
+    emitter.line(5, "match headers.name.as_str() {");
+    for entry in buffered {
+        emit_tail_begin_arm(emitter, tail_stage, entry);
+    }
+    emitter.line(6, "other => {");
+    emitter.line(7, "multipart_record_unknown(&self.log, other);");
+    emitter.line(7, &format!("self.stage = {tail_stage}::Drain;"));
+    emitter.line(6, "}");
+    emitter.line(5, "}");
+    emitter.line(4, "}");
+    emitter.line(
+        4,
+        "Ok(MultipartEvent::PartChunk(chunk)) => match self.stage {",
+    );
+    emitter.line(5, &format!("{tail_stage}::Idle => return Ok(Some(chunk)),"));
+    emitter.line(5, &format!("{tail_stage}::Drain => {{}}"));
+    if has_buffered {
+        let variants = buffered
+            .iter()
+            .map(|entry| tail_stage_variant_name(tail_stage, entry))
+            .collect::<Vec<_>>();
+        emit_or_pattern_head(emitter, 5, &variants, " => {");
+        emitter.line(6, "self.buffer.extend_from_slice(&chunk);");
+        emitter.line(6, "if self.buffer.len() > self.scalar_limit {");
+        emitter.line(
+            7,
+            "return Err(ProtocolRejection::new(RejectionKind::BodyTooLarge));",
+        );
+        emitter.line(6, "}");
+        emitter.line(5, "}");
+    }
+    emitter.line(4, "},");
+    // A block holding only this match collapses onto the arrow (§50 test 40
+    // keeps every emission rustfmt-canonical).
+    emitter.line(4, "Ok(MultipartEvent::PartEnd) => match self.stage {");
+    let idle_drain = vec![
+        format!("{tail_stage}::Idle"),
+        format!("{tail_stage}::Drain"),
+    ];
+    emit_or_pattern_head(emitter, 5, &idle_drain, " => {}");
+    for entry in buffered {
+        emit_tail_decode_arm(emitter, tail_stage, entry);
+    }
+    emitter.line(4, "},");
+    emitter.line(3, "}");
+    emitter.line(2, "}");
+    emitter.line(1, "}");
+}
+
+/// Stage variant name (no enum path) for one buffered trailing field.
+fn tail_stage_variant_name(tail_stage: &str, entry: &MultipartFieldIdents) -> String {
+    let variant = naming::ident(&entry.field.rust_name, NameStyle::Pascal);
+    if entry.field.repeated {
+        format!("{tail_stage}::{variant}Element")
+    } else {
+        format!("{tail_stage}::{variant}")
+    }
+}
+
+/// Emits one match-arm pattern head from or-pattern alternatives: a single
+/// line when it fits the rustfmt budget, otherwise rustfmt's canonical
+/// broken form (`alt0`, then `| altN` lines, the last carrying `suffix`).
+fn emit_or_pattern_head(
+    emitter: &mut Emitter,
+    indent: usize,
+    alternatives: &[String],
+    suffix: &str,
+) {
+    let single_line = format!("{}{suffix}", alternatives.join(" | "));
+    if fits(indent, &single_line) {
+        emitter.line(indent, &single_line);
+        return;
+    }
+    let last = alternatives.len() - 1;
+    for (index, alternative) in alternatives.iter().enumerate() {
+        if index == 0 {
+            emitter.line(indent, alternative);
+        } else if index == last {
+            emitter.line(indent, &format!("| {alternative}{suffix}"));
+        } else {
+            emitter.line(indent, &format!("| {alternative}"));
+        }
+    }
+}
+
+/// One `PartBegin` arm of the tail scan's declared-name dispatch: mark the
+/// single-valued name consumed, clear it from the pending-required set, and
+/// start bounded buffering toward its boundary decode.
+fn emit_tail_begin_arm(emitter: &mut Emitter, tail_stage: &str, entry: &MultipartFieldIdents) {
+    let wire = rust_string_literal(&entry.field.wire_name);
+    emitter.line(6, &format!("{wire} => {{"));
+    if !entry.field.repeated {
+        emitter.line(
+            7,
+            &format!("self.seen_single_valued.push({wire}.to_owned());"),
+        );
+        if entry.field.required {
+            emitter.line(
+                7,
+                &format!("self.pending_required.retain(|name| *name != {wire});"),
+            );
+        }
+    }
+    emitter.line(7, "self.buffer.clear();");
+    emitter.line(
+        7,
+        &format!(
+            "self.stage = {};",
+            tail_stage_variant_name(tail_stage, entry)
+        ),
+    );
+    emitter.line(6, "}");
+}
+
+/// One `PartEnd` decode arm of the tail scan: bounded-buffered bytes become
+/// typed values on the trailing-parts carrier.
+fn emit_tail_decode_arm(emitter: &mut Emitter, tail_stage: &str, entry: &MultipartFieldIdents) {
+    emitter.line(
+        5,
+        &format!("{} => {{", tail_stage_variant_name(tail_stage, entry)),
+    );
+    match &entry.field.kind {
+        PlannedMultipartFieldKind::ScalarText(rust_type) => {
+            let wire = rust_string_literal(&entry.field.wire_name);
+            emitter.line(
+                6,
+                &format!(
+                    "let value = multipart_scalar_text::<{rust_type}>({wire}, &self.buffer)?;"
+                ),
+            );
+        }
+        PlannedMultipartFieldKind::JsonPart(model) => {
+            let bind = format!("let value: {model} = decode_json_body(&self.buffer)?;");
+            if fits(6, &bind) {
+                emitter.line(6, &bind);
+            } else {
+                emitter.line(6, &format!("let value: {model} ="));
+                emitter.line(7, "decode_json_body(&self.buffer)?;");
+            }
+        }
+        PlannedMultipartFieldKind::BinaryPart => unreachable!("binary parts never buffer"),
+    }
+    if entry.field.repeated {
+        emitter.line(
+            6,
+            &format!("self.trailing_parts.{}.push(value);", entry.ident),
+        );
+    } else {
+        emitter.line(
+            6,
+            &format!("self.trailing_parts.{} = Some(value);", entry.ident),
+        );
+    }
+    emitter.line(6, &format!("self.stage = {tail_stage}::Idle;"));
+    emitter.line(5, "}");
+}
+
+/// The router-side single-pass collector for one operation's
+/// `multipart/form-data` body: streams the framed message exactly once,
+/// buffering ONLY scalar/JSON payloads up to `multipart_scalar_part_bytes`,
+/// enforcing required/duplicate/cardinality rules (§17.1), and handing the
+/// application an input whose binary parts are live streams.
+fn emit_multipart_collector(
+    emitter: &mut Emitter,
+    op_index: usize,
+    operation: &PlannedOperation,
+    layout: &ServerLayout,
+) {
+    let Some(spec) = operation
+        .request_contents
+        .iter()
+        .find(|content| content.media_class == MediaClass::Multipart)
+        .and_then(|content| content.multipart_spec.as_ref())
+    else {
+        return;
+    };
+    let Some(input_name) = layout.multipart_input(op_index) else {
+        return;
+    };
+    let resolved = resolve_multipart_field_idents(&spec.fields);
+    let collector = format!("collect_{}_multipart", operation.method);
+
+    emitter.blank();
+    emitter.docs(
+        0,
+        &[format!(
+            "Runs the §38 pre-handler pipeline for the `multipart/form-data` \
+              body of `{}` (main spec §5.5/§17/§17.1): one incremental pass \
+              up to the streaming handoff; scalar/JSON parts buffer only up \
+              to `multipart_scalar_part_bytes`; duplicate-single-valued \
+              parts reject before the trait runs, and required names the \
+              pass never observed reject here unless they may still arrive \
+              behind the live stream — those ride its `pending_required` set \
+              (wire-arrival-based enforcement, §17.1/§38).",
+            operation.method
+        )],
+    );
+    emitter.line(0, "#[allow(clippy::missing_errors_doc)]");
+    emitter.line(0, "#[allow(clippy::too_many_lines)]");
+    emitter.line(0, &format!("async fn {collector}("));
+    emitter.line(1, "body: ::axum::body::Body,");
+    emitter.line(1, "parsed: Option<&ParsedMediaType>,");
+    emitter.line(1, "limits: &BodyLimits,");
+    emitter.line(
+        0,
+        &format!(") -> Result<{input_name}, ProtocolRejection> {{"),
+    );
+    // Boundary extraction is never defaulted (§28.1); a Content-Type without
+    // a usable boundary parameter is malformed framing.
+    emitter.line(1, "let parsed = match parsed {");
+    emitter.line(2, "Some(parsed) => parsed,");
+    emitter.line(2, "None => {");
+    emitter.line(
+        3,
+        "return Err(malformed_body(\"multipart body requires a Content-Type\"));",
+    );
+    emitter.line(2, "}");
+    emitter.line(1, "};");
+    emitter.line(1, "let boundary = match extract_boundary(parsed) {");
+    emitter.line(2, "Ok(boundary) => boundary,");
+    emitter.line(2, "Err(_) => {");
+    emitter.line(3, "return Err(malformed_body(");
+    emitter.line(4, "\"multipart Content-Type lacks a usable boundary\",");
+    emitter.line(3, "));");
+    emitter.line(2, "}");
+    emitter.line(1, "};");
+    emitter.line(
+        1,
+        "let mut events: MultipartEvents = Box::pin(stream_multipart(",
+    );
+    emitter.line(2, "body.into_data_stream(),");
+    emitter.line(2, "boundary,");
+    emitter.line(2, "MultipartLimits::from_body_limits(limits),");
+    emitter.line(1, "));");
+    emitter.line(1, "let unknown_log =");
+    emitter.line(
+        2,
+        "::std::sync::Arc::new(::std::sync::Mutex::new(MultipartUnknownLog::default()));",
+    );
+
+    // Per-field collection state plus the buffering stage machine.
+    emitter.blank();
+    emitter.line(1, "#[derive(Clone, Copy)]");
+    emitter.line(1, "enum Stage {");
+    emitter.line(2, "Idle,");
+    emitter.line(2, "Drain,");
+    for entry in &resolved {
+        if matches!(entry.field.kind, PlannedMultipartFieldKind::BinaryPart) {
+            continue;
+        }
+        let variant = naming::ident(&entry.field.rust_name, NameStyle::Pascal);
+        if entry.field.repeated {
+            emitter.line(2, &format!("{variant}Element,"));
+        } else {
+            emitter.line(2, &format!("{variant},"));
+        }
+    }
+    emitter.line(1, "}");
+    emitter.line(1, "let mut stage = Stage::Idle;");
+    for (field_index, entry) in resolved.iter().enumerate() {
+        match &entry.field.kind {
+            PlannedMultipartFieldKind::BinaryPart => {
+                let part_name = layout
+                    .multipart_part(op_index, field_index)
+                    .expect("binary part registered");
+                emitter.line(
+                    1,
+                    &format!("let mut {}_part: Option<{part_name}> = None;", entry.ident),
+                );
+            }
+            kind => {
+                if entry.field.repeated {
+                    let vec_type = multipart_input_field_type(kind, true, true);
+                    emitter.line(
+                        1,
+                        &format!("let mut {}: {vec_type} = Vec::new();", entry.ident),
+                    );
+                } else if let PlannedMultipartFieldKind::ScalarText(rust_type)
+                | PlannedMultipartFieldKind::JsonPart(rust_type) = kind
+                {
+                    emitter.line(
+                        1,
+                        &format!("let mut {}: Option<{rust_type}> = None;", entry.ident),
+                    );
+                }
+            }
+        }
+        let needs_seen = !entry.field.repeated
+            && !(entry.field.required
+                && matches!(entry.field.kind, PlannedMultipartFieldKind::BinaryPart));
+        if needs_seen {
+            emitter.line(1, &format!("let mut seen_{} = false;", entry.ident));
+        }
+    }
+    emitter.line(1, "let mut buffer: Vec<u8> = Vec::new();");
+
+    // The single incremental pass over the framed message.
+    emitter.blank();
+    emitter.line(1, "loop {");
+    emitter.line(
+        2,
+        "let event = match next_multipart_event(&mut events).await {",
+    );
+    emitter.line(3, "Some(event) => event,");
+    emitter.line(3, "None => break,");
+    emitter.line(2, "};");
+    emitter.line(2, "match event {");
+    emitter.line(3, "Err(error) => return Err(multipart_rejection(&error)),");
+    emitter.line(3, "Ok(MultipartEvent::PartBegin(headers)) => {");
+    emitter.line(4, "stage = match headers.name.as_str() {");
+    let trailing_name = layout.multipart_trailing(op_index);
+    for (field_index, entry) in resolved.iter().enumerate() {
+        emit_collector_field_arm(
+            emitter,
+            op_index,
+            layout,
+            field_index,
+            entry,
+            &resolved,
+            trailing_name,
+        );
+    }
+    emitter.line(5, "other => {");
+    emitter.line(6, "multipart_record_unknown(&unknown_log, other);");
+    emitter.line(6, "Stage::Drain");
+    emitter.line(5, "}");
+    emitter.line(4, "};");
+    emitter.line(3, "}");
+    emitter.line(3, "Ok(MultipartEvent::PartChunk(chunk)) => match stage {");
+    emitter.line(4, "Stage::Idle | Stage::Drain => {}");
+    emitter.line(4, "_ => {");
+    emitter.line(5, "buffer.extend_from_slice(&chunk);");
+    emitter.line(5, "if buffer.len() > limits.multipart_scalar_part_bytes {");
+    emitter.line(
+        6,
+        "return Err(ProtocolRejection::new(RejectionKind::BodyTooLarge));",
+    );
+    emitter.line(5, "}");
+    emitter.line(4, "}");
+    emitter.line(3, "},");
+    emitter.line(3, "Ok(MultipartEvent::PartEnd) => match stage {");
+    emitter.line(4, "Stage::Idle | Stage::Drain => {}");
+    for entry in &resolved {
+        if matches!(entry.field.kind, PlannedMultipartFieldKind::BinaryPart) {
+            continue;
+        }
+        emit_collector_decode_arm(emitter, entry);
+    }
+    emitter.line(3, "},");
+    emitter.line(2, "}");
+    emitter.line(1, "}");
+
+    // Required-part enforcement is wire-arrival-based (§17.1, §38): parts
+    // this pass consumed validated inline above; names still outstanding at
+    // the streaming handoff ride `pending_required` on the live part, which
+    // reports one terminal SchemaViolation when the framing ends without
+    // them. Without a handoff this pass saw the whole message.
+    let binary_ident = resolved
+        .iter()
+        .find(|entry| matches!(entry.field.kind, PlannedMultipartFieldKind::BinaryPart))
+        .map(|entry| entry.ident.clone());
+    if let Some(binary) = &binary_ident {
+        emitter.line(1, &format!("let handed_off = {binary}_part.is_some();"));
+    }
+    for entry in &resolved {
+        if !entry.field.required || entry.field.repeated {
+            continue;
+        }
+        match &entry.field.kind {
+            PlannedMultipartFieldKind::BinaryPart => {
+                emitter.line(
+                    1,
+                    &format!("let {} = match {}_part {{", entry.ident, entry.ident),
+                );
+                emitter.line(2, "Some(part) => part,");
+                emitter.line(2, "None => {");
+                emitter.line(
+                    3,
+                    &format!(
+                        "return Err(schema_violation(\"missing \
+                         required part `{}`\"));",
+                        entry.field.wire_name
+                    ),
+                );
+                emitter.line(2, "}");
+                emitter.line(1, "};");
+            }
+            PlannedMultipartFieldKind::ScalarText(_) | PlannedMultipartFieldKind::JsonPart(_) => {
+                emitter.line(
+                    1,
+                    &format!("let {} = match {} {{", entry.ident, entry.ident),
+                );
+                if binary_ident.is_some() {
+                    emitter.line(2, "Some(value) => Some(value),");
+                    emitter.line(2, "None if handed_off => None,");
+                } else {
+                    emitter.line(2, "Some(value) => value,");
+                }
+                emitter.line(2, "None => {");
+                emitter.line(
+                    3,
+                    &format!(
+                        "return Err(schema_violation(\"missing \
+                         required part `{}`\"));",
+                        entry.field.wire_name
+                    ),
+                );
+                emitter.line(2, "}");
+                emitter.line(1, "};");
+            }
+        }
+    }
+
+    // Assemble the owned input in declaration order; optional/repeated
+    // fields keep their collected shape.
+    emitter.blank();
+    emitter.line(1, &format!("Ok({input_name} {{"));
+    for entry in &resolved {
+        match &entry.field.kind {
+            PlannedMultipartFieldKind::BinaryPart if !entry.field.required => {
+                emitter.line(2, &format!("{}: {}_part,", entry.ident, entry.ident));
+            }
+            _ => {
+                emitter.line(2, &format!("{},", entry.ident));
+            }
+        }
+    }
+    emitter.line(2, "unknown_log,");
+    emitter.line(1, "})");
+    emitter.line(0, "}");
+}
+
+/// One `PartBegin` arm of the collector's name dispatch.
+fn emit_collector_field_arm(
+    emitter: &mut Emitter,
+    op_index: usize,
+    layout: &ServerLayout,
+    field_index: usize,
+    entry: &MultipartFieldIdents,
+    resolved: &[MultipartFieldIdents],
+    trailing_name: Option<&str>,
+) {
+    let wire = rust_string_literal(&entry.field.wire_name);
+    emitter.line(5, &format!("{wire} => {{"));
+    let needs_seen = !entry.field.repeated
+        && !(entry.field.required
+            && matches!(entry.field.kind, PlannedMultipartFieldKind::BinaryPart));
+    if needs_seen {
+        emitter.line(6, &format!("if seen_{} {{", entry.ident));
+        emitter.line(7, "return Err(schema_violation(format!(");
+        emitter.line(8, "\"duplicate single-valued part `{}`\",");
+        emitter.line(8, "headers.name");
+        emitter.line(7, ")));");
+        emitter.line(6, "}");
+        emitter.line(6, &format!("seen_{} = true;", entry.ident));
+    }
+    match &entry.field.kind {
+        PlannedMultipartFieldKind::ScalarText(_) | PlannedMultipartFieldKind::JsonPart(_) => {
+            emitter.line(6, "buffer.clear();");
+            let variant = naming::ident(&entry.field.rust_name, NameStyle::Pascal);
+            if entry.field.repeated {
+                emitter.line(6, &format!("Stage::{variant}Element"));
+            } else {
+                emitter.line(6, &format!("Stage::{variant}"));
+            }
+        }
+        PlannedMultipartFieldKind::BinaryPart => {
+            let part_name = layout
+                .multipart_part(op_index, field_index)
+                .expect("binary part registered");
+            let tail_stage = format!("{part_name}TailStage");
+            // Wire-arrival-based enforcement (§17.1): every required
+            // scalar/JSON name still unseen rides on the live part and is
+            // reported at its clean end-of-message; already-consumed
+            // single-valued names stay duplicate-protected behind it.
+            emitter.line(
+                6,
+                "let mut pending_required: Vec<&'static str> = Vec::new();",
+            );
+            for other in resolved {
+                if other.field.required
+                    && !other.field.repeated
+                    && matches!(
+                        other.field.kind,
+                        PlannedMultipartFieldKind::ScalarText(_)
+                            | PlannedMultipartFieldKind::JsonPart(_)
+                    )
+                {
+                    emitter.line(6, &format!("if {}.is_none() {{", other.ident));
+                    emitter.line(
+                        7,
+                        &format!(
+                            "pending_required.push({});",
+                            rust_string_literal(&other.field.wire_name)
+                        ),
+                    );
+                    emitter.line(6, "}");
+                }
+            }
+            emitter.line(6, "let mut seen_single_valued: Vec<String> = Vec::new();");
+            for other in resolved {
+                // The live binary seeds its own name unconditionally below;
+                // plan time guarantees it is the body's only binary part.
+                if !other.field.repeated
+                    && !matches!(other.field.kind, PlannedMultipartFieldKind::BinaryPart)
+                {
+                    emitter.line(6, &format!("if seen_{} {{", other.ident));
+                    emitter.line(
+                        7,
+                        &format!(
+                            "seen_single_valued.push({}.to_owned());",
+                            rust_string_literal(&other.field.wire_name)
+                        ),
+                    );
+                    emitter.line(6, "}");
+                }
+            }
+            emitter.line(
+                6,
+                &format!(
+                    "seen_single_valued.push({}.to_owned());",
+                    rust_string_literal(&entry.field.wire_name)
+                ),
+            );
+            emitter.line(
+                6,
+                &format!("{ident}_part = Some({part_name} {{", ident = entry.ident),
+            );
+            emitter.line(7, "file_name: headers.filename,");
+            emitter.line(7, "content_type: headers.content_type,");
+            if let Some(trailing) = trailing_name {
+                emitter.line(7, &format!("trailing_parts: {trailing}::default(),"));
+            }
+            emitter.line(7, "events,");
+            emitter.line(7, "log: ::std::sync::Arc::clone(&unknown_log),");
+            emitter.line(7, &format!("stage: {tail_stage}::Idle,"));
+            emitter.line(7, "scalar_limit: limits.multipart_scalar_part_bytes,");
+            emitter.line(7, "buffer: Vec::new(),");
+            emitter.line(7, "finished: false,");
+            emitter.line(7, "pending_required,");
+            emitter.line(7, "seen_single_valued,");
+            emitter.line(6, "});");
+            emitter.line(6, "break;");
+        }
+    }
+    emitter.line(5, "}");
+}
+
+/// One `PartEnd` decode arm: bounded-buffered bytes become typed values.
+fn emit_collector_decode_arm(emitter: &mut Emitter, entry: &MultipartFieldIdents) {
+    let variant = naming::ident(&entry.field.rust_name, NameStyle::Pascal);
+    let stage = if entry.field.repeated {
+        format!("Stage::{variant}Element")
+    } else {
+        format!("Stage::{variant}")
+    };
+    emitter.line(4, &format!("{stage} => {{"));
+    match &entry.field.kind {
+        PlannedMultipartFieldKind::ScalarText(rust_type) => {
+            let wire = rust_string_literal(&entry.field.wire_name);
+            emitter.line(
+                5,
+                &format!("let value = multipart_scalar_text::<{rust_type}>({wire}, &buffer)?;"),
+            );
+        }
+        PlannedMultipartFieldKind::JsonPart(model) => {
+            let bind = format!("let value: {model} = decode_json_body(&buffer)?;");
+            if fits(5, &bind) {
+                emitter.line(5, &bind);
+            } else {
+                emitter.line(5, &format!("let value: {model} ="));
+                emitter.line(6, "decode_json_body(&buffer)?;");
+            }
+        }
+        PlannedMultipartFieldKind::BinaryPart => unreachable!("binary parts never buffer"),
+    }
+    if entry.field.repeated {
+        emitter.line(5, &format!("{}.push(value);", entry.ident));
+    } else {
+        emitter.line(5, &format!("{} = Some(value);", entry.ident));
+    }
+    emitter.line(5, "stage = Stage::Idle;");
+    emitter.line(4, "}");
 }
 
 // ----------------------------------------------------------------------
@@ -3403,6 +4670,18 @@ fn emit_module_helpers(emitter: &mut Emitter, flags: &Flags) {
     if flags.needs_form_decode {
         emitter.blank();
         emit_decode_form_body(emitter);
+    }
+    if flags.needs_multipart {
+        emitter.blank();
+        emit_multipart_shared_helpers(emitter);
+        emitter.blank();
+        emit_multipart_rejection(emitter);
+        emitter.blank();
+        emit_multipart_schema_violation(emitter);
+    }
+    if flags.needs_multipart_scalar {
+        emitter.blank();
+        emit_multipart_scalar_text(emitter);
     }
     if flags.needs_charset_check {
         emitter.blank();
@@ -3840,6 +5119,163 @@ fn emit_decode_form_body(emitter: &mut Emitter) {
     emitter.line(3, "}");
     emitter.line(2, "}");
     emitter.line(1, "}");
+    emitter.line(0, "}");
+}
+
+/// Shared machinery behind every generated multipart route (main spec
+/// §5.5/§17): the boxed event stream shared between the router's validation
+/// pass and the streaming parts, plus the unknown-part log and its
+/// poison-safe recorder.
+fn emit_multipart_shared_helpers(emitter: &mut Emitter) {
+    emitter.docs(
+        0,
+        &[String::from(
+            "Boxed multipart event stream shared between the router's \
+             single-pass validation and the live streaming part handed to \
+             the application (main spec §17).",
+        )],
+    );
+    emitter.line(0, "type MultipartEvents = ::std::pin::Pin<");
+    emitter.line(1, "Box<");
+    emitter.line(
+        2,
+        "dyn ::futures_core::Stream<Item = Result<MultipartEvent, MultipartError>>",
+    );
+    emitter.line(3, "+ ::std::marker::Send,");
+    emitter.line(1, ">,");
+    emitter.line(0, ">;");
+    emitter.blank();
+    emitter.docs(
+        0,
+        &["Polls the next framing event without extension traits.".to_owned()],
+    );
+    emitter.line(0, "#[allow(clippy::needless_pass_by_ref_mut)]");
+    emitter.line(0, "async fn next_multipart_event(");
+    emitter.line(1, "events: &mut MultipartEvents,");
+    emitter.line(0, ") -> Option<Result<MultipartEvent, MultipartError>> {");
+    emitter.line(
+        1,
+        "::std::future::poll_fn(|cx| events.as_mut().poll_next(cx)).await",
+    );
+    emitter.line(0, "}");
+    emitter.blank();
+    emitter.docs(
+        0,
+        &[String::from(
+            "Observability log of unrecognized/late part names (§17.1 \
+              unknown-fields-ignore default); payloads are never retained.",
+        )],
+    );
+    emitter.line(0, "#[derive(Default)]");
+    emitter.line(0, "struct MultipartUnknownLog {");
+    emitter.line(1, "names: Vec<String>,");
+    emitter.line(0, "}");
+    emitter.blank();
+    emitter.docs(
+        0,
+        &["Records one observed name, surviving mutex poisoning.".to_owned()],
+    );
+    emitter.line(
+        0,
+        "fn multipart_record_unknown(log: &::std::sync::Mutex<MultipartUnknownLog>, name: &str) {",
+    );
+    emitter.line(1, "match log.lock() {");
+    emitter.line(2, "Ok(mut guard) => guard.names.push(name.to_owned()),");
+    emitter.line(
+        2,
+        "Err(poisoned) => poisoned.into_inner().names.push(name.to_owned()),",
+    );
+    emitter.line(1, "}");
+    emitter.line(0, "}");
+}
+
+/// Maps framing-engine failures onto the canonical §39 rows: cardinality
+/// limits → BodyTooLarge 413; truncation and malformed framing →
+/// MalformedBody 400.
+fn emit_multipart_rejection(emitter: &mut Emitter) {
+    emitter.docs(
+        0,
+        &[String::from(
+            "Maps a multipart framing failure onto the §39 mapping table: \
+             cardinality limits (part count, header budget, name lengths) \
+             are bounded-collection rejections; truncation and malformed \
+             framing are syntactic failures.",
+        )],
+    );
+    emitter.line(
+        0,
+        "fn multipart_rejection(error: &MultipartError) -> ProtocolRejection {",
+    );
+    emitter.line(1, "match error {");
+    emitter.line(2, "MultipartError::TooManyParts { .. }");
+    emitter.line(2, "| MultipartError::PartHeaderTooLarge { .. }");
+    emitter.line(2, "| MultipartError::FieldNameTooLong { .. }");
+    emitter.line(2, "| MultipartError::FileNameTooLong { .. } => {");
+    emitter.line(3, "ProtocolRejection::new(RejectionKind::BodyTooLarge)");
+    emitter.line(2, "}");
+    emitter.line(2, "MultipartError::Truncated => {");
+    emitter.line(
+        3,
+        "malformed_body(\"multipart stream ended before the closing boundary\")",
+    );
+    emitter.line(2, "}");
+    emitter.line(
+        2,
+        "MultipartError::MalformedFraming => malformed_body(\"malformed multipart framing\"),",
+    );
+    emitter.line(1, "}");
+    emitter.line(0, "}");
+}
+
+/// Well-formed parts failing schema validation reject 422 (§17.1, §39 row 6).
+fn emit_multipart_schema_violation(emitter: &mut Emitter) {
+    emitter.docs(
+        0,
+        &[String::from(
+            "Well-formed multipart content failing schema validation \
+             (missing required part, duplicate single-valued part, bad \
+             scalar value) → 422 (§17.1, §39 mapping row 6).",
+        )],
+    );
+    emitter.line(
+        0,
+        "fn schema_violation(detail: impl Into<::std::borrow::Cow<'static, str>>) -> ProtocolRejection {",
+    );
+    emitter.line(
+        1,
+        "ProtocolRejection::new(RejectionKind::SchemaViolation).with_detail(detail)",
+    );
+    emitter.line(0, "}");
+}
+
+/// Decodes one bounded textual scalar part: strict UTF-8 first (400), then
+/// `FromStr` typing (well-formed bytes failing the schema → 422).
+fn emit_multipart_scalar_text(emitter: &mut Emitter) {
+    emitter.docs(
+        0,
+        &[String::from(
+            "Decodes one bounded textual scalar part (§17.1): non-UTF-8 \
+             bytes are MalformedBody 400; well-formed text failing its Rust \
+             type is SchemaViolation 422.",
+        )],
+    );
+    emitter.line(
+        0,
+        "fn multipart_scalar_text<T>(wire: &'static str, bytes: &[u8]) -> Result<T, ProtocolRejection>",
+    );
+    emitter.line(0, "where");
+    emitter.line(1, "T: ::std::str::FromStr,");
+    emitter.line(0, "{");
+    emitter.line(1, "let text = std::str::from_utf8(bytes)");
+    emitter.line(
+        2,
+        ".map_err(|_| malformed_body(\"multipart part is not valid UTF-8\"))?;",
+    );
+    emitter.line(1, "text.parse()");
+    emitter.line(
+        2,
+        ".map_err(|_| schema_violation(format!(\"part `{wire}` failed schema validation\")))",
+    );
     emitter.line(0, "}");
 }
 

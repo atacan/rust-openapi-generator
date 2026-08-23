@@ -283,3 +283,20 @@ Per main spec §52, URL-encoded forms, multipart, typed response headers, wildca
 and status-range/default handling beyond the Phase 1 enum shapes arrive in Phase 2. Phase 1
 server bodies: JSON family (bounded decode), plain text (bounded String), binary/raw/unknown
 (streaming passthrough).
+
+### D-impl-multipart-order Wire-arrival enforcement for multipart requiredness
+§17.1 defines missing-required as "the part stream ends without them", but sequential streaming
+(§51.4) means parts behind a live binary part cannot be judged before the application drains it.
+Decision: multipart validation is wire-arrival-based — scalar/JSON parts arriving before the
+first binary part validate pre-handler (missing → 422, handler never invoked); required parts
+still outstanding at binary handoff become `pending_required` on the emitted live part and
+surface as a terminal `SchemaViolation` from `next_chunk` at clean end-of-message (§38's
+"application-owned tail"). Trailing declared scalar/JSON parts are decoded onto a generated
+`<Op>TrailingParts` carrier rather than drained.
+
+### D-impl-multipart-single-binary At most one binary part per multipart body (v1)
+Sequential streaming gives exactly one live-part slot; a queue of parked unbounded streams would
+either buffer payloads or complicate the public API beyond v1 scope. Documents declaring more
+than one binary field get a generation Error diagnostic (`multipart_schema_unsupported`).
+Repeated (array) binary fields are likewise rejected, symmetrically with the client, which
+cannot clone streaming bodies. Revisit when a concrete fixture needs multi-file uploads.

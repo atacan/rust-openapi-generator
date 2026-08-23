@@ -1,0 +1,83 @@
+# Fixture 12 — file-first multipart upload order (main spec §17/§17.1/§38).
+# Mirrors real-world uploads whose streaming binary part arrives FIRST:
+# required-part enforcement is wire-arrival-based, so `metadata` (JSON part)
+# and `source` (required textual part) may lawfully arrive BEHIND the
+# handoff — they validate pre-handler when they precede `file`, and through
+# the live part's tail scan plus its terminal error otherwise. `tags` stays
+# an optional repeated textual part. The 201 answers JSON documenting a
+# required Location header (§15).
+openapi: 3.1.0
+info:
+  title: file-first multipart uploads
+  version: "1"
+paths:
+  /documents:
+    post:
+      operationId: uploadDocument
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, metadata, source]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                metadata:
+                  $ref: '#/components/schemas/DocumentMetadata'
+                source:
+                  type: string
+                tags:
+                  type: array
+                  items:
+                    type: string
+            encoding:
+              file:
+                contentType: application/octet-stream
+              metadata:
+                contentType: application/json
+      responses:
+        '201':
+          description: Uploaded
+          headers:
+            Location:
+              description: URL of the stored document
+              required: true
+              schema:
+                type: string
+                format: uri
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+        '409':
+          description: Rejected because a required part never arrived
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Rejection'
+components:
+  schemas:
+    DocumentMetadata:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+        pages:
+          type: integer
+          format: int32
+    Document:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+    Rejection:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string

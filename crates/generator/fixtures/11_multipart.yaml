@@ -1,0 +1,70 @@
+# Fixture 11 — multipart with scalar/JSON metadata and a streaming file
+# (main spec §17). uploadDocument posts a REQUIRED multipart/form-data body:
+# `metadata` is a JSON part ($ref object, encoding.contentType
+# application/json), `file` is a streaming binary part (format: binary,
+# encoding.contentType application/octet-stream), and `tags` is an optional
+# repeated textual part collecting in wire order (§17.1). Required scalar/
+# JSON parts are declared BEFORE the binary part so sequential streaming can
+# validate them pre-handler. The 201 answers JSON documenting a required
+# Location header (§15).
+openapi: 3.1.0
+info:
+  title: multipart uploads
+  version: "1"
+paths:
+  /documents:
+    post:
+      operationId: uploadDocument
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [metadata, file]
+              properties:
+                metadata:
+                  $ref: '#/components/schemas/DocumentMetadata'
+                tags:
+                  type: array
+                  items:
+                    type: string
+                file:
+                  type: string
+                  format: binary
+            encoding:
+              metadata:
+                contentType: application/json
+              file:
+                contentType: application/octet-stream
+      responses:
+        '201':
+          description: Uploaded
+          headers:
+            Location:
+              description: URL of the stored document
+              required: true
+              schema:
+                type: string
+                format: uri
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+components:
+  schemas:
+    DocumentMetadata:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+        pages:
+          type: integer
+          format: int32
+    Document:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
