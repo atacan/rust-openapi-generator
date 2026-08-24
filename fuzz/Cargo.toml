@@ -1,0 +1,85 @@
+[package]
+name = "openapi-to-rust-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace on purpose: the fuzz crate is NOT a member of the
+# repository workspace (main spec §50 test 41 harnesses live outside the
+# shipped crate graph), so root `cargo test/clippy/fmt` never see it.
+[workspace]
+
+[dependencies]
+axum = "0.8"
+bytes = "1"
+futures-util = "0.3"
+libfuzzer-sys = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dependencies.openapi-support]
+path = "../crates/support"
+features = ["client", "server"]
+
+[[bin]]
+name = "parse_content_type"
+path = "fuzz_targets/parse_content_type.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "form_pairs"
+path = "fuzz_targets/form_pairs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "params_decode_query"
+path = "fuzz_targets/params_decode_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sse_decode"
+path = "fuzz_targets/sse_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ndjson_decode"
+path = "fuzz_targets/ndjson_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jsonseq_decode"
+path = "fuzz_targets/jsonseq_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "multipart_framing"
+path = "fuzz_targets/multipart_framing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pattern_match_redos"
+path = "fuzz_targets/pattern_match_redos.rs"
+test = false
+doc = false
+bench = false
+
+# Keep crash backtraces symbolizable without slowing fuzzing meaningfully.
+[profile.release]
+debug = 1

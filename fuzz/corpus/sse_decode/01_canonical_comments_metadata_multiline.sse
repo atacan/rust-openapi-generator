@@ -1,0 +1,13 @@
+: keep-alive comment
+
+id: 42
+event: tick
+retry: 25000
+x-unknown: noise
+data: {"name":"a","count":1}
+
+event: skipped-because-no-data
+
+data: {"name":"b",
+data: "count":2}
+
