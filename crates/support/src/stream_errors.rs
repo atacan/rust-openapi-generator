@@ -29,6 +29,14 @@ pub enum SseDecodeError {
     /// Event bytes were not valid UTF-8.
     #[error("SSE event is not valid UTF-8")]
     NotUtf8,
+    /// Transport failure beneath the decoder; framing cannot continue and the
+    /// underlying error is preserved for diagnostics.
+    #[error("transport failed beneath the SSE decoder")]
+    Source(
+        /// Underlying transport error.
+        #[source]
+        Box<dyn std::error::Error + Send + Sync>,
+    ),
 }
 
 /// Client decode error for an NDJSON body (main spec §40).
@@ -53,6 +61,14 @@ pub enum NdjsonDecodeError {
     /// Line bytes were not valid UTF-8.
     #[error("NDJSON line is not valid UTF-8")]
     NotUtf8,
+    /// Transport failure beneath the decoder; framing cannot continue and the
+    /// underlying error is preserved for diagnostics.
+    #[error("transport failed beneath the NDJSON decoder")]
+    Source(
+        /// Underlying transport error.
+        #[source]
+        Box<dyn std::error::Error + Send + Sync>,
+    ),
 }
 
 /// Client decode error for a JSON Text Sequence body (RFC 7464; main spec §40).
@@ -80,6 +96,14 @@ pub enum JsonSeqDecodeError {
     /// A record was not introduced by the mandatory record separator (RS).
     #[error("JSON sequence record missing its leading record separator (RS)")]
     MissingRecordSeparator,
+    /// Transport failure beneath the decoder; framing cannot continue and the
+    /// underlying error is preserved for diagnostics.
+    #[error("transport failed beneath the JSON sequence decoder")]
+    Source(
+        /// Underlying transport error.
+        #[source]
+        Box<dyn std::error::Error + Send + Sync>,
+    ),
 }
 
 /// Failure raised by an application stream after the response was committed
@@ -145,6 +169,39 @@ mod tests {
         assert!(too_large.to_string().contains("record limit of 1 bytes"));
         let malformed = JsonSeqDecodeError::MalformedJson(json_source());
         assert!(std::error::Error::source(&malformed).is_some());
+    }
+
+    #[test]
+    fn source_variant_preserves_transport_failures_for_every_decoder() {
+        let transport = || -> Box<dyn std::error::Error + Send + Sync> {
+            Box::new(std::io::Error::other("socket reset"))
+        };
+
+        let sse = SseDecodeError::Source(transport());
+        assert_eq!(sse.to_string(), "transport failed beneath the SSE decoder");
+        assert_eq!(
+            std::error::Error::source(&sse)
+                .expect("sse source")
+                .to_string(),
+            "socket reset"
+        );
+
+        let ndjson = NdjsonDecodeError::Source(transport());
+        assert_eq!(
+            ndjson.to_string(),
+            "transport failed beneath the NDJSON decoder"
+        );
+        assert!(std::error::Error::source(&ndjson).is_some());
+
+        let seq = JsonSeqDecodeError::Source(transport());
+        assert_eq!(
+            seq.to_string(),
+            "transport failed beneath the JSON sequence decoder"
+        );
+        assert!(std::error::Error::source(&seq).is_some());
+
+        // The boxed errors stay debuggable through their enum wrappers.
+        assert!(format!("{sse:?}").contains("socket reset"));
     }
 
     #[test]

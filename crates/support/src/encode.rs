@@ -124,6 +124,37 @@ where
     Ok(Bytes::from(form.writer.into_inner()))
 }
 
+/// Serializes `value` as JSON framed by fixed prefix/suffix byte runs, all
+/// counted against `limit`.
+///
+/// Shared by the per-item streaming encoders (`data:` framing for SSE, line
+/// feeds for NDJSON, record separators for JSON sequences — main spec §18.2
+/// through §20, DECISIONS.md D-impl-stream-item-bounds): the whole frame is
+/// one independently bounded document, so the limit fails fast through
+/// [`CountingWriter`] and no partial output escapes on error.
+pub(crate) fn serialize_json_framed<T>(
+    value: &T,
+    limit: usize,
+    prefix: &[u8],
+    suffix: &[u8],
+) -> Result<Bytes, EncodeTooLarge>
+where
+    T: Serialize + ?Sized,
+{
+    let mut writer = CountingWriter::new(
+        Vec::with_capacity(limit.min(INITIAL_ENCODE_CAPACITY)),
+        limit,
+    );
+    let overflow = EncodeTooLarge { limit };
+    writer.write_all(prefix).map_err(|_| overflow)?;
+    {
+        let mut serializer = serde_json::Serializer::new(&mut writer);
+        Serialize::serialize(value, &mut serializer).map_err(|_| overflow)?;
+    }
+    writer.write_all(suffix).map_err(|_| overflow)?;
+    Ok(Bytes::from(writer.into_inner()))
+}
+
 const INITIAL_ENCODE_CAPACITY: usize = 8 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]

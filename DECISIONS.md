@@ -310,6 +310,41 @@ re-classes such an entry into the streaming family for BOTH directions, while th
 literal — and therefore runtime Content-Type matching, the operation's Accept contribution, and
 the `TextPlain` variant name — stays verbatim. Any other `x-rust-body` value remains an ignored
 vendor extension. JSON-family entries are deliberately NOT overridable this way: their bounded
+
+---
+
+## E. Phase 3 implementation choices
+
+### D-impl-sse-framing SSE framing follows WHATWG with strict data validation
+Line terminators: CRLF, LF, and CR are all accepted between lines (WHATWG event-stream
+convention), while the §18.2 contract holds otherwise — `data:` joined with `\n` before one JSON
+parse, `id:`/`event:` ignored by default, `retry:` surfaced only through configuration, comment
+lines ignored, BOM stripped once at stream start. An event without `data:` is skipped per WHATWG;
+malformed JSON yields `SseDecodeError::MalformedJson` and TERMINATES the stream (fail-fast, never
+skip-and-continue), per §18.2 "without collecting the rest".
+
+### D-impl-ndjson-lines NDJSON blank-line policy
+A single trailing line terminator is part of the format; interior empty lines are
+`MalformedJson`. EOF exactly at a record boundary is clean end-of-stream; EOF mid-record is
+`Truncated` (distinct from clean EOF per §40).
+
+### D-impl-jsonseq-eof JSON Text Sequences: no truncated-record recovery
+RFC 7464 allows parsers to recover a truncated final record ("MAY"). Decision: v1 does NOT
+recover — EOF after RS without a terminating LF yields `JsonSeqDecodeError::Truncated`, keeping
+truncation observable rather than guessed away. A record whose first byte is not RS yields
+`MissingRecordSeparator`.
+
+### D-impl-stream-item-bounds Per-item bounds for streamed encodes and decodes
+Decoded records are bounded by `max_stream_record_bytes` on decode; server-side per-item ENCODE
+also enforces `max_stream_record_bytes` (not `structured_encode_bytes`) since each item is an
+independently bounded document. Overflow on a committed stream follows §40 (terminate + hook),
+while pre-commit overflow on request encoding follows §34.2.
+
+### D-impl-request-direction-streams Streaming structured media run in both directions
+The §6 summary table admits SSE/NDJSON/JSON-seq REQUEST bodies; generated clients send them via
+chunk-wrapped encoded item streams (per-item bound enforced pre-send) and generated routers hand
+handlers a typed item-stream wrapper whose decode errors surface as rejections before/during
+consumption under the same wire-arrival philosophy as multipart (D-impl-multipart-order).
 full-document decode is what produces the typed representation, and a raw JSON stream would erase
 the type contract instead of relaxing its memory bound.
 

@@ -5,22 +5,26 @@
 //! (§34.1, §40). Protocol layer: pre-handler rejections (§39), identity-only
 //! inbound content coding (§30.4), stream decode errors and committed-stream
 //! failures (§40), and the presence/nullability matrix (companion §2.1).
-//! Dispatch layer: media-type parsing/matching and peek-and-preserve presence
-//! detection (§28), percent encoding (companion §8), the parameter
-//! style × explode matrix (companion §6), and the authoritative
-//! `ClientError` (§36).
+//! Streaming codecs: incremental record-framed decode/encode for SSE (§18.2),
+//! NDJSON (§19), and JSON Text Sequences (§20). Dispatch layer: media-type
+//! parsing/matching and peek-and-preserve presence detection (§28), percent
+//! encoding (companion §8), the parameter style × explode matrix (companion §6),
+//! and the authoritative `ClientError` (§36).
 
 pub mod collect;
 pub mod content_coding;
 pub mod encode;
 pub mod form;
 pub mod hooks;
+pub mod jsonseq;
 pub mod limits;
 pub mod mediatype;
+pub mod ndjson;
 pub mod optional;
 pub mod params;
 pub mod percent;
 pub mod rejection;
+pub mod sse;
 pub mod stream_errors;
 pub mod validation;
 
