@@ -2355,6 +2355,8 @@ Contract-boundary rules:
 3. By default a rejection response carries only the canonical status with an empty body, keeping invented schemas off the wire. Generator configuration MAY switch rejections to a canned minimal RFC 9457 problem document under `application/problem+json`; this remains generator-owned and never uses application schema types.
 4. The client side needs no special casing: whatever the server actually sends decodes normally, so a peer-generated rejection still matches a documented variant, range, or `default` when one exists, and otherwise surfaces as `ClientError::UndocumentedStatus`.
 
+**Codec exception:** codec plugins whose underlying library cannot portably distinguish syntax failures from shape failures MAY map unclassifiable data errors to `MalformedBody` (`400`). This applies only to optional codec paths; every built-in Phase 1–3 media type keeps the strict split above, and companion section 9 post-decode validation continues to produce `SchemaViolation` (`422`) for constraint violations regardless.
+
 ---
 
 ## 40. Failures after a streaming response has started
@@ -2862,6 +2864,7 @@ Reproducibility and conformance testing:
 49. Discriminator-selected `oneOf`: a document matching the selected branch AND another branch still fails exactly-one validation; selection does not weaken the verdict (companion section 4.2).
 50. Directional view requiredness: a required `writeOnly` field is mandatory when encoding requests and absent from decoded responses; a required `readOnly` field is mandatory in responses and omitted from requests (companion section 5).
 51. Scalar `allOf` intersection: `minLength` plus `pattern` constraints on strings combine into one validated string type, not nested values (companion section 4.1).
+52. Codec rejection mapping: codec data errors map to `400 MalformedBody`, while constraint violations still produce `422 SchemaViolation` through post-decode validation (section 39, Codec exception).
 
 Memory tests should use a synthetic producer that generates far more bytes than allowed by process memory, proving behavior rather than relying only on code inspection.
 
