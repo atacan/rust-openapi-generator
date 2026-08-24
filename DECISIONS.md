@@ -345,6 +345,43 @@ The §6 summary table admits SSE/NDJSON/JSON-seq REQUEST bodies; generated clien
 chunk-wrapped encoded item streams (per-item bound enforced pre-send) and generated routers hand
 handlers a typed item-stream wrapper whose decode errors surface as rejections before/during
 consumption under the same wire-arrival philosophy as multipart (D-impl-multipart-order).
+
+---
+
+## F. Phase 4 implementation choices
+
+### D-impl-codec-plugins Compile-time codec plugins with bounded collect-then-parse
+Main spec §45 makes typed codecs opt-in with raw-stream fallback. Decision: plugins live in the
+GENERATOR as a Rust trait (`codegen::codecs::MediaCodecPlugin`) consulted during planning;
+enablement is generator configuration, default ALL OFF. When a plugin claims an entry, both
+directions become: bounded collection under the purpose-specific structured limit FIRST, then
+codec parse from the bounded bytes (memory bounded by construction); encoding serializes through
+the fail-fast `CountingWriter`. Runtime codec dependencies (e.g. quick-xml, ciborium, rmp-serde)
+are added to EMITTED manifests only for enabled codecs — `openapi-support` stays dependency-light
+(companion §4.5). Built-in v1 plugins: XML, CBOR, MessagePack. Protobuf/Avro are deferred:
+they require external schema compilers/codegen steps this generator does not invoke.
+
+### D-impl-override-precedence Representation resolution precedence
+Per-entry representation resolves as: custom generator override > claiming codec plugin > default
+media-type classification. Overrides may force raw streaming (any class → streaming wrapper) or
+restore defaults; they may never invent a structured representation for an unknown format
+(§5.9 forbids guessing codecs).
+
+### D-impl-retry Explicit-factory retries only
+Main spec §31 forbids retrying consumed one-shot bodies. Decision: generated methods NEVER retry
+implicitly. Every operation whose request carries streaming content gains a twin
+`<op>_replaying(body_factory, policy)` method that rebuilds the body per attempt via the
+caller-supplied factory. Only PRE-RESPONSE transport failures classified retryable by
+`openapi_support::retry::is_retryable_transport` are retried; once response headers arrive the
+outcome is final. Backoff sleeps between attempts. Idempotency is the caller's responsibility and
+documented on every twin (PUT-style operations are natural fits; POST caution noted).
+
+### D-impl-long-memory-tests Ten-GiB passthrough proofs are ignore-gated
+Main spec §50 tests 5–7 want multi-GiB synthetic passthrough proof. Default suites stay fast, so
+the upload/download/backpressure proofs run as `#[ignore]`-gated conformance tests with
+zero-allocation counting producers (documented invocation:
+`cargo test -p openapi-conformance -- --ignored`). Chunk-count assertions prove laziness; peak
+memory stays flat because producers synthesize bytes arithmetically rather than buffering them.
 full-document decode is what produces the typed representation, and a raw JSON stream would erase
 the type contract instead of relaxing its memory bound.
 

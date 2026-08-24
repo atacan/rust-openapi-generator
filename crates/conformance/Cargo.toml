@@ -22,6 +22,12 @@ reqwest = { workspace = true }
 futures-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Runtime crates of the §45 codec families: referenced by the CODEC-ENABLED
+# fixture-16 artifacts (D-impl-codec-plugins). openapi-support stays
+# dependency-light; these live here and in emitted-manifest metadata only.
+quick-xml = { workspace = true }
+ciborium = { workspace = true }
+rmp-serde = { workspace = true }
 # Referenced by the generated §17 client (`from_file` streams files through
 # tokio-util's ReaderStream); the generated code is included! into this lib.
 tokio = { workspace = true, features = ["fs", "io-util"] }

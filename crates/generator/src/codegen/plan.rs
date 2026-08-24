@@ -20,6 +20,7 @@ use crate::normalize::composition::ResolvedKind;
 use crate::normalize::naming::{self, NameStyle};
 use crate::normalize::{NormalizedDocument, NormalizedOperation};
 
+use super::codecs::{CodecBinding, MediaCodecPlugin};
 use super::validation::{analyze, Analysis};
 
 /// Generator configuration for planning (main spec §29 configured preference
@@ -36,6 +37,10 @@ pub struct PlanConfig {
     /// bodies and reject via `SchemaViolation` 422. Turning it off skips the
     /// CALLS only; validators are still emitted into models.rs.
     pub server_runtime_validation: bool,
+    /// Optional codec families + representation overrides (main spec §5.9,
+    /// §44, §45). Defaults keep every codec OFF and no overrides active, so
+    /// existing documents plan byte-identically.
+    pub generator_options: GeneratorPlanOptions,
 }
 
 impl Default for PlanConfig {
@@ -43,6 +48,79 @@ impl Default for PlanConfig {
         Self {
             accept_preference: Vec::new(),
             server_runtime_validation: true,
+            generator_options: GeneratorPlanOptions::default(),
+        }
+    }
+}
+
+/// Optional-family policy (main spec §5.9/§44/§45,
+/// D-impl-codec-plugins/D-impl-override-precedence): the enabled codec plugin
+/// ids (consulted through [`super::codecs::default_registry`]) plus custom
+/// representation overrides. Per-entry resolution precedence is override >
+/// claiming plugin > default classification.
+#[derive(Debug, Clone, Default)]
+pub struct GeneratorPlanOptions {
+    /// Enabled codec plugin ids (`"xml"`, `"cbor"`, `"msgpack"`); ALL OFF by
+    /// default — without a configured codec, those formats stay raw streaming
+    /// rather than being guessed into an eager representation (§5.9).
+    pub enabled_codecs: BTreeSet<&'static str>,
+    /// Representation overrides applied before codec claims are considered.
+    pub overrides: Vec<RepresentationOverride>,
+}
+
+/// Custom generator representation override (main spec §44): today only
+/// force-streaming exists. Overrides may force raw streaming or restore
+/// defaults; they may never invent a structured representation for an unknown
+/// format (§5.9 forbids guessing codecs).
+#[derive(Debug, Clone)]
+pub enum RepresentationOverride {
+    /// Re-class every matching bounded entry to the raw-streaming family for
+    /// BOTH directions while keeping its media-type literal (and therefore
+    /// runtime matching and the `Accept` contribution) verbatim.
+    ForceStreaming {
+        match_media: MediaTypePattern,
+        match_operation: OperationPattern,
+    },
+}
+
+/// Which media types one override matches (parameter-stripped base literal,
+/// case-insensitive).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaTypePattern {
+    /// Exactly this base literal (`application/json`).
+    Exact(String),
+    /// Any subtype of this type (`text/*`).
+    TypeRange(String),
+    /// Every entry.
+    Any,
+}
+
+impl MediaTypePattern {
+    fn matches(&self, base_literal: &str) -> bool {
+        match self {
+            Self::Exact(exact) => base_literal.eq_ignore_ascii_case(exact),
+            Self::TypeRange(ty) => base_literal
+                .split_once('/')
+                .is_some_and(|(entry_ty, _)| entry_ty.eq_ignore_ascii_case(ty)),
+            Self::Any => true,
+        }
+    }
+}
+
+/// Which operations one override matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperationPattern {
+    /// The operation declaring exactly this `operationId`.
+    OperationId(String),
+    /// Every operation.
+    Any,
+}
+
+impl OperationPattern {
+    fn matches(&self, operation_id: Option<&str>) -> bool {
+        match self {
+            Self::OperationId(id) => operation_id == Some(id.as_str()),
+            Self::Any => true,
         }
     }
 }
@@ -54,6 +132,11 @@ pub struct PlannedApi {
     /// Effective companion §9 policy copied from [`PlanConfig`] so the
     /// server emitter gates its validation calls without extra plumbing.
     pub server_runtime_validation: bool,
+    /// Enabled codec plugin ids copied from [`PlanConfig::generator_options`]
+    /// (main spec §45). Manifest emission stays future work (§3.1), but the
+    /// dependency fragments for these ids are available through
+    /// [`super::codecs::manifest_dependency_for`] for when it lands.
+    pub enabled_codecs: BTreeSet<&'static str>,
 }
 
 /// One operation with every codegen decision precomputed so both emitters
@@ -152,6 +235,13 @@ pub struct PlannedContent {
     /// SchemaViolation 422 — only when [`PlanConfig::server_runtime_validation`]
     /// is on (the default).
     pub body_validation: Option<PlannedBodyValidation>,
+    /// Claiming codec plugin (main spec §45): populated only when a codec is
+    /// enabled in [`PlanConfig::generator_options`], the default class for the
+    /// literal is the raw-streaming fallback (§5.9 — codecs never steal the
+    /// JSON/text/form/streaming families), and no override already forced this
+    /// entry to stream. Both directions then become bounded-collect +
+    /// codec-parse / codec-encode through the fail-fast counting writer.
+    pub codec: Option<CodecBinding>,
 }
 
 /// Wire framing of one streaming record entry (main spec §5.6–§5.8).
@@ -305,15 +395,20 @@ pub fn plan_api_with_config(
 ) -> Result<PlannedApi, Vec<Diagnostic>> {
     let mut diags = Diagnostics::new();
     let analysis = analyze(doc);
+    // Built-in plugin registry; consulted ONLY for enabled ids. Declaration
+    // order is the claim precedence when several enabled plugins handle one
+    // literal.
+    let registry = super::codecs::default_registry();
     let mut operations = Vec::with_capacity(doc.operations.len());
     for operation in &doc.operations {
         operations.push(plan_operation(
-            doc, operation, config, &analysis, &mut diags,
+            doc, operation, config, &registry, &analysis, &mut diags,
         ));
     }
     diags.into_result(PlannedApi {
         operations,
         server_runtime_validation: config.server_runtime_validation,
+        enabled_codecs: config.generator_options.enabled_codecs.clone(),
     })
 }
 
@@ -321,6 +416,7 @@ fn plan_operation(
     doc: &NormalizedDocument,
     operation: &NormalizedOperation,
     config: &PlanConfig,
+    registry: &[Box<dyn MediaCodecPlugin>],
     analysis: &Analysis,
     diags: &mut Diagnostics,
 ) -> PlannedOperation {
@@ -337,10 +433,13 @@ fn plan_operation(
         request_body_required = body.required;
         request_contents = plan_contents(
             doc,
+            operation.operation_id.as_deref(),
             &location,
             &body.content,
             diags,
             ContentSide::Request,
+            config,
+            registry,
             analysis,
         );
         if request_contents.len() >= 2 {
@@ -362,10 +461,13 @@ fn plan_operation(
         .map(|(index, response)| {
             let contents = plan_contents(
                 doc,
+                operation.operation_id.as_deref(),
                 &location,
                 &response.content,
                 diags,
                 ContentSide::Response,
+                config,
+                registry,
                 analysis,
             );
             let headers = plan_response_headers(doc, response, operation.method, &location, diags);
@@ -557,12 +659,23 @@ enum ContentSide {
 /// (SSE/NDJSON/JSON-seq, §5.6–§5.8) in BOTH directions; everything else
 /// stop-and-reports (response-side forms/multipart are later-phase
 /// deliverables, main spec §52).
+///
+/// Representation resolution per entry (D-impl-override-precedence): custom
+/// override > claiming codec plugin > default classification. Overrides may
+/// force raw streaming (any bounded class → streaming wrapper, literal and
+/// `Accept` contribution kept verbatim); codecs claim ONLY entries whose
+/// default class is the §5.9 raw fallback — they never steal JSON/text/form/
+/// multipart/streaming families.
+#[allow(clippy::too_many_arguments)]
 fn plan_contents(
     doc: &NormalizedDocument,
+    operation_id: Option<&str>,
     location: &DocumentPath,
     contents: &[ContentEntryIr],
     diags: &mut Diagnostics,
     side: ContentSide,
+    config: &PlanConfig,
+    registry: &[Box<dyn MediaCodecPlugin>],
     analysis: &Analysis,
 ) -> Vec<PlannedContent> {
     let mut planned = Vec::with_capacity(contents.len());
@@ -601,13 +714,53 @@ fn plan_contents(
         // turns a bounded plain-text entry into the raw streaming family for
         // BOTH directions; the literal (and therefore runtime matching,
         // Accept, and the TextPlain variant name) stays verbatim.
-        let effective_class = if entry.stream_override && entry.media_class == MediaClass::PlainText
-        {
-            MediaClass::Binary
-        } else {
-            entry.media_class
-        };
+        let mut effective_class =
+            if entry.stream_override && entry.media_class == MediaClass::PlainText {
+                MediaClass::Binary
+            } else {
+                entry.media_class
+            };
+        // Generator-side ForceStreaming override (§44/D-impl-override-
+        // precedence): re-class any BOUNDED entry to the raw-streaming family.
+        // Streaming-record classes already stream; wildcard entries are raw by
+        // definition; multipart framing cannot stream-force — all stay put.
+        // The override wins over codec claims, so it also suppresses them.
         let base_literal = base_media_literal(&entry.media_type);
+        let force_streaming = !entry.is_wildcard
+            && config
+                .generator_options
+                .overrides
+                .iter()
+                .any(|candidate| match candidate {
+                    RepresentationOverride::ForceStreaming {
+                        match_media,
+                        match_operation,
+                    } => {
+                        match_operation.matches(operation_id) && match_media.matches(&base_literal)
+                    }
+                });
+        if force_streaming
+            && matches!(
+                effective_class,
+                MediaClass::JsonFamily | MediaClass::PlainText | MediaClass::UrlEncodedForm
+            )
+        {
+            effective_class = MediaClass::Binary;
+        }
+        let claimed = if force_streaming {
+            None
+        } else {
+            codec_claim(
+                doc,
+                entry,
+                effective_class,
+                &base_literal,
+                config,
+                registry,
+                location,
+                diags,
+            )
+        };
         let variant_base = content_variant_base(&base_literal, entry.is_wildcard);
         let variant = unique_variant(&variant_base, &mut used_variants);
         let mut multipart_spec = None;
@@ -638,28 +791,23 @@ fn plan_contents(
             }
             // Binary/RawUnknown/stream classes; each emitter renders its own
             // payload type from [`MediaClass`] or [`PlannedContent::stream`].
+            // Codec-claimed entries carry the shared models.rs path on their
+            // [`CodecBinding`] instead.
             _ => String::new(),
         };
         // Constrained scalar aliases carry their models.rs free validator
         // (companion §9); named composite payloads validate through their
         // inherent `validate_request`. Anonymous shapes never validate:
         // inline scalars have no validator to call (documented leniency),
-        // and anonymous composites are plan-time Errors anyway.
+        // and anonymous composites are plan-time Errors anyway. Codec
+        // entries resolve the SAME models.rs types as JsonFamily, so they
+        // participate identically.
         let body_validation = match effective_class {
             MediaClass::JsonFamily | MediaClass::UrlEncodedForm | MediaClass::PlainText => {
-                let effective = doc.resolve_alias(entry.schema);
-                match analysis.scalar_alias(effective) {
-                    Some(alias) => Some(PlannedBodyValidation::ScalarFn(alias.fn_name.clone())),
-                    None if matches!(
-                        entry.media_class,
-                        MediaClass::JsonFamily | MediaClass::UrlEncodedForm
-                    ) && analysis.has_validator(effective)
-                        && component_name(doc, effective).is_some() =>
-                    {
-                        Some(PlannedBodyValidation::Inherent)
-                    }
-                    None => None,
-                }
+                validation_for(doc, entry.schema, entry.media_class, false, analysis)
+            }
+            _ if claimed.is_some() => {
+                validation_for(doc, entry.schema, entry.media_class, true, analysis)
             }
             _ => None,
         };
@@ -672,9 +820,75 @@ fn plan_contents(
             multipart_spec,
             stream,
             body_validation,
+            codec: claimed,
         });
     }
     planned
+}
+
+/// Companion §9 validator resolution shared by the textual classes and
+/// codec-claimed entries: constrained scalar aliases call their free
+/// validators; nominal composites call the inherent `validate_request`.
+/// Codec entries resolve the SAME models.rs types as the JSON family, so the
+/// identical predicate applies once they are claimed.
+fn validation_for(
+    doc: &NormalizedDocument,
+    schema: SchemaId,
+    media_class: MediaClass,
+    codec_claimed: bool,
+    analysis: &Analysis,
+) -> Option<PlannedBodyValidation> {
+    let effective = doc.resolve_alias(schema);
+    match analysis.scalar_alias(effective) {
+        Some(alias) => Some(PlannedBodyValidation::ScalarFn(alias.fn_name.clone())),
+        None if codec_claimed
+            || matches!(
+                media_class,
+                MediaClass::JsonFamily | MediaClass::UrlEncodedForm
+            ) =>
+        {
+            analysis
+                .has_validator(effective)
+                .then_some(PlannedBodyValidation::Inherent)
+                .filter(|_| component_name(doc, effective).is_some())
+        }
+        None => None,
+    }
+}
+
+/// §45 codec claim (D-impl-codec-plugins): an ENABLED plugin takes over an
+/// entry only when the default classification left it in the §5.9 raw
+/// fallback (unclassified/wildcard-free RawUnknown) — codecs never steal the
+/// JSON/text/form/multipart/streaming families. First enabled handler in
+/// registry order wins; the model path resolves through the SAME pipeline as
+/// the JSON family so both share models.rs types and Serde derives.
+#[allow(clippy::too_many_arguments)]
+fn codec_claim(
+    doc: &NormalizedDocument,
+    entry: &ContentEntryIr,
+    effective_class: MediaClass,
+    base_literal: &str,
+    config: &PlanConfig,
+    registry: &[Box<dyn MediaCodecPlugin>],
+    location: &DocumentPath,
+    diags: &mut Diagnostics,
+) -> Option<CodecBinding> {
+    if effective_class != MediaClass::RawUnknown || entry.is_wildcard {
+        return None;
+    }
+    let plugin = registry.iter().find(|candidate| {
+        config
+            .generator_options
+            .enabled_codecs
+            .contains(&candidate.id())
+            && candidate.handles(base_literal)
+    })?;
+    Some(CodecBinding {
+        plugin_id: plugin.id(),
+        model_path: json_model_expr(doc, entry.schema, location, diags),
+        runtime_crate: plugin.runtime_crate(),
+        feature_note: plugin.feature_note(),
+    })
 }
 
 // ----------------------------------------------------------------------

@@ -12,6 +12,7 @@
 //! so the tree is stable for parallel work packages.
 
 pub mod client;
+pub mod codecs;
 pub mod models;
 pub mod plan;
 pub mod server;
@@ -55,8 +56,33 @@ impl Emitter {
         }
     }
 
+    /// Appends a multi-line plugin fragment, indenting every line.
+    pub(crate) fn block(&mut self, indent: usize, text: &str) {
+        for fragment_line in text.split('\n') {
+            self.line(indent, fragment_line);
+        }
+    }
+
     /// Consumes the emitter into the accumulated source text.
     pub(crate) fn finish(self) -> String {
         self.out
+    }
+}
+
+/// Sort key mirroring rustfmt's `reorder_imports`: keyword paths
+/// (`super::models`) come first, everything else orders by its full
+/// normalized path. The emitters already emit exactly this order for
+/// default-config documents (verified by the committed snapshot suites), so
+/// the stable sort never moves their lines and only slots codec use-lines
+/// into place (main spec §45).
+pub(crate) fn import_sort_key(line: &str) -> (u8, String) {
+    let rest = line.strip_prefix("use ").unwrap_or(line);
+    let rest = rest.strip_prefix("::").unwrap_or(rest);
+    let rest = rest.trim_end_matches(';');
+    let first = rest.split("::").next().unwrap_or("");
+    if matches!(first, "super" | "self" | "crate") {
+        (0_u8, first.to_owned())
+    } else {
+        (1_u8, rest.to_owned())
     }
 }

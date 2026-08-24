@@ -124,6 +124,28 @@ where
     Ok(Bytes::from(form.writer.into_inner()))
 }
 
+/// Serializes one value through a caller-supplied codec writer callback,
+/// enforcing `limit` fail-fast during serialization (section 34).
+///
+/// Shared by the optional media-codec families (main spec §45,
+/// DECISIONS.md D-impl-codec-plugins): every byte the codec emits passes
+/// through [`CountingWriter`], so an oversized document aborts before
+/// completion and no partial output escapes on error. The callback owns the
+/// codec-specific serializer (XML, CBOR, MessagePack, …) and must surface any
+/// codec failure as an `io::Error`; like the JSON path, ANY failure maps onto
+/// [`EncodeTooLarge`].
+pub fn serialize_with_writer_limited<F>(limit: usize, encode: F) -> Result<Bytes, EncodeTooLarge>
+where
+    F: FnOnce(&mut CountingWriter<Vec<u8>>) -> io::Result<()>,
+{
+    let mut writer = CountingWriter::new(
+        Vec::with_capacity(limit.min(INITIAL_ENCODE_CAPACITY)),
+        limit,
+    );
+    encode(&mut writer).map_err(|_| EncodeTooLarge { limit })?;
+    Ok(Bytes::from(writer.into_inner()))
+}
+
 /// Serializes `value` as JSON framed by fixed prefix/suffix byte runs, all
 /// counted against `limit`.
 ///
@@ -775,6 +797,36 @@ mod tests {
         );
         let decoded: Widget = serde_json::from_slice(&bytes).expect("round trip");
         assert_eq!(decoded, widget);
+    }
+
+    #[test]
+    fn writer_limited_round_trips_and_enforces_the_limit_fail_fast() {
+        let widget = Widget {
+            name: "gear".to_owned(),
+            count: 7,
+            tags: vec![],
+            note: None,
+        };
+        let bytes = serialize_with_writer_limited(1024, |writer| {
+            serde_json::to_writer(writer, &widget).map_err(io::Error::other)
+        })
+        .expect("under limit");
+        assert_eq!(
+            bytes.as_ref(),
+            br#"{"name":"gear","count":7,"tags":[],"note":null}"#
+        );
+
+        let error = serialize_with_writer_limited(8, |writer| {
+            serde_json::to_writer(writer, &oversized_widget(64)).map_err(io::Error::other)
+        })
+        .expect_err("over limit");
+        assert_eq!(error, EncodeTooLarge { limit: 8 });
+
+        // A codec callback that fails for NON-size reasons maps onto
+        // EncodeTooLarge as well (no partial output escapes either way).
+        let error = serialize_with_writer_limited(1024, |_| Err(io::Error::other("codec")))
+            .expect_err("codec failure");
+        assert_eq!(error, EncodeTooLarge { limit: 1024 });
     }
 
     #[test]

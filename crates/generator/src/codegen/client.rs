@@ -31,6 +31,7 @@ use crate::ir::document::{
 use crate::normalize::naming;
 use crate::normalize::NormalizedDocument;
 
+use super::codecs::{default_registry as codec_registry, helper_prefix};
 use super::plan::{
     PlannedApi, PlannedContent, PlannedMultipart, PlannedMultipartField, PlannedMultipartFieldKind,
     PlannedOperation, PlannedParameter, PlannedStatus, StreamFraming,
@@ -214,10 +215,11 @@ fn wrapper_name(status: &PlannedStatus) -> Option<String> {
         return None;
     };
     if content.is_wildcard
-        || matches!(
-            content.media_class,
-            MediaClass::Binary | MediaClass::RawUnknown
-        )
+        || (content.codec.is_none()
+            && matches!(
+                content.media_class,
+                MediaClass::Binary | MediaClass::RawUnknown
+            ))
     {
         // Streaming/wildcard payloads keep the Phase 1 wrapper shape unless
         // a range/default needs its inline struct variant for headers.
@@ -278,6 +280,14 @@ struct Flags {
     /// A multipart request body exists somewhere (main spec §17): pulls in
     /// the `reqwest::multipart` form builder plus the per-part mime helper.
     needs_multipart: bool,
+    /// Codec plugin ids whose DECODE helper is referenced somewhere (main
+    /// spec §45 response entries): pulls in the codec's use lines plus its
+    /// generated decode helper.
+    decode_codecs: BTreeSet<String>,
+    /// Codec plugin ids whose ENCODE helper is referenced somewhere (§45/§34.2
+    /// request entries): pulls in the codec's use lines plus its generated
+    /// encode helper.
+    encode_codecs: BTreeSet<String>,
     /// Streaming record classes used by RESPONSE entries somewhere: pulls in
     /// the per-framing support decoder + decode-error import pair.
     response_framings: BTreeSet<StreamFraming>,
@@ -310,6 +320,16 @@ impl Flags {
     }
 
     fn scan_request_content(&mut self, content: &PlannedContent) {
+        if let Some(binding) = &content.codec {
+            // §45 codec-claimed request entry: bounded encode through the
+            // generated per-codec helper (§34.2 pre-send guarantee), typed
+            // `&T`/owned parameter like the JSON family.
+            self.encode_codecs.insert(binding.plugin_id.to_owned());
+            self.needs_body_limit_direction = true;
+            self.model_types
+                .extend(model_type_names(&binding.model_path));
+            return;
+        }
         match content.media_class {
             MediaClass::JsonFamily => {
                 self.needs_serialize_json = true;
@@ -381,7 +401,13 @@ impl Flags {
             )
         });
         let negotiated = status.contents.len() >= 2;
-        if textual || negotiated {
+        let codec_bound = status
+            .contents
+            .iter()
+            .any(|content| content.codec.is_some());
+        // Codec-bound entries negotiate through the same Content-Type gate as
+        // the textual classes (§28), so they pull the helpers in too.
+        if textual || negotiated || codec_bound {
             self.needs_content_type_helpers = true;
         }
         if textual {
@@ -389,6 +415,13 @@ impl Flags {
             self.needs_collect = true;
         }
         for content in &status.contents {
+            if let Some(binding) = &content.codec {
+                self.decode_codecs.insert(binding.plugin_id.to_owned());
+                self.model_types
+                    .extend(model_type_names(&binding.model_path));
+                self.needs_collect = true;
+                continue;
+            }
             match content.media_class {
                 MediaClass::JsonFamily => {
                     self.model_types
@@ -585,10 +618,37 @@ fn emit_header(emitter: &mut Emitter, doc: &NormalizedDocument, flags: &Flags) {
     if flags.needs_multipart {
         imports.push("use ::reqwest::multipart::{Form, Part};".to_owned());
     }
+    // §45 codec families: their use lines slot into rustfmt's canonical
+    // crate-sorted position (stable sort keeps every existing line in place).
+    let mut codec_ids: Vec<String> = flags
+        .decode_codecs
+        .union(&flags.encode_codecs)
+        .cloned()
+        .collect();
+    codec_ids.sort();
+    let registry = codec_registry();
+    let mut plugin_lines = Vec::new();
+    for id in &codec_ids {
+        if let Some(plugin) = registry.iter().find(|plugin| plugin.id() == id.as_str()) {
+            plugin_lines.extend(plugin.emitted_use_lines());
+        }
+    }
+    imports.extend(plugin_lines);
+    imports.sort_by_key(|line| super::import_sort_key(line));
 
     for import in &imports {
         emitter.line(0, import);
     }
+}
+
+/// Generated bounded-encode helper name for a codec-claimed entry
+/// (`<prefix>_encode_limited`, shared with the module helper emission).
+fn codec_encode_helper(content: &PlannedContent) -> String {
+    content
+        .codec
+        .as_ref()
+        .map(|binding| format!("{}_encode_limited", helper_prefix(binding.plugin_id)))
+        .expect("codec-bound entry")
 }
 
 fn emit_client(emitter: &mut Emitter, bases: &BaseSet) {
@@ -1365,6 +1425,9 @@ fn request_payload_type(
     op_index: usize,
     content_index: usize,
 ) -> String {
+    if let Some(binding) = &content.codec {
+        return binding.model_path.clone();
+    }
     match content.media_class {
         MediaClass::JsonFamily | MediaClass::UrlEncodedForm => content.model_expr.clone(),
         MediaClass::PlainText => "String".to_owned(),
@@ -1645,6 +1708,9 @@ fn emit_content_enum(
 /// `reqwest::Response` for streaming classes (§32), and the decoding
 /// `<…>Stream` wrapper for the record-framed classes (§18–§20 Output A).
 fn response_payload_type(content: &PlannedContent, stream_wrapper: Option<&str>) -> String {
+    if let Some(binding) = &content.codec {
+        return binding.model_path.clone();
+    }
     match content.media_class {
         MediaClass::JsonFamily => content.model_expr.clone(),
         MediaClass::PlainText => "String".to_owned(),
@@ -1712,6 +1778,41 @@ fn emit_stream_wrapper_literal_fields(
     emitter.line(indent + 1, "response,");
     emitter.line(indent + 1, "limits: self.limits,");
     emitter.line(indent, "}},");
+}
+
+/// Emits the rustfmt-canonical EXPRESSION arm for an explicit-status §32
+/// streaming wrapper WITHOUT documented headers (`PATTERN => Ok(Enum::
+/// Variant(Wrapper { response })),`), breaking vertically only when the head
+/// exceeds the width budget (same layouts as [`emit_stream_wrapper_arm`]).
+fn emit_plain_wrapper_arm(
+    emitter: &mut Emitter,
+    indent: usize,
+    pattern: &str,
+    operation: &PlannedOperation,
+    status: &PlannedStatus,
+    wrapper: &str,
+) {
+    let enum_name = &operation.response_enum_name;
+    let variant = &status.enum_variant;
+    // Tier 1: the whole expression fits on the arm line.
+    let single = format!("{pattern} Ok({enum_name}::{variant}({wrapper} {{ response }})),");
+    if fits(indent, &single) {
+        emitter.line(indent, &single);
+        return;
+    }
+    // Tier 2: enum path stays on the arm line, struct fields go vertical.
+    let head_a = format!("{pattern} Ok({enum_name}::{variant}({wrapper} {{");
+    if fits(indent, &head_a) {
+        emitter.line(indent, &head_a);
+        emitter.line(indent + 1, "response,");
+        emitter.line(indent, "})),");
+        return;
+    }
+    // Tier 3: even the head overflows; rustfmt stabilizes on dropping the
+    // wrapper literal onto a single-line continuation argument.
+    emitter.line(indent, &format!("{pattern} Ok({enum_name}::{variant}("));
+    emitter.line(indent + 1, &format!("{wrapper} {{ response }},"));
+    emitter.line(indent, ")),");
 }
 
 /// Emits one `<Op><Status>[<Variant>]Stream` wrapper plus its incremental
@@ -2267,6 +2368,10 @@ fn request_parameter_type(
     op_index: usize,
     content_index: usize,
 ) -> String {
+    // §45 codec entries borrow the shared model like the JSON family.
+    if let Some(binding) = &content.codec {
+        return format!("&{}", binding.model_path);
+    }
     match content.media_class {
         MediaClass::JsonFamily | MediaClass::UrlEncodedForm => {
             format!("&{}", content.model_expr)
@@ -2567,7 +2672,17 @@ fn emit_request_construction(
 
     // Single-content JSON/text bodies serialize BEFORE the send so an encode
     // overflow returns `BodyTooLarge` without any wire traffic (§34.2).
+    // Codec-claimed bodies take the same pre-send shape through their
+    // generated bounded helper (§45).
     match operation.request_contents.as_slice() {
+        [content] if content.codec.is_some() => {
+            flags.needs_body_limit_direction = true;
+            if operation.request_body_required && !content.is_wildcard {
+                flags.needs_encode_overflow = true;
+                let helper = codec_encode_helper(content);
+                emit_bounded_encode(emitter, 2, "body", &helper);
+            }
+        }
         [content] if content.media_class == MediaClass::JsonFamily => {
             flags.needs_serialize_json = true;
             flags.needs_body_limit_direction = true;
@@ -2680,6 +2795,7 @@ fn emit_request_construction(
             let payload_expr = match content.media_class {
                 MediaClass::JsonFamily | MediaClass::UrlEncodedForm => "payload",
                 MediaClass::PlainText => "body.to_owned()",
+                _ if content.codec.is_some() => "payload",
                 _ => "body",
             };
             emitter.line(3, &format!(".body({payload_expr})"));
@@ -2837,6 +2953,14 @@ fn emit_single_request_body(
     required: bool,
     flags: &mut Flags,
 ) {
+    // §45 codec bodies serialize bounded through the generated per-codec
+    // helper exactly where the JSON family binds its payload (§34.2).
+    if content.codec.is_some() && !required && !content.is_wildcard {
+        flags.needs_body_limit_direction = true;
+        flags.needs_encode_overflow = true;
+        let helper = codec_encode_helper(content);
+        emit_bounded_encode(emitter, indent, "body", &helper);
+    }
     match content.media_class {
         MediaClass::JsonFamily if !required => {
             flags.needs_serialize_json = true;
@@ -2860,6 +2984,16 @@ fn emit_single_request_body(
     emitter.line(indent, "request = request");
     match content.media_class {
         MediaClass::JsonFamily | MediaClass::UrlEncodedForm => {
+            emitter.line(
+                indent + 1,
+                &format!(
+                    ".header(::http::header::CONTENT_TYPE, {})",
+                    rust_string_literal(&content.media_type_literal)
+                ),
+            );
+            emitter.line(indent + 1, ".body(payload);");
+        }
+        _ if content.codec.is_some() => {
             emitter.line(
                 indent + 1,
                 &format!(
@@ -2909,6 +3043,24 @@ fn emit_request_enum_arm(
     indent: usize,
 ) {
     let variant = format!("{enum_name}::{}", content.variant_name);
+    // §45 codec variant: bounded encode through the generated helper, then
+    // the same header/body chain shape as the JSON arm (§34.2).
+    if content.codec.is_some() && !content.is_wildcard {
+        let helper = codec_encode_helper(content);
+        emitter.line(indent, &format!("{variant}(value) => {{"));
+        emit_bounded_encode(emitter, indent + 1, "&value", &helper);
+        emitter.line(indent + 1, "request");
+        emitter.line(
+            indent + 2,
+            &format!(
+                ".header(::http::header::CONTENT_TYPE, {})",
+                rust_string_literal(&content.media_type_literal)
+            ),
+        );
+        emitter.line(indent + 2, ".body(payload)");
+        emitter.line(indent, "}");
+        return;
+    }
     match content.media_class {
         MediaClass::JsonFamily => {
             flags.needs_serialize_json = true;
@@ -3250,10 +3402,12 @@ fn emit_status_arm(
             );
             return;
         }
-        if matches!(
-            content.media_class,
-            MediaClass::Binary | MediaClass::RawUnknown
-        ) {
+        if content.codec.is_none()
+            && matches!(
+                content.media_class,
+                MediaClass::Binary | MediaClass::RawUnknown
+            )
+        {
             if has_headers {
                 // Typed headers are read BEFORE handing the raw response to
                 // the wrapper (main spec §15).
@@ -3272,16 +3426,36 @@ fn emit_status_arm(
                 emitter.line(3, "}");
                 return;
             }
-            emit_simple_arm(
+            if struct_variant_status(status) {
+                // Range/default struct variants carry the wire status beside
+                // the wrapper (§23–§24).
+                emit_simple_arm(
+                    emitter,
+                    3,
+                    &pattern,
+                    op_index,
+                    operation,
+                    status,
+                    status_index,
+                    layout,
+                    BodyExpr::Wrapper,
+                );
+                return;
+            }
+            // rustfmt collapses single-expression block arms, so the
+            // explicit-status wrapper result is emitted directly in canonical
+            // expression form (same rule as the stream-wrapper arms).
+            emit_plain_wrapper_arm(
                 emitter,
                 3,
                 &pattern,
-                op_index,
                 operation,
                 status,
-                status_index,
-                layout,
-                BodyExpr::Wrapper,
+                layout
+                    .wrappers
+                    .get(&(op_index, status_index))
+                    .map(String::as_str)
+                    .unwrap_or_else(|| panic!("wrapper missing for {}", status.enum_variant)),
             );
             return;
         }
@@ -3797,6 +3971,26 @@ fn emit_collect_and_decode(
     let inner = indent + 1;
     let inner2 = indent + 2;
     flags.needs_collect = true;
+    if let Some(binding) = &content.codec {
+        // §45: bounded collect FIRST, then the codec parse from the bounded
+        // bytes (D-impl-codec-plugins). Binary formats carry no charset
+        // parameters and empty bodies surface as codec decode errors.
+        emitter.line(indent, &format!("let limit = {limit_expr};"));
+        emitter.line(
+            indent,
+            "let bytes = collect_reqwest_limited(response, limit).await?;",
+        );
+        let helper = format!("{}_decode_typed", helper_prefix(binding.plugin_id));
+        let model = &binding.model_path;
+        let decode_line = format!("let value: {model} = {helper}(&bytes, Some(content_type))?;");
+        if fits(indent, &decode_line) {
+            emitter.line(indent, &decode_line);
+        } else {
+            emitter.line(indent, &format!("let value: {model} ="));
+            emitter.line(inner, &format!("{helper}(&bytes, Some(content_type))?;"));
+        }
+        return;
+    }
     if matches!(
         content.media_class,
         MediaClass::JsonFamily | MediaClass::PlainText
@@ -3886,7 +4080,18 @@ fn emit_negotiated_arm_body(
     for (index, content) in status.contents.iter().enumerate() {
         emitter.line(5, &format!("Some({index}) => {{"));
         match content.media_class {
-            MediaClass::JsonFamily | MediaClass::PlainText => {
+            MediaClass::JsonFamily | MediaClass::PlainText if content.codec.is_none() => {
+                emit_collect_and_decode(emitter, 6, content, flags, limit_expr);
+                emit_negotiated_result(
+                    emitter,
+                    6,
+                    operation,
+                    status,
+                    content_enum,
+                    &format!("{}(value)", content.variant_name),
+                );
+            }
+            _ if content.codec.is_some() => {
                 emit_collect_and_decode(emitter, 6, content, flags, limit_expr);
                 emit_negotiated_result(
                     emitter,
@@ -3987,6 +4192,9 @@ fn emit_wrapper_fields_opt(emitter: &mut Emitter, indent: usize, status: &Planne
 // ----------------------------------------------------------------------
 
 fn emit_module_helpers(emitter: &mut Emitter, flags: &Flags, has_variables: bool) {
+    // §45 codec helpers precede everything else so operation bodies reference
+    // generated, rustfmt-canonical call targets instead of inline fragments.
+    emit_codec_helpers(emitter, flags);
     // §40 response-direction classifiers precede everything else so each
     // `<Op><Status>Stream` adapter can wrap its decoder.
     if !flags.response_framings.is_empty() {
@@ -4478,6 +4686,134 @@ fn emit_module_helpers(emitter: &mut Emitter, flags: &Flags, has_variables: bool
     );
     emitter.line(2, "})");
     emitter.line(2, "&& !rest.is_empty()");
+    emitter.line(0, "}");
+}
+
+/// Emits the per-codec bounded-encode/typed-decode helpers (main spec §45)
+/// composed from the plugin fragments, plus the XML fmt-sink adapter. One
+/// helper pair per codec actually referenced on this side keeps `-D warnings`
+/// clean.
+fn emit_codec_helpers(emitter: &mut Emitter, flags: &Flags) {
+    if flags.encode_codecs.is_empty() && flags.decode_codecs.is_empty() {
+        return;
+    }
+    let registry = codec_registry();
+    let mut ids: Vec<&String> = flags.decode_codecs.union(&flags.encode_codecs).collect();
+    ids.sort();
+    let mut xml_sink_emitted = false;
+    for id in ids {
+        let Some(plugin) = registry.iter().find(|plugin| plugin.id() == id.as_str()) else {
+            continue;
+        };
+        let prefix = helper_prefix(plugin.id());
+        let encodes = flags.encode_codecs.contains(id.as_str());
+        let decodes = flags.decode_codecs.contains(id.as_str());
+        if plugin.id() == "xml" && encodes && !xml_sink_emitted {
+            emitter.blank();
+            emit_xml_fmt_sink(emitter);
+            xml_sink_emitted = true;
+        }
+        if encodes {
+            emitter.blank();
+            emitter.docs(
+                0,
+                &[
+                    format!(
+                        "Bounded `{}` request serialization (main spec §45/§34): \
+                         bytes stream through the fail-fast counting writer, so \
+                         an oversized document returns `BodyTooLarge` before any \
+                         wire traffic and no partial output escapes.",
+                        plugin.id()
+                    ),
+                    format!("{}.", plugin.feature_note()),
+                ],
+            );
+            let encode_return = "Result<::bytes::Bytes, ::openapi_support::encode::EncodeTooLarge>";
+            let encode_inline = format!(
+                "fn {prefix}_encode_limited<T>(value: &T, limit: usize) -> {encode_return}"
+            );
+            // Single-statement codec bodies would trip clippy's
+            // let_and_return on the trailing `encoded`; the allow keeps one
+            // uniform helper shape across codecs.
+            if fits(0, &encode_inline) {
+                emitter.line(0, "#[allow(clippy::let_and_return)]");
+                emitter.line(0, &encode_inline);
+            } else {
+                emitter.line(0, "#[allow(clippy::let_and_return)]");
+                emitter.line(0, &format!("fn {prefix}_encode_limited<T>("));
+                emitter.line(1, "value: &T,");
+                emitter.line(1, "limit: usize,");
+                emitter.line(0, &format!(") -> {encode_return}"));
+            }
+            emitter.line(0, "where");
+            emitter.line(1, "T: serde::Serialize,");
+            emitter.line(0, "{");
+            emitter.block(1, &plugin.client_encode_stmts("value", "limit", "encoded"));
+            emitter.line(1, "encoded");
+            emitter.line(0, "}");
+        }
+        if decodes {
+            emitter.blank();
+            emitter.docs(
+                0,
+                &[
+                    format!(
+                        "Typed `{}` response decode from ALREADY-bounded bytes \
+                         (main spec §45): any codec failure maps onto \
+                         `ClientError::Decode` with the negotiated content type.",
+                        plugin.id()
+                    ),
+                    "The schema/data distinction is not portable across codecs; \
+                     all decode failures surface as decode errors."
+                        .to_owned(),
+                    format!("{}.", plugin.feature_note()),
+                ],
+            );
+            let decode_inline = format!(
+                "fn {prefix}_decode_typed<T>(bytes: &[u8], content_type: \
+                 Option<::mime::Mime>) -> Result<T, ClientError>"
+            )
+            .replace(" \\", "");
+            if fits(0, &decode_inline) {
+                emitter.line(0, "#[allow(clippy::missing_errors_doc)]");
+                emitter.line(0, &decode_inline);
+            } else {
+                emitter.block(
+                    0,
+                    &format!(
+                        "#[allow(clippy::missing_errors_doc)]\nfn {prefix}_decode_typed<T>(\n    bytes: &[u8],\n    content_type: Option<::mime::Mime>,\n) -> Result<T, ClientError>"
+                    ),
+                );
+            }
+            emitter.line(0, "where");
+            emitter.line(1, "T: serde::de::DeserializeOwned,");
+            emitter.line(0, "{");
+            emitter.block(1, &plugin.client_decode_expr("bytes", "T"));
+            emitter.line(0, "}");
+        }
+    }
+}
+
+/// Adapts the byte-oriented counting writer to quick-xml's text-oriented
+/// serializer target; XML output is UTF-8 text, so the conversion never loses
+/// bytes.
+fn emit_xml_fmt_sink(emitter: &mut Emitter) {
+    emitter.line(0, "struct XmlFmtSink<'a, W>(&'a mut W);");
+    emitter.blank();
+    emitter.line(
+        0,
+        "impl<W: ::std::io::Write> ::std::fmt::Write for XmlFmtSink<'_, W> {",
+    );
+    emitter.line(
+        1,
+        "fn write_str(&mut self, text: &str) -> ::std::fmt::Result {",
+    );
+    // The chain exceeds rustfmt's chain_width, so the canonical form breaks
+    // after the receiver.
+    emitter.line(2, "self.0");
+    emitter.line(3, ".write_all(text.as_bytes())");
+    emitter.line(3, ".map_err(|_| ::std::fmt::Error)");
+    emitter.line(1, "}");
     emitter.line(0, "}");
 }
 

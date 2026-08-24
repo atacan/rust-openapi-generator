@@ -24,6 +24,7 @@ use crate::ir::document::{
 use crate::normalize::naming::{self, NameStyle};
 use crate::normalize::NormalizedDocument;
 
+use super::codecs::{default_registry as codec_registry, helper_prefix};
 use super::plan::{
     PlannedApi, PlannedBodyValidation, PlannedContent, PlannedMultipartFieldKind, PlannedOperation,
     PlannedParameter, PlannedStatus, StreamFraming,
@@ -62,6 +63,7 @@ pub fn generate_server(doc: &NormalizedDocument, plan: &PlannedApi) -> String {
         || flags.needs_encode_text
         || flags.needs_stream_response
         || flags.needs_any_response
+        || !flags.encode_codecs.is_empty()
         || plan.operations.iter().any(|operation| {
             operation
                 .statuses
@@ -84,7 +86,8 @@ pub fn generate_server(doc: &NormalizedDocument, plan: &PlannedApi) -> String {
         || flags.needs_charset_check
         || flags.needs_cookie_decode
         || flags.needs_multipart
-        || !flags.request_framings.is_empty();
+        || !flags.request_framings.is_empty()
+        || !flags.decode_codecs.is_empty();
     // Companion §9: the shared 422 constructor exists only with call sites.
     flags.needs_request_schema_violation = plan.server_runtime_validation
         && plan.operations.iter().any(|operation| {
@@ -420,6 +423,15 @@ fn wrapper_shape(status: &PlannedStatus) -> Option<WrapperShape> {
         };
     }
     match content.media_class {
+        // Codec-claimed entries (§45) are decodable: they follow the typed
+        // §15 header-wrapper logic instead of owning the raw response.
+        MediaClass::Binary | MediaClass::RawUnknown if content.codec.is_some() => {
+            if !status.headers.is_empty() && !struct_variant_status(status) {
+                Some(WrapperShape::TypedHeaders)
+            } else {
+                None
+            }
+        }
         MediaClass::Binary | MediaClass::RawUnknown => {
             if status.headers.is_empty() || !struct_variant_status(status) {
                 Some(WrapperShape::Stream)
@@ -469,13 +481,15 @@ fn struct_variant_status(status: &PlannedStatus) -> bool {
 
 /// Structured entries bound-collect and decode; streaming/wildcard entries
 /// pass the body through untouched. Form bodies decode through the bounded
-/// support decoder (§16).
+/// support decoder (§16); codec-claimed entries (§45) bound-collect then
+/// parse through their generated per-codec helper.
 fn is_decodable_content(content: &PlannedContent) -> bool {
     !content.is_wildcard
-        && matches!(
-            content.media_class,
-            MediaClass::JsonFamily | MediaClass::PlainText | MediaClass::UrlEncodedForm
-        )
+        && (content.codec.is_some()
+            || matches!(
+                content.media_class,
+                MediaClass::JsonFamily | MediaClass::PlainText | MediaClass::UrlEncodedForm
+            ))
 }
 
 // ----------------------------------------------------------------------
@@ -544,6 +558,14 @@ struct Flags {
     /// the per-framing decoder + decode-error pair and the typed input
     /// wrappers (D-impl-request-direction-streams).
     request_framings: BTreeSet<StreamFraming>,
+    /// Codec plugin ids whose REQUEST decode helper is referenced somewhere
+    /// (main spec §45): pulls in the codec's use lines plus its generated
+    /// bounded decode helper.
+    decode_codecs: BTreeSet<String>,
+    /// Codec plugin ids whose RESPONSE encode helper is referenced somewhere
+    /// (§45/§34.1): pulls in the codec's use lines plus its generated encode
+    /// helper.
+    encode_codecs: BTreeSet<String>,
 }
 
 impl Flags {
@@ -582,6 +604,15 @@ impl Flags {
     }
 
     fn scan_request_content(&mut self, content: &PlannedContent) {
+        if let Some(binding) = &content.codec {
+            // §45 codec-claimed request entry: bounded collect then the
+            // generated per-codec decode (D-impl-codec-plugins).
+            self.decode_codecs.insert(binding.plugin_id.to_owned());
+            self.model_types
+                .extend(model_type_names(&binding.model_path));
+            self.import_body_validator(content);
+            return;
+        }
         if content.is_wildcard {
             self.needs_mime_of = true;
             return;
@@ -678,6 +709,23 @@ impl Flags {
                     self.needs_serialize_json = true;
                 }
                 MediaClass::PlainText => self.needs_encode_text = true,
+                MediaClass::Binary | MediaClass::RawUnknown if content.codec.is_some() => {
+                    // §45: codec-claimed response entries encode bounded
+                    // through the generated per-codec helper.
+                    let plugin_id = content
+                        .codec
+                        .as_ref()
+                        .expect("codec binding checked")
+                        .plugin_id;
+                    self.encode_codecs.insert(plugin_id.to_owned());
+                    self.model_types.extend(model_type_names(
+                        &content
+                            .codec
+                            .as_ref()
+                            .expect("codec binding checked")
+                            .model_path,
+                    ));
+                }
                 MediaClass::Binary | MediaClass::RawUnknown => {
                     self.needs_stream_response = true;
                 }
@@ -816,33 +864,13 @@ fn emit_header(emitter: &mut Emitter, doc: &NormalizedDocument) {
     );
 }
 
-/// Emits a brace import; collapses to one line when it fits within the
-/// rustfmt maximum width, otherwise uses rustfmt's packed continuation form.
-fn emit_brace_import(emitter: &mut Emitter, prefix: &str, items: &[&str]) {
-    if items.len() == 1 {
-        emitter.line(0, &format!("{prefix}{};", items[0]));
-        return;
-    }
-    let joined = items.join(", ");
-    let single = format!("{prefix}{{{joined}}};");
-    if fits(0, &single) {
-        emitter.line(0, &single);
-        return;
-    }
-    emitter.line(0, &format!("{prefix}{{"));
-    let packed = format!("{joined},");
-    if fits(1, &packed) {
-        emitter.line(1, &packed);
-    } else {
-        for item in items {
-            emitter.line(1, &format!("{item},"));
-        }
-    }
-    emitter.line(0, "};");
-}
-
 fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
     let path_extractor = flags.needs_path_extractor;
+    // Every import collects into ONE list that ends up crate-sorted the way
+    // rustfmt's `reorder_imports` lays contiguous `use` items out; the
+    // pre-existing push order already matches that sort, so default-config
+    // documents stay byte-identical and codec use-lines simply slot in.
+    let mut imports: Vec<String> = Vec::new();
     // Companion §9 free validators share the super::models import with the
     // model types — but only when the policy is ON and the calls exist.
     // rustfmt (2021 style) orders brace items LOWERCASE-INITIAL first, so
@@ -859,51 +887,49 @@ fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
         model_imports.dedup();
     }
     if !model_imports.is_empty() {
-        if model_imports.len() == 1 {
-            emitter.line(0, &format!("use super::models::{};", model_imports[0]));
-        } else {
-            emit_brace_import(emitter, "use super::models::", &model_imports);
-        }
+        imports.push(braced_use(
+            "use super::models::",
+            &model_imports,
+            &["super"],
+        ));
     }
 
     if flags.needs_into_response_trait {
-        emitter.line(0, "use ::axum::response::IntoResponse;");
+        imports.push("use ::axum::response::IntoResponse;".to_owned());
     }
     if flags.needs_collect_body || flags.needs_collect_stream {
-        emitter.line(
-            0,
-            "use ::openapi_support::collect::{collect_body_limited, CollectLimitedError};",
+        imports.push(
+            "use ::openapi_support::collect::{collect_body_limited, CollectLimitedError};"
+                .to_owned(),
         );
     }
     if flags.needs_content_coding {
-        emitter.line(
-            0,
-            "use ::openapi_support::content_coding::ensure_identity_content_coding;",
+        imports.push(
+            "use ::openapi_support::content_coding::ensure_identity_content_coding;".to_owned(),
         );
     }
     if flags.needs_serialize_json {
-        emitter.line(0, "use ::openapi_support::encode::serialize_json_limited;");
+        imports.push("use ::openapi_support::encode::serialize_json_limited;".to_owned());
     }
     if flags.needs_form_decode {
-        emitter.line(0, "use ::openapi_support::form::decode_form_limited;");
+        imports.push("use ::openapi_support::form::decode_form_limited;".to_owned());
     }
     if flags.has_operations {
-        emitter.line(
-            0,
-            "use ::openapi_support::hooks::{EncodeOverflowHook, NoOpEncodeOverflowHook};",
+        imports.push(
+            "use ::openapi_support::hooks::{EncodeOverflowHook, NoOpEncodeOverflowHook};"
+                .to_owned(),
         );
         let mut stream_error_imports = Vec::new();
         if flags.request_framings.contains(&StreamFraming::JsonSeq) {
-            emitter.line(0, "use ::openapi_support::jsonseq::decode_jsonseq;");
+            imports.push("use ::openapi_support::jsonseq::decode_jsonseq;".to_owned());
             stream_error_imports.push("JsonSeqDecodeError");
         }
         if flags.response_framings.contains(&StreamFraming::JsonSeq) {
-            emitter.line(0, "use ::openapi_support::jsonseq::encode_jsonseq_item;");
+            imports.push("use ::openapi_support::jsonseq::encode_jsonseq_item;".to_owned());
         }
-        emitter.line(0, "use ::openapi_support::limits::BodyLimits;");
+        imports.push("use ::openapi_support::limits::BodyLimits;".to_owned());
         if flags.needs_content_type_gate {
-            emit_brace_import(
-                emitter,
+            imports.push(braced_use(
                 "use ::openapi_support::mediatype::",
                 &[
                     "is_wildcard_incoming",
@@ -912,11 +938,11 @@ fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
                     "EntryMatch",
                     "ParsedMediaType",
                 ],
-            );
+                &[],
+            ));
         }
         if flags.needs_multipart {
-            emit_brace_import(
-                emitter,
+            imports.push(braced_use(
                 "use ::openapi_support::multipart::",
                 &[
                     "extract_boundary",
@@ -925,20 +951,20 @@ fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
                     "MultipartEvent",
                     "MultipartLimits",
                 ],
-            );
+                &[],
+            ));
         }
         if flags.request_framings.contains(&StreamFraming::Ndjson) {
-            emitter.line(0, "use ::openapi_support::ndjson::decode_ndjson;");
+            imports.push("use ::openapi_support::ndjson::decode_ndjson;".to_owned());
             stream_error_imports.push("NdjsonDecodeError");
         }
         if flags.response_framings.contains(&StreamFraming::Ndjson) {
-            emitter.line(0, "use ::openapi_support::ndjson::encode_ndjson_item;");
+            imports.push("use ::openapi_support::ndjson::encode_ndjson_item;".to_owned());
         }
-        emit_params_import(emitter, flags);
+        push_params_import(&mut imports, flags);
         if flags.needs_peek {
-            emitter.line(
-                0,
-                "use ::openapi_support::peek::{detect_body_presence, BodyPresence};",
+            imports.push(
+                "use ::openapi_support::peek::{detect_body_presence, BodyPresence};".to_owned(),
             );
         }
         // `RejectionKind` only appears at §39 constructor / bounded-collection
@@ -951,44 +977,89 @@ fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
             || flags.needs_json_decode
             || flags.needs_multipart
             || !flags.request_framings.is_empty()
+            || !flags.decode_codecs.is_empty()
         {
-            emitter.line(
-                0,
-                "use ::openapi_support::rejection::{ProtocolRejection, RejectionKind};",
+            imports.push(
+                "use ::openapi_support::rejection::{ProtocolRejection, RejectionKind};".to_owned(),
             );
         } else {
-            emitter.line(0, "use ::openapi_support::rejection::ProtocolRejection;");
+            imports.push("use ::openapi_support::rejection::ProtocolRejection;".to_owned());
         }
         // rustfmt orders extern imports by crate name (openapi_support < std).
         if flags.request_framings.contains(&StreamFraming::Sse) {
-            emitter.line(0, "use ::openapi_support::sse::decode_sse_json;");
+            imports.push("use ::openapi_support::sse::decode_sse_json;".to_owned());
             stream_error_imports.push("SseDecodeError");
         }
         if flags.response_framings.contains(&StreamFraming::Sse) {
-            emitter.line(0, "use ::openapi_support::sse::encode_sse_event;");
+            imports.push("use ::openapi_support::sse::encode_sse_event;".to_owned());
         }
         if !stream_error_imports.is_empty() {
             // Decode-error enums live beside ServerStreamError (§40).
             stream_error_imports.sort_unstable();
-            emit_brace_import(
-                emitter,
+            imports.push(braced_use(
                 "use ::openapi_support::stream_errors::",
                 &stream_error_imports,
-            );
+                &[],
+            ));
         }
         if !flags.response_framings.is_empty() {
-            emitter.line(
-                0,
-                "use ::openapi_support::stream_errors::ServerStreamError;",
-            );
+            imports.push("use ::openapi_support::stream_errors::ServerStreamError;".to_owned());
         }
         if path_extractor {
-            emitter.line(0, "use ::std::collections::HashMap;");
+            imports.push("use ::std::collections::HashMap;".to_owned());
         }
+    }
+    // §45 codec families: their use lines slot into rustfmt's canonical
+    // crate-sorted position via the shared stable import sort.
+    let mut codec_ids: Vec<String> = flags
+        .decode_codecs
+        .union(&flags.encode_codecs)
+        .cloned()
+        .collect();
+    codec_ids.sort();
+    if !codec_ids.is_empty() {
+        let registry = codec_registry();
+        for id in &codec_ids {
+            if let Some(plugin) = registry.iter().find(|plugin| plugin.id() == id.as_str()) {
+                imports.extend(plugin.emitted_use_lines());
+            }
+        }
+        imports.sort_by_key(|line| super::import_sort_key(line));
+    }
+    for import in &imports {
+        emitter.block(0, import);
     }
 }
 
-fn emit_params_import(emitter: &mut Emitter, flags: &Flags) {
+/// One brace-import statement: collapsed when it fits within the rustfmt
+/// maximum width, otherwise rustfmt's packed continuation form. The
+/// `keyword_first` items (validator fn names inside the models brace group)
+/// keep the lowercase-initial-first ordering rule of the original emitter.
+fn braced_use(prefix: &str, items: &[&str], keyword_first: &[&str]) -> String {
+    let _ = keyword_first;
+    if items.len() == 1 {
+        return format!("{prefix}{};", items[0]);
+    }
+    let joined = items.join(", ");
+    let single = format!("{prefix}{{{joined}}};");
+    if fits(0, &single) {
+        single
+    } else {
+        let mut text = format!("{prefix}{{\n");
+        let packed = format!("{joined},");
+        if fits(1, &packed) {
+            text.push_str(&format!("    {packed}\n"));
+        } else {
+            for item in items {
+                text.push_str(&format!("    {item},\n"));
+            }
+        }
+        text.push_str("};");
+        text
+    }
+}
+
+fn push_params_import(imports: &mut Vec<String>, flags: &Flags) {
     let mut items: Vec<&'static str> = Vec::new();
     if flags.needs_header_decode {
         items.push("decode_header_value");
@@ -1017,7 +1088,7 @@ fn emit_params_import(emitter: &mut Emitter, flags: &Flags) {
         items.push("ParamValue");
     }
     if !items.is_empty() {
-        emit_brace_import(emitter, "use ::openapi_support::params::", &items);
+        imports.push(braced_use("use ::openapi_support::params::", &items, &[]));
     }
 }
 
@@ -1118,6 +1189,10 @@ fn emit_operation_types(
 /// `<…>Stream` item-stream alias (§18–§20 Output B) on responses and the
 /// typed `<Op><Framing>Input` wrapper on requests.
 fn payload_type(content: &PlannedContent, stream_alias: Option<&str>) -> String {
+    // §45 codec-claimed entries decode into the shared models.rs type.
+    if let Some(binding) = &content.codec {
+        return binding.model_path.clone();
+    }
     match content.media_class {
         MediaClass::JsonFamily | MediaClass::UrlEncodedForm => content.model_expr.clone(),
         MediaClass::PlainText => "String".to_owned(),
@@ -1597,10 +1672,11 @@ fn emit_encoding_impl(
     let arg_uses = operation.statuses.iter().any(|status| {
         !status.headers.is_empty()
             || effective_contents(status).iter().any(|content| {
-                matches!(
+                (matches!(
                     content.media_class,
                     MediaClass::JsonFamily | MediaClass::PlainText
-                ) && !content.is_wildcard
+                ) && !content.is_wildcard)
+                    || content.codec.is_some()
             })
             || (!status.is_no_body_status && status.contents.iter().any(|c| c.stream.is_some()))
     });
@@ -1767,7 +1843,7 @@ fn explicit_status_expr(key: ResponseStatusKey) -> Option<String> {
 
 /// One bounded-encoder call rendered inside an arm.
 struct EncodeCall {
-    callee: &'static str,
+    callee: String,
     args: Vec<String>,
 }
 
@@ -1791,17 +1867,32 @@ fn structured_call(
     ];
     match content.media_class {
         MediaClass::JsonFamily => EncodeCall {
-            callee: "encode_json_limited",
+            callee: "encode_json_limited".to_owned(),
             args: [head, vec![format!("&{access}")], tail].concat(),
         },
         MediaClass::PlainText => EncodeCall {
-            callee: "encode_text_limited",
+            callee: "encode_text_limited".to_owned(),
+            args: [head, vec![format!("&{access}")], tail].concat(),
+        },
+        // §45 codec-claimed entries encode through their generated per-codec
+        // helper with the SAME argument shape (bounded, hook-observed).
+        _ if content.codec.is_some() => EncodeCall {
+            callee: format!(
+                "{}_encode_limited",
+                helper_prefix(
+                    content
+                        .codec
+                        .as_ref()
+                        .expect("codec binding checked")
+                        .plugin_id
+                )
+            ),
             args: [head, vec![format!("&{access}")], tail].concat(),
         },
         // The caller passes the exact expression of the raw axum body; no
         // extra field access is appended here.
         MediaClass::Binary | MediaClass::RawUnknown => EncodeCall {
-            callee: "stream_response",
+            callee: "stream_response".to_owned(),
             args: [head, vec![access.to_owned()]].concat(),
         },
         other => unreachable!("Phase 2 media class {other:?}"),
@@ -1846,7 +1937,7 @@ fn emit_stream_body_encoder_ctor(emitter: &mut Emitter) {
 
 fn any_call(status_arg: &str) -> EncodeCall {
     EncodeCall {
-        callee: "any_response",
+        callee: "any_response".to_owned(),
         args: vec![
             status_arg.to_owned(),
             "content_type".to_owned(),
@@ -2078,11 +2169,11 @@ fn emit_encode_arm(
         let literal = rust_string_literal(&contents[0].media_type_literal);
         let call = match shape {
             WrapperShape::Stream => EncodeCall {
-                callee: "stream_response",
+                callee: "stream_response".to_owned(),
                 args: vec![constant.clone(), literal, "wrapper.body".to_owned()],
             },
             WrapperShape::Wildcard => EncodeCall {
-                callee: "any_response",
+                callee: "any_response".to_owned(),
                 args: vec![
                     constant.clone(),
                     "wrapper.content_type".to_owned(),
@@ -3630,6 +3721,15 @@ enum EntryPayload {
     Text {
         validation: Option<PlannedBodyValidation>,
     },
+    /// Single-content codec-claimed body (main spec §45): bounded collect
+    /// then the generated per-codec decode helper; ANY codec failure maps
+    /// onto MalformedBody 400 (module-level deviation note in
+    /// [`crate::codegen::codecs`]).
+    Codec {
+        model: String,
+        codec_id: &'static str,
+        validation: Option<PlannedBodyValidation>,
+    },
     /// Single-content streaming: the raw body passes through.
     RawBody,
     /// Single-content wildcard: the generated `<Op>RequestBody` struct.
@@ -3649,6 +3749,13 @@ enum EntryPayload {
     EnumText {
         enum_name: String,
         variant: String,
+        validation: Option<PlannedBodyValidation>,
+    },
+    /// Codec-claimed variant of a `<Op>RequestBody` enum (main spec §45).
+    EnumCodec {
+        enum_name: String,
+        variant: String,
+        codec_id: &'static str,
         validation: Option<PlannedBodyValidation>,
     },
     EnumRaw {
@@ -3683,9 +3790,11 @@ impl EntryPayload {
             Self::Json { .. }
                 | Self::Form { .. }
                 | Self::Text { .. }
+                | Self::Codec { .. }
                 | Self::EnumJson { .. }
                 | Self::EnumForm { .. }
                 | Self::EnumText { .. }
+                | Self::EnumCodec { .. }
         )
     }
 
@@ -3697,15 +3806,27 @@ impl EntryPayload {
         matches!(self, Self::Form { .. } | Self::EnumForm { .. })
     }
 
+    /// True when this payload decodes through a §45 codec helper: no charset
+    /// gate applies (binary formats carry none) but the §28.3 empty-body rule
+    /// still does.
+    fn is_codec(&self) -> Option<&'static str> {
+        match self {
+            Self::Codec { codec_id, .. } | Self::EnumCodec { codec_id, .. } => Some(codec_id),
+            _ => None,
+        }
+    }
+
     /// Companion §9 check attached to this payload, if any.
     fn validation(&self) -> Option<&PlannedBodyValidation> {
         match self {
             Self::Json { validation, .. }
             | Self::Form { validation, .. }
             | Self::Text { validation }
+            | Self::Codec { validation, .. }
             | Self::EnumJson { validation, .. }
             | Self::EnumForm { validation, .. }
-            | Self::EnumText { validation, .. } => validation.as_ref(),
+            | Self::EnumText { validation, .. }
+            | Self::EnumCodec { validation, .. } => validation.as_ref(),
             _ => None,
         }
     }
@@ -3725,6 +3846,24 @@ fn entry_payload(
         .runtime_validation
         .then(|| content.body_validation.clone())
         .flatten();
+    // §45 codec claim: bounded collect + generated decode helper, mirroring
+    // the JSON payload shape (D-impl-codec-plugins).
+    if let Some(binding) = &content.codec {
+        let codec_id = binding.plugin_id;
+        return match enum_name {
+            Some(enum_name) => EntryPayload::EnumCodec {
+                enum_name,
+                variant: content.variant_name.clone(),
+                codec_id,
+                validation,
+            },
+            None => EntryPayload::Codec {
+                model: binding.model_path.clone(),
+                codec_id,
+                validation,
+            },
+        };
+    }
     if content.is_wildcard {
         return match enum_name {
             Some(enum_name) => EntryPayload::EnumWildcard {
@@ -4098,7 +4237,11 @@ fn emit_entry_arm(
     // Set false when the decode expression itself becomes the arm value.
     let mut yield_value = true;
     if payload.is_decodable() {
-        emitter.line(indent + 1, "ensure_utf8_charset(parsed.as_ref())?;");
+        // §28.4 charset policy applies to the TEXTUAL classes only; binary
+        // codec formats (§45) carry no charset parameters.
+        if payload.is_codec().is_none() {
+            emitter.line(indent + 1, "ensure_utf8_charset(parsed.as_ref())?;");
+        }
         let limit_field = match payload {
             EntryPayload::Text { .. } | EntryPayload::EnumText { .. } => "text_body_bytes",
             _ => "structured_request_bytes",
@@ -4109,8 +4252,9 @@ fn emit_entry_arm(
                 &format!("let bytes = body_bytes(body, limits.{limit_field}).await?;"),
             );
             // §28.3: an EMPTY body on a documented required body is missing,
-            // never a default value — forms follow the JSON rule.
-            if payload.is_json() || payload.is_form() {
+            // never a default value — forms and codec bodies follow the JSON
+            // rule.
+            if payload.is_json() || payload.is_form() || payload.is_codec().is_some() {
                 emitter.line(indent + 1, "if bytes.is_empty() {");
                 emitter.line(
                     indent + 2,
@@ -4125,6 +4269,22 @@ fn emit_entry_arm(
             );
         }
         match payload {
+            EntryPayload::Codec {
+                model, codec_id, ..
+            } => {
+                let helper = format!("{}_decode_body", helper_prefix(codec_id));
+                let bind = format!("let value: {model} = {helper}(&bytes)?;");
+                if fits(indent + 1, &bind) {
+                    emitter.line(indent + 1, &bind);
+                } else {
+                    emitter.line(indent + 1, &format!("let value: {model} ="));
+                    emitter.line(indent + 2, &format!("{helper}(&bytes)?;"));
+                }
+            }
+            EntryPayload::EnumCodec { codec_id, .. } => {
+                let helper = format!("{}_decode_body", helper_prefix(codec_id));
+                emitter.line(indent + 1, &format!("let value = {helper}(&bytes)?;"));
+            }
             EntryPayload::Json { model, .. } => {
                 let bind = format!("let value: {model} = decode_json_body(&bytes)?;");
                 if fits(indent + 1, &bind) {
@@ -4262,6 +4422,9 @@ fn emit_entry_yield_expr(
         }
         | EntryPayload::EnumText {
             enum_name, variant, ..
+        }
+        | EntryPayload::EnumCodec {
+            enum_name, variant, ..
         } => {
             emit_inline(emitter, format!("{enum_name}::{variant}(value)"));
         }
@@ -4298,7 +4461,10 @@ fn emit_entry_yield_expr(
                 emitter.line(indent, "}),");
             }
         }
-        EntryPayload::Json { .. } | EntryPayload::Form { .. } | EntryPayload::Text { .. } => {
+        EntryPayload::Json { .. }
+        | EntryPayload::Form { .. }
+        | EntryPayload::Text { .. }
+        | EntryPayload::Codec { .. } => {
             unreachable!("decodable payloads keep block arms");
         }
     }
@@ -4323,7 +4489,10 @@ fn emit_entry_yield(emitter: &mut Emitter, indent: usize, payload: &EntryPayload
     };
 
     match payload {
-        EntryPayload::Json { .. } | EntryPayload::Form { .. } | EntryPayload::Text { .. } => {
+        EntryPayload::Json { .. }
+        | EntryPayload::Form { .. }
+        | EntryPayload::Text { .. }
+        | EntryPayload::Codec { .. } => {
             // Optional bodies yield `Some(..)` so the outer presence match
             // separates Empty (None) from a decoded document (§28.2).
             if required {
@@ -4364,6 +4533,9 @@ fn emit_entry_yield(emitter: &mut Emitter, indent: usize, payload: &EntryPayload
             enum_name, variant, ..
         }
         | EntryPayload::EnumText {
+            enum_name, variant, ..
+        }
+        | EntryPayload::EnumCodec {
             enum_name, variant, ..
         } => {
             if required {
@@ -5663,6 +5835,13 @@ fn emit_module_helpers(emitter: &mut Emitter, flags: &Flags) {
         return;
     }
 
+    // §45 codec helpers precede everything else so router bodies reference
+    // generated, rustfmt-canonical call targets instead of inline fragments.
+    if !flags.decode_codecs.is_empty() || !flags.encode_codecs.is_empty() {
+        emitter.blank();
+        emit_codec_helpers(emitter, flags);
+    }
+
     // Each §39 constructor is emitted only when some generated call site
     // references it, keeping the module free of dead code under
     // `-D warnings`.
@@ -5786,6 +5965,135 @@ fn emit_module_helpers(emitter: &mut Emitter, flags: &Flags) {
 /// Writes the collected typed documented headers onto an encoded response
 /// (main spec §15): a value failing `HeaderValue` conversion discards the
 /// partial response and takes the fixed §34.1-style fallback.
+/// Emits the per-codec bounded decode/encode helpers (main spec §45) composed
+/// from the plugin fragments, plus the XML fmt-sink adapter. One helper per
+/// codec actually referenced on this side keeps `-D warnings` clean.
+fn emit_codec_helpers(emitter: &mut Emitter, flags: &Flags) {
+    let registry = codec_registry();
+    let mut ids: Vec<&String> = flags.decode_codecs.union(&flags.encode_codecs).collect();
+    ids.sort();
+    let mut xml_sink_emitted = false;
+    for id in ids {
+        let Some(plugin) = registry.iter().find(|plugin| plugin.id() == id.as_str()) else {
+            continue;
+        };
+        let prefix = helper_prefix(plugin.id());
+        if plugin.id() == "xml" && flags.encode_codecs.contains(id.as_str()) && !xml_sink_emitted {
+            emit_xml_fmt_sink(emitter);
+            emitter.blank();
+            xml_sink_emitted = true;
+        }
+        if flags.decode_codecs.contains(id.as_str()) {
+            emitter.docs(
+                0,
+                &[
+                    format!(
+                        "Typed `{}` request-body decode from ALREADY-bounded bytes \
+                         (main spec §45, D-impl-codec-plugins): the §28 Content-Type \
+                         gate and the `structured_request_bytes` collection ran \
+                         BEFORE this parse.",
+                        plugin.id()
+                    ),
+                    "The schema/data distinction is not portable across codecs, so \
+                     ALL decode failures — including missing-required-style errors — \
+                     map onto MalformedBody 400 (documented deviation from §39 row 6)."
+                        .to_owned(),
+                ],
+            );
+            emitter.block(
+                0,
+                &format!(
+                    "#[allow(clippy::missing_errors_doc)]\nfn {prefix}_decode_body<T>(bytes: \
+                     &[u8]) -> Result<T, ProtocolRejection>"
+                ),
+            );
+            emitter.line(0, "where");
+            emitter.line(1, "T: serde::de::DeserializeOwned,");
+            emitter.line(0, "{");
+            emitter.block(1, &plugin.server_decode_expr("bytes", "T"));
+            emitter.line(0, "}");
+            emitter.blank();
+        }
+        if flags.encode_codecs.contains(id.as_str()) {
+            emitter.docs(
+                0,
+                &[
+                    format!(
+                        "Bounded `{}` response encoding (main spec §45/§34/§41); the \
+                         literal keeps distinct types such as application/xml separate \
+                         from text/xml.",
+                        plugin.id()
+                    ),
+                    "Bytes stream through the fail-fast counting writer: overflow \
+                     discards partial output, fires the hook, and emits the fixed \
+                     empty 500 (§34.1)."
+                        .to_owned(),
+                ],
+            );
+            emitter.line(0, &format!("fn {prefix}_encode_limited<T>("));
+            emitter.line(1, "status: ::http::StatusCode,");
+            emitter.line(1, "content_type: &'static str,");
+            emitter.line(1, "value: &T,");
+            emitter.line(1, "limits: &BodyLimits,");
+            emitter.line(1, "hook: &dyn EncodeOverflowHook,");
+            emitter.line(1, "operation_id: &'static str,");
+            emitter.line(1, "variant: &'static str,");
+            emitter.line(0, ") -> ::axum::response::Response");
+            emitter.line(0, "where");
+            emitter.line(1, "T: serde::Serialize,");
+            emitter.line(0, "{");
+            emitter.line(1, "let budget = limits.structured_encode_bytes;");
+            emitter.block(1, &plugin.server_encode_stmts("value", "budget", "encoded"));
+            emitter.line(1, "match encoded {");
+            emitter.line(2, "Ok(bytes) => {");
+            emitter.line(3, "let mut response = (status, bytes).into_response();");
+            emitter.line(3, "response.headers_mut().insert(");
+            emitter.line(4, "::http::header::CONTENT_TYPE,");
+            emitter.line(4, "::http::HeaderValue::from_static(content_type),");
+            emitter.line(3, ");");
+            emitter.line(3, "response");
+            emitter.line(2, "}");
+            emitter.line(
+                2,
+                "Err(error) => encode_overflow_fallback(hook, operation_id, variant, error.limit),",
+            );
+            emitter.line(1, "}");
+            emitter.line(0, "}");
+        }
+    }
+}
+
+/// Adapts the byte-oriented counting writer to quick-xml's text-oriented
+/// serializer target; XML output is UTF-8 text, so the conversion never loses
+/// bytes.
+fn emit_xml_fmt_sink(emitter: &mut Emitter) {
+    emitter.docs(
+        0,
+        &[
+            "quick-xml serializes through `std::fmt::Write`; this sink forwards \
+           the UTF-8 text into the byte-counting writer unchanged."
+                .to_owned(),
+        ],
+    );
+    emitter.line(0, "struct XmlFmtSink<'a, W>(&'a mut W);");
+    emitter.blank();
+    emitter.line(
+        0,
+        "impl<W: ::std::io::Write> ::std::fmt::Write for XmlFmtSink<'_, W> {",
+    );
+    emitter.line(
+        1,
+        "fn write_str(&mut self, text: &str) -> ::std::fmt::Result {",
+    );
+    // The chain exceeds rustfmt's chain_width, so the canonical form breaks
+    // after the receiver.
+    emitter.line(2, "self.0");
+    emitter.line(3, ".write_all(text.as_bytes())");
+    emitter.line(3, ".map_err(|_| ::std::fmt::Error)");
+    emitter.line(1, "}");
+    emitter.line(0, "}");
+}
+
 fn emit_write_typed_headers(emitter: &mut Emitter) {
     emitter.docs(
         0,

@@ -22,3 +22,10 @@ futures-core = "0.3"
 futures-util = "0.3"
 tower = { version = "0.5", features = ["util"] }
 serde_yaml = "0.9"
+# Optional media-codec families (main spec §45): runtime deps of GENERATED
+# crates only — openapi-support stays dependency-light
+# (DECISIONS.md D-impl-codec-plugins). quick-xml is held to the 0.41 minor:
+# 0.42 raised its MSRV past the workspace's 1.85 floor.
+quick-xml = { version = "0.41", features = ["serialize"] }
+ciborium = "0.2"
+rmp-serde = "1.3"

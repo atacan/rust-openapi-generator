@@ -251,4 +251,97 @@ pub mod fixtures {
             include!(concat!(env!("OUT_DIR"), "/15_streams/server.rs"));
         }
     }
+
+    /// Fixture 16 under the DEFAULT configuration (all codecs OFF): every
+    /// XML/CBOR/MessagePack entry stays in the §5.9 raw-streaming fallback.
+    /// Compilation of this module IS the raw-fallback conformance proof.
+    pub mod fixture_16_codecs {
+        pub mod models {
+            include!(concat!(env!("OUT_DIR"), "/16_codecs/models.rs"));
+        }
+        pub mod views {
+            include!(concat!(env!("OUT_DIR"), "/16_codecs/views.rs"));
+        }
+        pub mod client {
+            include!(concat!(env!("OUT_DIR"), "/16_codecs/client.rs"));
+        }
+        pub mod server {
+            include!(concat!(env!("OUT_DIR"), "/16_codecs/server.rs"));
+        }
+    }
+
+    /// Fixture 16 with ONLY the `xml` codec enabled (main spec §45).
+    pub mod fixture_16_codecs_xml {
+        pub mod models {
+            include!(concat!(env!("OUT_DIR"), "/16_codecs.xml/models.rs"));
+        }
+        pub mod views {
+            include!(concat!(env!("OUT_DIR"), "/16_codecs.xml/views.rs"));
+        }
+        pub mod client {
+            include!(concat!(env!("OUT_DIR"), "/16_codecs.xml/client.rs"));
+        }
+        pub mod server {
+            include!(concat!(env!("OUT_DIR"), "/16_codecs.xml/server.rs"));
+        }
+    }
+
+    /// Fixture 16 with ONLY the `cbor` codec enabled.
+    pub mod fixture_16_codecs_cbor {
+        pub mod models {
+            include!(concat!(env!("OUT_DIR"), "/16_codecs.cbor/models.rs"));
+        }
+        pub mod views {
+            include!(concat!(env!("OUT_DIR"), "/16_codecs.cbor/views.rs"));
+        }
+        pub mod client {
+            include!(concat!(env!("OUT_DIR"), "/16_codecs.cbor/client.rs"));
+        }
+        pub mod server {
+            include!(concat!(env!("OUT_DIR"), "/16_codecs.cbor/server.rs"));
+        }
+    }
+
+    /// Fixture 16 with ONLY the `msgpack` codec enabled.
+    pub mod fixture_16_codecs_msgpack {
+        pub mod models {
+            include!(concat!(env!("OUT_DIR"), "/16_codecs.msgpack/models.rs"));
+        }
+        pub mod views {
+            include!(concat!(env!("OUT_DIR"), "/16_codecs.msgpack/views.rs"));
+        }
+        pub mod client {
+            include!(concat!(env!("OUT_DIR"), "/16_codecs.msgpack/client.rs"));
+        }
+        pub mod server {
+            include!(concat!(env!("OUT_DIR"), "/16_codecs.msgpack/server.rs"));
+        }
+    }
+
+    /// Fixture 16 with every codec enabled PLUS ForceStreaming overrides on
+    /// the JSON operation and the XML operation (D-impl-override-precedence:
+    /// override > claiming plugin).
+    pub mod fixture_16_codecs_force_stream {
+        pub mod models {
+            include!(concat!(
+                env!("OUT_DIR"),
+                "/16_codecs.force-stream/models.rs"
+            ));
+        }
+        pub mod views {
+            include!(concat!(env!("OUT_DIR"), "/16_codecs.force-stream/views.rs"));
+        }
+        pub mod client {
+            include!(concat!(
+                env!("OUT_DIR"),
+                "/16_codecs.force-stream/client.rs"
+            ));
+        }
+        pub mod server {
+            include!(concat!(
+                env!("OUT_DIR"),
+                "/16_codecs.force-stream/server.rs"
+            ));
+        }
+    }
 }
