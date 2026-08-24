@@ -293,6 +293,7 @@ async fn route_put_cbor_state(
                 return Err(malformed_body("documented request body arrived empty"));
             }
             let value: CborState = cbor_decode_body(&bytes)?;
+            require_valid_request("body", value.validate_request())?;
             value
         }
         RequestEntryMatch::Entry(_) => unreachable!("request entry index out of range"),
@@ -561,6 +562,18 @@ where
         } else {
             malformed_body("malformed JSON body")
         }
+    })
+}
+
+/// Runs one companion §9 request-body/part validator after decode: a violation rejects 422 SchemaViolation outside the documented enum, with a location-prefixed diagnostic detail (§39 rows 6; details stay off the wire per rule 3).
+fn require_valid_request(
+    location: &str,
+    validation: ::std::result::Result<(), ::openapi_support::validation::Violation>,
+) -> ::std::result::Result<(), ProtocolRejection> {
+    validation.map_err(|violation| {
+        ProtocolRejection::new(RejectionKind::SchemaViolation).with_detail(format!(
+            "request body failed schema validation at `{location}`: {violation}",
+        ))
     })
 }
 

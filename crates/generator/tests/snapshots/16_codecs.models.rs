@@ -16,23 +16,83 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct XmlDocument {
+    /// Constraints (enforced by generated routers on server requests, companion §9; lenient on client decode): minLength >= 2.
     pub title: String,
     /// Constraints (enforced by generated routers on server requests, companion §9; lenient on client decode): format `int32`.
     pub revision: i32,
 }
 
+impl XmlDocument {
+    /// Server-side request validation (companion §9): structural checks stay in Serde decode; these enforce the D-§2
+    /// bucket-2 constraints. Client decoding stays lenient.
+    pub fn validate_request(
+        &self,
+    ) -> ::std::result::Result<(), ::openapi_support::validation::Violation> {
+        ::openapi_support::validation::validate_string(
+            &self.title,
+            &::openapi_support::validation::StringConstraints {
+                pattern: None,
+                min_length: Some(2),
+                max_length: None,
+            },
+        )
+        .map_err(|error| error.at_field("title"))?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CborState {
+    /// Constraints (enforced by generated routers on server requests, companion §9; lenient on client decode): minLength >= 2.
     pub slot: String,
     /// Constraints (enforced by generated routers on server requests, companion §9; lenient on client decode): format `int64`.
     pub level: i64,
 }
 
+impl CborState {
+    /// Server-side request validation (companion §9): structural checks stay in Serde decode; these enforce the D-§2
+    /// bucket-2 constraints. Client decoding stays lenient.
+    pub fn validate_request(
+        &self,
+    ) -> ::std::result::Result<(), ::openapi_support::validation::Violation> {
+        ::openapi_support::validation::validate_string(
+            &self.slot,
+            &::openapi_support::validation::StringConstraints {
+                pattern: None,
+                min_length: Some(2),
+                max_length: None,
+            },
+        )
+        .map_err(|error| error.at_field("slot"))?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MsgPackEvent {
+    /// Constraints (enforced by generated routers on server requests, companion §9; lenient on client decode): minLength >= 2.
     pub kind: String,
     /// Constraints (enforced by generated routers on server requests, companion §9; lenient on client decode): format `int32`.
     pub seq: i32,
+}
+
+impl MsgPackEvent {
+    /// Server-side request validation (companion §9): structural checks stay in Serde decode; these enforce the D-§2
+    /// bucket-2 constraints. Client decoding stays lenient.
+    pub fn validate_request(
+        &self,
+    ) -> ::std::result::Result<(), ::openapi_support::validation::Violation> {
+        ::openapi_support::validation::validate_string(
+            &self.kind,
+            &::openapi_support::validation::StringConstraints {
+                pattern: None,
+                min_length: Some(2),
+                max_length: None,
+            },
+        )
+        .map_err(|error| error.at_field("kind"))?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -5,9 +5,12 @@
 //!   single-codec configurations;
 //! - the 413 size gate fires BEFORE codec parsing (oversized + malformed
 //!   body → 413, never 400);
-//! - a malformed (small) codec body maps onto MalformedBody 400 through the
-//!   documented enum (server-side deviation documented in
-//!   `codegen::codecs`);
+//! - §50 test 52, first half (§39 Codec exception): a malformed (small)
+//!   codec body maps onto MalformedBody 400 through the documented enum
+//!   (server-side deviation documented in `codegen::codecs`);
+//! - §50 test 52, second half: constraint violations on codec paths still
+//!   produce SchemaViolation 422 through companion §9 post-decode
+//!   validation — the handler never observes a violating body;
 //! - a garbage response surfaces client-side as `ClientError::Decode`;
 //! - ForceStreaming overrides beat enabled codecs and pass bytes through
 //!   unbounded (1 MiB proof with chunk-count evidence).
@@ -216,13 +219,14 @@ async fn msgpack_codec_round_trips_both_directions() {
     assert!(app.handler_ran.load(Ordering::SeqCst), "handler ran");
 }
 
-/// A small MALFORMED MessagePack body is well-framed HTTP but fails codec
-/// parsing: the generated router maps it onto MalformedBody 400, which the
-/// documenter 400 (problem+json) absorbs into `BadRequest400` — the
-/// documented deviation recorded in `codegen::codecs` (the schema/data
-/// distinction is not portable across codecs).
+/// §50 test 52, first half (§39 Codec exception): a small MALFORMED
+/// MessagePack body is well-framed HTTP but fails codec parsing: the
+/// generated router maps it onto MalformedBody 400, which the documenter 400
+/// (problem+json) absorbs into `BadRequest400` — the documented deviation
+/// recorded in `codegen::codecs` (the schema/data distinction is not
+/// portable across codecs).
 #[tokio::test]
-async fn malformed_msgpack_body_becomes_documented_400() {
+async fn t52_codec_data_errors_map_to_400_malformed_body() {
     use tower::ServiceExt;
 
     let app = Arc::new(MsgPackApp {
@@ -252,6 +256,76 @@ async fn malformed_msgpack_body_becomes_documented_400() {
     assert!(
         !app.handler_ran.load(Ordering::SeqCst),
         "a malformed body must never reach the handler"
+    );
+}
+
+/// §50 test 52, second half: a WELL-FORMED codec payload whose constrained
+/// field violates its companion §9 constraint still rejects through
+/// post-decode validation with SchemaViolation 422 — never through the §39
+/// Codec exception's MalformedBody 400 — and the handler stays uninvoked.
+/// The generated client encodes the payload itself, so the wire bytes are
+/// guaranteed-valid codec data; only bucket-2 validation can reject. Proven
+/// for MessagePack first, then CBOR for symmetry.
+#[tokio::test]
+async fn t52_constraint_violations_still_422_through_post_decode_validation_on_codec_paths() {
+    // MessagePack: decode succeeds, then minLength("kind") fails.
+    let app = Arc::new(MsgPackApp {
+        handler_ran: AtomicBool::new(false),
+    });
+    let address = common::spawn_router(fxMsgPack::server::router(
+        app.clone(),
+        BodyLimits::process_default(),
+        Arc::new(NoOpEncodeOverflowHook),
+        Arc::new(NoOpStreamFailureHook),
+    ));
+    let client = fxMsgPack::client::ClientBuilder::new()
+        .base_url(common::base_url(address))
+        .build()
+        .expect("client builds");
+    let violation = fxMsgPack::models::MsgPackEvent {
+        kind: "x".to_owned(),
+        seq: -3,
+    };
+    match client.post_msg_pack_event(&violation).await {
+        Err(openapi_support::client_error::ClientError::UndocumentedStatus { status }) => {
+            // 422 is undocumented on this operation, so the peer-generated
+            // rejection surfaces as UndocumentedStatus carrying the status.
+            assert_eq!(status, ::http::StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        other => panic!("expected UndocumentedStatus 422, got {other:?}"),
+    }
+    assert!(
+        !app.handler_ran.load(Ordering::SeqCst),
+        "a constraint-violating body must never reach the handler"
+    );
+
+    // CBOR symmetry: decode succeeds, then minLength("slot") fails.
+    let app = Arc::new(CborEchoApp {
+        handler_ran: AtomicBool::new(false),
+    });
+    let address = common::spawn_router(fxCbor::server::router(
+        app.clone(),
+        BodyLimits::process_default(),
+        Arc::new(NoOpEncodeOverflowHook),
+        Arc::new(NoOpStreamFailureHook),
+    ));
+    let client = fxCbor::client::ClientBuilder::new()
+        .base_url(common::base_url(address))
+        .build()
+        .expect("client builds");
+    let violation = fxCbor::models::CborState {
+        slot: "x".to_owned(),
+        level: 1_048_576,
+    };
+    match client.put_cbor_state(&violation).await {
+        Err(openapi_support::client_error::ClientError::UndocumentedStatus { status }) => {
+            assert_eq!(status, ::http::StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        other => panic!("expected UndocumentedStatus 422, got {other:?}"),
+    }
+    assert!(
+        !app.handler_ran.load(Ordering::SeqCst),
+        "a constraint-violating body must never reach the handler"
     );
 }
 

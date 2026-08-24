@@ -7,10 +7,15 @@
 # (bounded collect + codec parse, bounded encode through the fail-fast
 # counting writer).
 #
-# Schemas are deliberately plain objects with string/int fields and NO enums:
+# Schemas are deliberately enum-free objects with string/int fields:
 # enum wire forms are codec-specific (quick-xml has no externally visible
 # variant tagging contract, and rmp-serde/ciborium encode serde variants
 # differently), so they are a documented codec limitation for this phase.
+# Each schema also carries ONE runtime-validated constraint (`minLength` on
+# its required string) so companion §9 post-decode validation stays provable
+# on codec paths too: a well-formed payload violating the constraint must
+# yield SchemaViolation 422 AFTER the codec decode, while codec data errors
+# map onto MalformedBody 400 (main spec §50 test 52; §39 Codec exception).
 # Each operation also documents problem+json on 400 so malformed-body tests
 # observe the §39 MalformedBody mapping through the documented enum.
 openapi: 3.1.0
@@ -114,6 +119,7 @@ components:
       properties:
         title:
           type: string
+          minLength: 2
         revision:
           type: integer
           format: int32
@@ -123,6 +129,7 @@ components:
       properties:
         slot:
           type: string
+          minLength: 2
         level:
           type: integer
           format: int64
@@ -132,6 +139,7 @@ components:
       properties:
         kind:
           type: string
+          minLength: 2
         seq:
           type: integer
           format: int32

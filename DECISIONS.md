@@ -367,6 +367,14 @@ media-type classification. Overrides may force raw streaming (any class → stre
 restore defaults; they may never invent a structured representation for an unknown format
 (§5.9 forbids guessing codecs).
 
+### D-codec-rejection-mapping Codec data errors map to MalformedBody per §39 Codec exception
+Adopted from the spec amendment introduced in commit `50081c8` ("Codec exception", main spec §39;
+pinning test §50 test 52): because quick-xml/ciborium/rmp-serde error types cannot portably
+distinguish syntax failures from shape failures, unclassifiable codec data errors map to
+`MalformedBody` (`400`). This applies ONLY to optional codec paths — every built-in Phase 1–3
+media type keeps the strict §39 split, and companion §9 post-decode validation continues to
+produce `SchemaViolation` (`422`) for constraint violations regardless.
+
 ### D-impl-retry Explicit-factory retries only
 Main spec §31 forbids retrying consumed one-shot bodies. Decision: generated methods NEVER retry
 implicitly. Every operation whose request carries streaming content gains a twin
