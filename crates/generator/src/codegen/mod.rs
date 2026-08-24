@@ -13,6 +13,7 @@
 
 pub mod client;
 pub mod codecs;
+pub mod manifest;
 pub mod models;
 pub mod plan;
 pub mod server;

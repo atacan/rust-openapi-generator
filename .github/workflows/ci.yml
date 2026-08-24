@@ -97,7 +97,8 @@ jobs:
             # silently rewrite committed files.
             unset CLIENT_SNAPSHOT_UPDATE SERVER_SNAPSHOT_UPDATE \
                   MODELS_SNAPSHOT_UPDATE VIEWS_SNAPSHOT_UPDATE \
-                  OPENAPI_SNAPSHOT_UPDATE CODEC_SNAPSHOT_UPDATE
+                  OPENAPI_SNAPSHOT_UPDATE CODEC_SNAPSHOT_UPDATE \
+                  MANIFEST_SNAPSHOT_UPDATE
 
             echo "::group::generation pass ${pass}"
             cargo test -p openapi-to-rust-generator -p openapi-conformance --locked

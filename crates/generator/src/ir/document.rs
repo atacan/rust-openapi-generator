@@ -15,6 +15,9 @@ pub struct IrDocument {
     pub version: OpenApiVersion,
     /// Original `openapi` string from the document.
     pub raw_version: String,
+    /// `info.title` verbatim when declared; consumed by emitted-manifest
+    /// package naming (main spec §3.1).
+    pub info_title: Option<String>,
     /// Root-level servers in declaration order.
     pub servers: Vec<ServerIr>,
     /// Path entries in declaration order.

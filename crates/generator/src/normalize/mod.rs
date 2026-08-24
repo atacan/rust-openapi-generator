@@ -111,6 +111,9 @@ pub struct NormalizedOperation {
 pub struct NormalizedDocument {
     pub version: crate::ir::document::OpenApiVersion,
     pub raw_version: String,
+    /// `info.title` verbatim when declared (main spec §3.1 package naming);
+    /// absent when the document declares no title.
+    pub info_title: Option<String>,
     /// Root-level servers verbatim (may be empty → `/` defaults apply per
     /// operation through companion §8 precedence).
     pub root_servers: Vec<ServerIr>,
@@ -279,6 +282,7 @@ pub fn normalize_with_config(
     Ok(NormalizedDocument {
         version: doc.version,
         raw_version: doc.raw_version,
+        info_title: doc.info_title,
         root_servers: doc.servers,
         operations,
         schemas,

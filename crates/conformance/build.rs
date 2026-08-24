@@ -1,13 +1,14 @@
 //! Compile-conformance build script (main spec §50 test 38, compile half):
 //! loads + normalizes EVERY fixture under `crates/generator/fixtures/`,
-//! plans it, and emits the four generated artifacts for each into
+//! plans it, and emits the four generated source artifacts plus the emitted
+//! `Cargo.toml` ([`generate_manifest`], main spec §3.1) for each into
 //! `$OUT_DIR/<fixture_stem>/` through the generator's public APIs.
 //!
 //! Any diagnostic (Error or Warning) fails the build loudly — the
 //! stop-and-report policy leaves no room for improvised output. Generation
 //! runs TWICE per fixture into independent directories and byte-compares
 //! both, so double-generation determinism (main spec §50 test 39) is
-//! enforced at build time across all four artifact kinds. Nothing but the
+//! enforced at build time across all five artifact kinds. Nothing but the
 //! deterministic pipeline output ever reaches `$OUT_DIR` (no timestamps, no
 //! paths).
 
@@ -15,6 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use openapi_to_rust_generator::codegen::client::generate_client;
+use openapi_to_rust_generator::codegen::manifest::{generate_manifest, ManifestConfig};
 use openapi_to_rust_generator::codegen::models::generate_models;
 use openapi_to_rust_generator::codegen::plan::{
     plan_api_with_config, GeneratorPlanOptions, OperationPattern, PlanConfig,
@@ -169,19 +171,24 @@ fn emit_with_options(fixtures_dir: &Path, fixture: &str, dir: &Path, config: &Pl
     }
 }
 
-/// Runs the full pipeline once and writes the four artifacts under `dir`;
-/// returns the artifact texts for comparison.
-fn generate(fixtures_dir: &Path, fixture: &str, dir: &Path) -> [String; 4] {
+/// Runs the full pipeline once and writes the five artifacts (models, views,
+/// client, server, Cargo.toml) under `dir`; returns the artifact texts for
+/// comparison.
+fn generate(fixtures_dir: &Path, fixture: &str, dir: &Path) -> Vec<String> {
     generate_with_config(fixtures_dir, fixture, dir, &PlanConfig::default())
 }
 
-/// Runs the full pipeline once under an explicit plan config.
+/// Runs the full pipeline once under an explicit plan config. The emitted
+/// manifest ([`generate_manifest`], main spec §3.1) is the single source of
+/// truth for generated-crate manifests; its codec configuration mirrors the
+/// plan options so claimed codecs always carry their runtime crates
+/// (D-impl-codec-plugins).
 fn generate_with_config(
     fixtures_dir: &Path,
     fixture: &str,
     dir: &Path,
     config: &PlanConfig,
-) -> [String; 4] {
+) -> Vec<String> {
     let ir = load_document(fixture, fixtures_dir, &LoadConfig::default())
         .unwrap_or_else(|diags| panic!("{fixture}: load failed: {diags:?}"));
     let doc = normalize_with_config(ir, &Default::default())
@@ -203,6 +210,15 @@ fn generate_with_config(
     let views = generate_views(&doc);
     let client = generate_client(&doc, &plan);
     let server = generate_server(&doc, &plan);
+    let manifest = generate_manifest(
+        &doc,
+        &plan,
+        &ManifestConfig {
+            enabled_codecs: config.generator_options.enabled_codecs.clone(),
+            ..ManifestConfig::default()
+        },
+    )
+    .unwrap_or_else(|diags| panic!("{fixture}: manifest generation failed: {diags:?}"));
 
     fs::create_dir_all(dir).expect("create artifact directory");
     for (name, text) in [
@@ -210,9 +226,10 @@ fn generate_with_config(
         ("views.rs", &views),
         ("client.rs", &client),
         ("server.rs", &server),
+        ("Cargo.toml", &manifest),
     ] {
         fs::write(dir.join(name), text)
             .unwrap_or_else(|err| panic!("{}: write {name}: {err}", dir.display()));
     }
-    [models, views, client, server]
+    vec![models, views, client, server, manifest]
 }

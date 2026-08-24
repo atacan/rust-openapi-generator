@@ -2199,6 +2199,15 @@ impl Loader {
             .map(|value| self.parse_servers(value, &root_servers_path))
             .unwrap_or_default();
 
+        // `info.title` is carried verbatim for emitted-manifest package
+        // naming (main spec §3.1); everything else under `info` is ignored.
+        let info_title = as_mapping(&root)
+            .and_then(|m| mapping_get(m, "info"))
+            .and_then(as_mapping)
+            .and_then(|info| mapping_get(info, "title"))
+            .and_then(Yaml::as_str)
+            .map(ToOwned::to_owned);
+
         let mut paths = Vec::new();
         if let Some(paths_mapping) = as_mapping(&root)
             .and_then(|m| mapping_get(m, "paths"))
@@ -2223,6 +2232,7 @@ impl Loader {
         let document = IrDocument {
             version: self.version,
             raw_version: self.raw_version.clone(),
+            info_title,
             servers,
             paths,
             schemas,

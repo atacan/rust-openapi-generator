@@ -18,9 +18,10 @@
 //! entries reuse the SHARED models.rs types and their Serde derives verbatim
 //! (no per-codec model duplication). Runtime crates are dependencies of
 //! EMITTED manifests only for enabled codecs — `openapi-support` stays
-//! dependency-light (companion §4.5); generated-crate emission itself remains
-//! future work (main spec §3.1), so [`MediaCodecPlugin::manifest_dependency`]
-//! fragments ride on the plan metadata for when it lands.
+//! dependency-light (companion §4.5); emitted-manifest generation consumes
+//! [`MediaCodecPlugin::manifest_dependency`] through
+//! [`manifest_dependency_for`] (main spec §3.1,
+//! [`super::manifest::generate_manifest`]).
 //!
 //! # Error-mapping contract (documented deviation)
 //!

@@ -14,7 +14,13 @@
 use std::fs;
 use std::path::PathBuf;
 
-const ARTIFACTS: &[&str] = &["models.rs", "views.rs", "client.rs", "server.rs"];
+const ARTIFACTS: &[&str] = &[
+    "models.rs",
+    "views.rs",
+    "client.rs",
+    "server.rs",
+    "Cargo.toml",
+];
 
 /// Substrings that must never appear in generated code.
 const FORBIDDEN: &[&str] = &[

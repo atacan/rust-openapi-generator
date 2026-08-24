@@ -133,9 +133,10 @@ pub struct PlannedApi {
     /// server emitter gates its validation calls without extra plumbing.
     pub server_runtime_validation: bool,
     /// Enabled codec plugin ids copied from [`PlanConfig::generator_options`]
-    /// (main spec §45). Manifest emission stays future work (§3.1), but the
-    /// dependency fragments for these ids are available through
-    /// [`super::codecs::manifest_dependency_for`] for when it lands.
+    /// (main spec §45). Emitted-manifest generation
+    /// ([`super::manifest::generate_manifest`]) cross-checks its configured
+    /// ids against these and resolves dependency fragments through
+    /// [`super::codecs::manifest_dependency_for`].
     pub enabled_codecs: BTreeSet<&'static str>,
 }
 
