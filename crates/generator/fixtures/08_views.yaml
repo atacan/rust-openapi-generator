@@ -1,12 +1,18 @@
 # Fixture 08 — directional views (companion §5): readOnly/writeOnly markers
 # produce <Name>Write / <Name>Read view types while shared models keep every
-# field. Covers:
+# field, and the operation codecs consume the directional cut: request
+# payloads target <M>Write, response payloads <M>Read. Covers:
 #   (a) Account      — required writeOnly password + required directionless id
 #                      + optional directionless note (§5 Widget/password rule);
+#                      POST /accounts exercises the lossless write view (the
+#                      router reconstructs the shared model before the trait);
 #   (b) AuditEntry   — required readOnly createdAt + optional writeOnly
 #                      draftNote + optional nullable metadata;
+#                      GET /audit/{id} serves the read view;
 #   (c) SyncedRecord — mixes readOnly AND writeOnly (one direction lossless,
-#                      the other not);
+#                      the other not); PUT /synced carries a constrained kept
+#                      field (label minLength) so the Write view emits and the
+#                      router calls validate_request;
 #   (d) PlainNote    — no markers at all: NO view types emitted (identity).
 openapi: 3.1.0
 info:
@@ -29,9 +35,15 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Account'
-  /audit-entries:
+  /audit/{id}:
     get:
       operationId: listAuditEntries
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
       responses:
         '200':
           description: OK
@@ -39,8 +51,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AuditEntry'
-  /synced-records:
-    post:
+  /synced:
+    put:
       operationId: syncRecord
       requestBody:
         required: true
@@ -89,6 +101,7 @@ components:
           readOnly: true
         label:
           type: string
+          minLength: 3
         secretToken:
           type: string
           writeOnly: true

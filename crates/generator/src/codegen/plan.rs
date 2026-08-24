@@ -4,6 +4,27 @@
 //! representations (§5–§7, §21–§25), the companion §6 parameter matrix, and
 //! the operation-wide `Accept` union (§29).
 //!
+//! # Directional view consumption (companion §5, main spec §50 test 50)
+//!
+//! Every content entry whose resolved component carries at least one
+//! `readOnly`/`writeOnly` property is planned onto the directional cut
+//! ([`super::views`]): request-side payloads (JSON family, forms, streams,
+//! codecs) target `<M>Write`, response-side payloads target `<M>Read`.
+//! [`PlannedContent::model_expr`] carries that direction-resolved type, so
+//! both emitters consume views without re-deriving them.
+//!
+//! Recorded contract decision for trait signatures (router auto-converts
+//! when lossless): a SINGLE-content structured body whose write view can
+//! reconstruct the shared model (`From<&<M>Write> for <M>` exists — every
+//! view-omitted field optional, §5 lossless rule) keeps the SHARED model in
+//! the API-trait signature; the generated router decodes into `<M>Write`,
+//! runs its `validate_request`, converts through the lossless `From`, and
+//! hands the shared model to the trait. When reconstruction would lose data,
+//! the trait takes the `<M>Write` view itself. Multi-content request ENUMS
+//! always carry the decoded `<M>Write` views end-to-end (per-variant
+//! auto-conversion would require doubling the enum); handlers convert the
+//! variants they need.
+//!
 //! Planning is pure and deterministic (declaration order everywhere,
 //! stable sorts only); shapes Phase 1 cannot honor surface as Error
 //! diagnostics instead of improvised output (stop-and-report policy).
@@ -22,6 +43,7 @@ use crate::normalize::{NormalizedDocument, NormalizedOperation};
 
 use super::codecs::{CodecBinding, MediaCodecPlugin};
 use super::validation::{analyze, Analysis};
+use super::views::{self, ViewBinding};
 
 /// Generator configuration for planning (main spec §29 configured preference
 /// order hook).
@@ -216,10 +238,18 @@ pub struct PlannedContent {
     /// Base type/subtype (parameters stripped) kept verbatim for `Accept`,
     /// `Content-Type`, and runtime matching.
     pub media_type_literal: String,
-    /// Rust type path into `super::models` for JsonFamily; `String` for
-    /// PlainText; empty for streaming classes (each emitter renders its own
-    /// payload type from [`MediaClass`] or [`Self::stream`]).
+    /// Rust type of the decoded/encoded payload for this entry's DIRECTION
+    /// (companion §5): the shared models.rs path when the component carries
+    /// no directional markers, otherwise `<M>Write` on requests and
+    /// `<M>Read` on responses. `String` for PlainText; empty for streaming
+    /// classes (each emitter renders its own payload type from
+    /// [`MediaClass`] or [`Self::stream`]).
     pub model_expr: String,
+    /// Directional-view facts for this entry, present exactly when the
+    /// resolved component carries views ([`super::views`]); drives the
+    /// emitters' import routing (`super::views`) and the server-side
+    /// lossless auto-conversion contract.
+    pub view: Option<PlannedViewPayload>,
     pub is_wildcard: bool,
     /// Typed field plan for `multipart/form-data` request entries (§17):
     /// populated when [`MediaClass::Multipart`] is planned for a REQUEST;
@@ -243,6 +273,18 @@ pub struct PlannedContent {
     /// entry to stream. Both directions then become bounded-collect +
     /// codec-parse / codec-encode through the fail-fast counting writer.
     pub codec: Option<CodecBinding>,
+}
+
+/// Directional-view facts attached to one content entry (companion §5).
+#[derive(Debug, Clone)]
+pub struct PlannedViewPayload {
+    /// Shared-model type name behind the directional cut (the models.rs
+    /// path the trait keeps when the write view reconstructs losslessly).
+    pub shared_type: String,
+    /// True when `From<&<M>Write> for <M>` exists: the router may convert
+    /// the decoded view into the shared model before invoking the trait
+    /// (recorded contract decision, see the module docs).
+    pub write_lossless: bool,
 }
 
 /// Wire framing of one streaming record entry (main spec §5.6–§5.8).
@@ -287,8 +329,11 @@ impl StreamFraming {
 #[derive(Debug, Clone)]
 pub struct PlannedStream {
     pub framing: StreamFraming,
-    /// Rust type path into `super::models` of ONE streamed item.
+    /// Rust type path of ONE streamed item, direction-resolved like
+    /// [`PlannedContent::model_expr`] (companion §5).
     pub item_model_path: String,
+    /// True when [`Self::item_model_path`] names a `super::views` type.
+    pub item_from_views: bool,
 }
 
 impl PlannedContent {
@@ -400,10 +445,20 @@ pub fn plan_api_with_config(
     // order is the claim precedence when several enabled plugins handle one
     // literal.
     let registry = super::codecs::default_registry();
+    // Directional-view facts extracted from the SAME discovery pass that
+    // renders views.rs (companion §5), so planner and emitter can never
+    // disagree on names, losslessness, or validators (main spec §50 test 50).
+    let view_bindings = views::view_bindings(doc);
     let mut operations = Vec::with_capacity(doc.operations.len());
     for operation in &doc.operations {
         operations.push(plan_operation(
-            doc, operation, config, &registry, &analysis, &mut diags,
+            doc,
+            operation,
+            config,
+            &registry,
+            &analysis,
+            &view_bindings,
+            &mut diags,
         ));
     }
     diags.into_result(PlannedApi {
@@ -413,12 +468,14 @@ pub fn plan_api_with_config(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_operation(
     doc: &NormalizedDocument,
     operation: &NormalizedOperation,
     config: &PlanConfig,
     registry: &[Box<dyn MediaCodecPlugin>],
     analysis: &Analysis,
+    view_bindings: &BTreeMap<u32, ViewBinding>,
     diags: &mut Diagnostics,
 ) -> PlannedOperation {
     let location = operation_location(operation);
@@ -442,6 +499,7 @@ fn plan_operation(
             config,
             registry,
             analysis,
+            view_bindings,
         );
         if request_contents.len() >= 2 {
             let stem = operation
@@ -470,6 +528,7 @@ fn plan_operation(
                 config,
                 registry,
                 analysis,
+                view_bindings,
             );
             let headers = plan_response_headers(doc, response, operation.method, &location, diags);
             let status = PlannedStatus {
@@ -678,6 +737,7 @@ fn plan_contents(
     config: &PlanConfig,
     registry: &[Box<dyn MediaCodecPlugin>],
     analysis: &Analysis,
+    view_bindings: &BTreeMap<u32, ViewBinding>,
 ) -> Vec<PlannedContent> {
     let mut planned = Vec::with_capacity(contents.len());
     let mut used_variants: BTreeSet<String> = BTreeSet::new();
@@ -756,6 +816,8 @@ fn plan_contents(
                 entry,
                 effective_class,
                 &base_literal,
+                side,
+                view_bindings,
                 config,
                 registry,
                 location,
@@ -764,6 +826,10 @@ fn plan_contents(
         };
         let variant_base = content_variant_base(&base_literal, entry.is_wildcard);
         let variant = unique_variant(&variant_base, &mut used_variants);
+        // Directional-view facts of this entry's resolved component
+        // (companion §5); `None` keeps the shared-model payload untouched.
+        let effective_schema = doc.resolve_alias(entry.schema);
+        let binding = view_bindings.get(&effective_schema.0);
         let mut multipart_spec = None;
         // §18.1: the item schema is the entry schema UNLESS the
         // `x-rust-stream-item` override is present (the override wins).
@@ -777,14 +843,24 @@ fn plan_contents(
             _ => None,
         } {
             let item_schema = entry.stream_item_override.unwrap_or(entry.schema);
+            let item_binding = view_bindings.get(&doc.resolve_alias(item_schema).0);
             stream = Some(PlannedStream {
                 framing,
-                item_model_path: json_model_expr(doc, item_schema, location, diags),
+                item_model_path: json_payload_expr(
+                    doc,
+                    item_schema,
+                    item_binding,
+                    side,
+                    location,
+                    diags,
+                ),
+                item_from_views: item_binding.is_some(),
             });
         }
         let model_expr = match effective_class {
-            MediaClass::JsonFamily => json_model_expr(doc, entry.schema, location, diags),
-            MediaClass::UrlEncodedForm => json_model_expr(doc, entry.schema, location, diags),
+            MediaClass::JsonFamily | MediaClass::UrlEncodedForm => {
+                json_payload_expr(doc, entry.schema, binding, side, location, diags)
+            }
             MediaClass::PlainText => "String".to_owned(),
             MediaClass::Multipart => {
                 multipart_spec = plan_multipart_spec(doc, entry, location, diags, analysis);
@@ -792,8 +868,8 @@ fn plan_contents(
             }
             // Binary/RawUnknown/stream classes; each emitter renders its own
             // payload type from [`MediaClass`] or [`PlannedContent::stream`].
-            // Codec-claimed entries carry the shared models.rs path on their
-            // [`CodecBinding`] instead.
+            // Codec-claimed entries carry the direction-resolved models.rs
+            // path on their [`CodecBinding`] instead.
             _ => String::new(),
         };
         // Constrained scalar aliases carry their models.rs free validator
@@ -802,13 +878,24 @@ fn plan_contents(
         // inline scalars have no validator to call (documented leniency),
         // and anonymous composites are plan-time Errors anyway. Codec
         // entries resolve the SAME models.rs types as JsonFamily, so they
-        // participate identically.
+        // participate identically. View-carrying request payloads validate
+        // through the WRITE view's own validator (companion §5/§9
+        // continuity): only constraints on fields the write direction keeps
+        // can violate on that wire shape.
         let body_validation = match effective_class {
             MediaClass::JsonFamily | MediaClass::UrlEncodedForm | MediaClass::PlainText => {
-                validation_for(doc, entry.schema, entry.media_class, false, analysis)
+                if side == ContentSide::Request && binding.is_some() {
+                    view_request_validation(binding)
+                } else {
+                    validation_for(doc, entry.schema, entry.media_class, false, analysis)
+                }
             }
             _ if claimed.is_some() => {
-                validation_for(doc, entry.schema, entry.media_class, true, analysis)
+                if side == ContentSide::Request && binding.is_some() {
+                    view_request_validation(binding)
+                } else {
+                    validation_for(doc, entry.schema, entry.media_class, true, analysis)
+                }
             }
             _ => None,
         };
@@ -817,6 +904,15 @@ fn plan_contents(
             media_class: effective_class,
             media_type_literal: base_literal,
             model_expr,
+            view: match binding {
+                Some(view) => {
+                    component_name(doc, effective_schema).map(|shared_type| PlannedViewPayload {
+                        shared_type,
+                        write_lossless: view.write_lossless,
+                    })
+                }
+                None => None,
+            },
             is_wildcard: entry.is_wildcard,
             multipart_spec,
             stream,
@@ -825,6 +921,42 @@ fn plan_contents(
         });
     }
     planned
+}
+
+/// Companion §9 continuity for a decoded WRITE view (companion §5): the
+/// router calls its inherent validator exactly when the view emits one.
+fn view_request_validation(binding: Option<&ViewBinding>) -> Option<PlannedBodyValidation> {
+    let view = binding?;
+    view.write_validates
+        .then_some(PlannedBodyValidation::Inherent)
+}
+
+/// Direction-resolved payload type for one JSON-family/form/stream/codec
+/// schema (companion §5): view-carrying components target `<M>Write` on the
+/// request side and `<M>Read` on the response side; every other component
+/// keeps the legacy shared models.rs expression.
+fn json_payload_expr(
+    doc: &NormalizedDocument,
+    schema: SchemaId,
+    binding: Option<&ViewBinding>,
+    side: ContentSide,
+    location: &DocumentPath,
+    diags: &mut Diagnostics,
+) -> String {
+    let Some(view) = binding else {
+        return json_model_expr(doc, schema, location, diags);
+    };
+    let effective = doc.resolve_alias(schema);
+    let name = if side == ContentSide::Request {
+        &view.write
+    } else {
+        &view.read
+    };
+    if doc.resolution(effective).nullable {
+        format!("Option<{name}>")
+    } else {
+        name.clone()
+    }
 }
 
 /// Companion §9 validator resolution shared by the textual classes and
@@ -862,13 +994,17 @@ fn validation_for(
 /// fallback (unclassified/wildcard-free RawUnknown) — codecs never steal the
 /// JSON/text/form/multipart/streaming families. First enabled handler in
 /// registry order wins; the model path resolves through the SAME pipeline as
-/// the JSON family so both share models.rs types and Serde derives.
+/// the JSON family so both share types and Serde derives — directionally cut
+/// to `<M>Write`/`<M>Read` exactly when the resolved component carries views
+/// (companion §5).
 #[allow(clippy::too_many_arguments)]
 fn codec_claim(
     doc: &NormalizedDocument,
     entry: &ContentEntryIr,
     effective_class: MediaClass,
     base_literal: &str,
+    side: ContentSide,
+    view_bindings: &BTreeMap<u32, ViewBinding>,
     config: &PlanConfig,
     registry: &[Box<dyn MediaCodecPlugin>],
     location: &DocumentPath,
@@ -884,11 +1020,13 @@ fn codec_claim(
             .contains(&candidate.id())
             && candidate.handles(base_literal)
     })?;
+    let binding = view_bindings.get(&doc.resolve_alias(entry.schema).0);
     Some(CodecBinding {
         plugin_id: plugin.id(),
-        model_path: json_model_expr(doc, entry.schema, location, diags),
+        model_path: json_payload_expr(doc, entry.schema, binding, side, location, diags),
         runtime_crate: plugin.runtime_crate(),
         feature_note: plugin.feature_note(),
+        model_from_views: binding.is_some(),
     })
 }
 

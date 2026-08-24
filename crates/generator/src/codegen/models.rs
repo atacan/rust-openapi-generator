@@ -107,6 +107,7 @@ pub fn generate_models(doc: &NormalizedDocument) -> String {
         needs_btree_map: false,
         needs_serde: false,
         analysis: analyze(doc),
+        validation: ValidationStatements::new(doc),
         defs: Vec::new(),
     };
     for (schema, name) in components.iter().zip(names.iter()) {
@@ -223,19 +224,19 @@ const RUSTFMT_MAX_WIDTH: usize = 100;
 
 /// Statement pad inside an inherent `validate_request` method body
 /// (indentation level two).
-const METHOD_PAD: &str = "        ";
+pub(crate) const METHOD_PAD: &str = "        ";
 
 /// One support-crate validation call with optional field annotation
 /// (companion §9): `field` names the generated location so routers surface
 /// `Violation::Field` paths through SchemaViolation 422 details.
-struct CheckCall {
+pub(crate) struct CheckCall {
     /// Callee expression WITHOUT the opening paren.
-    callee: String,
+    pub(crate) callee: String,
     /// Fully rendered arguments (may themselves be nested blocks).
-    args: Vec<String>,
+    pub(crate) args: Vec<String>,
     /// Field label for `Violation::at_field`; `None` leaves bare errors
     /// (undecidable-context predicates feeding `is_ok()` only).
-    field: Option<String>,
+    pub(crate) field: Option<String>,
 }
 
 /// Annotated composite-recursion statement
@@ -243,7 +244,7 @@ struct CheckCall {
 /// A single flat call keeps emitted code free of multi-method chains, whose
 /// rustfmt layout is context-dependent; [`CheckCall::render`] owns the width
 /// decisions.
-fn annotated_call(expr: &str, field: Option<&str>, level: usize) -> Vec<String> {
+pub(crate) fn annotated_call(expr: &str, field: Option<&str>, level: usize) -> Vec<String> {
     let Some(field) = field else {
         return vec![format!("{}{};", "    ".repeat(level), expr)];
     };
@@ -256,7 +257,7 @@ fn annotated_call(expr: &str, field: Option<&str>, level: usize) -> Vec<String> 
 }
 
 impl CheckCall {
-    fn render(&self, level: usize) -> Vec<String> {
+    pub(crate) fn render(&self, level: usize) -> Vec<String> {
         let pad = "    ".repeat(level);
         let inner = format!("{pad}    ");
         let annotation = self.field.as_deref().map(|field| {
@@ -314,7 +315,7 @@ impl CheckCall {
 
 /// `validate_string` + `validate_format_string` against one accessor
 /// expression (already borrow-shaped, e.g. `&self.code` or `value`).
-fn string_check_lines(
+pub(crate) fn string_check_lines(
     accessor: &str,
     validation: &ValidationMeta,
     field: Option<&str>,
@@ -361,7 +362,7 @@ fn string_check_lines(
 }
 
 /// `validate_number` against one value expression.
-fn number_check_lines(
+pub(crate) fn number_check_lines(
     value_expr: &str,
     numeric: &crate::ir::schema::NumericValidation,
     field: Option<&str>,
@@ -396,7 +397,7 @@ fn number_check_lines(
     .render(level)
 }
 
-fn option_u64(value: Option<u64>) -> String {
+pub(crate) fn option_u64(value: Option<u64>) -> String {
     value.map_or_else(|| "None".to_owned(), |value| format!("Some({value})"))
 }
 
@@ -436,6 +437,9 @@ struct Generator<'a> {
     /// Shared runtime-validation verdicts (companion §9); consulted for
     /// nested recursion and alias free functions.
     analysis: Analysis,
+    /// Shared check-statement builders (companion §9), reused verbatim by
+    /// the directional view emitter for `<M>Write` validators.
+    validation: ValidationStatements<'a>,
     defs: Vec<Def>,
 }
 
@@ -938,12 +942,90 @@ impl<'a> Generator<'a> {
         }
     }
 
+    /// All statements for one object field: delegates to the shared
+    /// [`ValidationStatements`] builders (companion §9), which both emitters
+    /// use verbatim.
+    fn field_check_lines(
+        &self,
+        field_name: &str,
+        effective: SchemaId,
+        validation: &ValidationMeta,
+        boxed: bool,
+        wrapper: Wrapper,
+    ) -> Vec<String> {
+        self.validation
+            .field_check_lines(field_name, effective, validation, boxed, wrapper)
+    }
+
+    /// Free validator function for a constrained scalar alias component
+    /// (the `Slug` case); `None` for everything else.
+    fn alias_validator(&self, component_name: &str, effective: SchemaId) -> Option<AliasValidator> {
+        let alias = self.analysis.scalar_alias(effective)?;
+        let validation = self.doc.resolution(effective).validation.clone();
+        // Free function bodies sit at indentation level one; the whole-alias
+        // value carries no field label (routers add the body context).
+        let mut body = match alias.kind {
+            ScalarParamKind::Str => string_check_lines("value", &validation, None, 1),
+            ScalarParamKind::Int => {
+                number_check_lines("*value as f64", &validation.numeric, None, 1)
+            }
+            ScalarParamKind::Float => number_check_lines("*value", &validation.numeric, None, 1),
+        };
+        body.push("    Ok(())".to_owned());
+        let param_ty = match alias.kind {
+            ScalarParamKind::Str => "&str",
+            ScalarParamKind::Int => "&i64",
+            ScalarParamKind::Float => "&f64",
+        };
+        Some(AliasValidator {
+            fn_name: alias.fn_name.clone(),
+            param_ty,
+            docs: vec![format!(
+                "Server-side request validation (companion §9) for the \
+                 constrained scalar alias `{component_name}`: bucket-2 \
+                 constraints enforced on server requests; client encoding \
+                 stays lenient."
+            )],
+            body,
+        })
+    }
+}
+
+/// Shared runtime-validation statement builders (companion §9): the exact
+/// bucket-2 check emission used by `models.rs`, exposed to the directional
+/// view emitter so `<M>Write` views carry byte-identical validators keyed
+/// by their surviving field lists (main spec §50 test 50 continuity).
+pub(crate) struct ValidationStatements<'a> {
+    doc: &'a NormalizedDocument,
+    analysis: Analysis,
+}
+
+impl<'a> ValidationStatements<'a> {
+    pub(crate) fn new(doc: &'a NormalizedDocument) -> Self {
+        Self {
+            doc,
+            analysis: analyze(doc),
+        }
+    }
+
+    fn chase(&self, id: SchemaId) -> SchemaId {
+        self.doc.resolve_alias(id)
+    }
+
+    fn resolution_of(&self, id: SchemaId) -> &ResolvedKind {
+        &self.doc.resolution(id).kind
+    }
+
+    fn validation_of(&self, id: SchemaId) -> ValidationMeta {
+        self.doc.resolution(id).validation.clone()
+    }
+
     /// All statements for one object field: scalar constraints, array
     /// cardinality/uniqueness/items/contains, recursion into validated
     /// composites — each guarded by the presence wrapper when the matrix
     /// cell wraps the value. Direct statements render at method-body level
     /// two; wrapped statements at level three inside their `if let` head.
-    fn field_check_lines(
+    pub(crate) fn field_check_lines(
         &self,
         field_name: &str,
         effective: SchemaId,
@@ -1255,7 +1337,7 @@ impl<'a> Generator<'a> {
 
     /// Base [`SchemaKind`] after composition resolution; composite verdicts
     /// come from the resolution itself, not this view.
-    fn effective_base_kind(&self, effective: SchemaId) -> Option<SchemaKind> {
+    pub(crate) fn effective_base_kind(&self, effective: SchemaId) -> Option<SchemaKind> {
         match self.resolution_of(effective).clone() {
             ResolvedKind::IntersectedScalar(scalar) => Some(scalar.base_kind),
             ResolvedKind::RawValueFallback(_) | ResolvedKind::Alias(_) => None,
@@ -1265,7 +1347,7 @@ impl<'a> Generator<'a> {
     }
 
     /// Composite shapes that emit a `validate_request` method.
-    fn is_validated_composite(&self, effective: SchemaId) -> bool {
+    pub(crate) fn is_validated_composite(&self, effective: SchemaId) -> bool {
         let composite = matches!(
             self.resolution_of(effective),
             ResolvedKind::MergedObject(_) | ResolvedKind::ClosedEnum(_)
@@ -1276,45 +1358,12 @@ impl<'a> Generator<'a> {
             );
         composite && self.analysis.has_validator(effective)
     }
-
-    /// Free validator function for a constrained scalar alias component
-    /// (the `Slug` case); `None` for everything else.
-    fn alias_validator(&self, component_name: &str, effective: SchemaId) -> Option<AliasValidator> {
-        let alias = self.analysis.scalar_alias(effective)?;
-        let validation = self.doc.resolution(effective).validation.clone();
-        // Free function bodies sit at indentation level one; the whole-alias
-        // value carries no field label (routers add the body context).
-        let mut body = match alias.kind {
-            ScalarParamKind::Str => string_check_lines("value", &validation, None, 1),
-            ScalarParamKind::Int => {
-                number_check_lines("*value as f64", &validation.numeric, None, 1)
-            }
-            ScalarParamKind::Float => number_check_lines("*value", &validation.numeric, None, 1),
-        };
-        body.push("    Ok(())".to_owned());
-        let param_ty = match alias.kind {
-            ScalarParamKind::Str => "&str",
-            ScalarParamKind::Int => "&i64",
-            ScalarParamKind::Float => "&f64",
-        };
-        Some(AliasValidator {
-            fn_name: alias.fn_name.clone(),
-            param_ty,
-            docs: vec![format!(
-                "Server-side request validation (companion §9) for the \
-                 constrained scalar alias `{component_name}`: bucket-2 \
-                 constraints enforced on server requests; client encoding \
-                 stays lenient."
-            )],
-            body,
-        })
-    }
 }
 
 /// Presence wrapper of one field in the generated struct, deciding both the
 /// accessor expressions and the `if let` guard of its checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Wrapper {
+pub(crate) enum Wrapper {
     /// Required + non-nullable: validate the field directly.
     Direct,
     /// Required + nullable or optional + nullable (`Option<T>`).
@@ -1324,7 +1373,7 @@ enum Wrapper {
 }
 
 impl Wrapper {
-    fn from_cell(required: bool, nullable: bool) -> Self {
+    pub(crate) fn from_cell(required: bool, nullable: bool) -> Self {
         match (required, nullable) {
             (true, false) => Self::Direct,
             (false, false) => Self::OptionalField,
@@ -1349,7 +1398,7 @@ enum UniqueKind {
 /// Emits the `let mut property_count = 0_usize;` prologue ahead of the
 /// accumulated `+=` contributions when the object declares property-count
 /// bounds.
-fn wrap_property_count_intro(body: Vec<String>, counting: bool) -> Vec<String> {
+pub(crate) fn wrap_property_count_intro(body: Vec<String>, counting: bool) -> Vec<String> {
     if !counting || body.is_empty() {
         return body;
     }
@@ -1793,7 +1842,7 @@ fn emit_def(emitter: &mut Emitter, def: &Def) {
 
 /// The shared `validate_request` inherent method (companion §9): structural
 /// checks stay in Serde decode; these enforce the D-§2 bucket-2 constraints.
-fn emit_validate_request_impl(emitter: &mut Emitter, name: &str, body: &[String]) {
+pub(crate) fn emit_validate_request_impl(emitter: &mut Emitter, name: &str, body: &[String]) {
     emitter.line(0, &format!("impl {name} {{"));
     emitter.docs(
         1,

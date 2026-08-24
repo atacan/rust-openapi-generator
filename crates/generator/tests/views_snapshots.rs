@@ -356,3 +356,27 @@ fn item_block(output: &str, marker: &str) -> String {
 fn struct_block(output: &str, name: &str) -> String {
     item_block(output, &format!("pub struct {name} {{"))
 }
+
+/// Companion §9 continuity (main spec §50 test 50): Write views emit
+/// `validate_request()` keyed by their SURVIVING field list — SyncedRecord's
+/// `label` constraint rides into the write view; constraints on dropped
+/// readOnly fields would not. Read views never carry validators.
+#[test]
+fn fixture_08_write_views_validate_kept_fields_only() {
+    let output = generate_fixture("08_views.yaml");
+
+    let validator = item_block(&output, "impl SyncedRecordWrite {");
+    assert!(
+        validator.contains("pub fn validate_request(")
+            && validator.contains("validate_string")
+            && validator.contains("min_length: Some(3)")
+            && validator.contains("at_field(\"label\")"),
+        "the kept constrained field must be checked:\n{validator}"
+    );
+    assert!(
+        !output.contains("impl AccountWrite {"),
+        "no surviving constraint → no validator:\n{output}"
+    );
+    assert!(!output.contains("impl AccountRead {"), "\n{output}");
+    assert!(!output.contains("impl AuditEntryRead {"), "\n{output}");
+}

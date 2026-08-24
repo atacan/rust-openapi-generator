@@ -23,6 +23,7 @@ const SNAPSHOT_FIXTURES: &[&str] = &[
     "02_streaming_binary.yaml",
     "03_nested_content.yaml",
     "04_status_ranges.yaml",
+    "08_views.yaml",
     "10_forms_headers.yaml",
     "11_multipart.yaml",
     "12_multipart_order.yaml",
@@ -900,4 +901,53 @@ fn no_aggregation_in_streaming_snapshots() {
             "streaming snapshot aggregates via `{forbidden}` (§49)"
         );
     }
+}
+
+// ----------------------------------------------------------------------
+// Fixture 08 — directional view consumption (companion §5, §50 test 50)
+// ----------------------------------------------------------------------
+
+#[test]
+fn fixture_08_client_request_enums_and_methods_take_write_views() {
+    let output = generate_fixture("08_views.yaml");
+
+    // Convenience methods borrow the WRITE views (readOnly fields cannot be
+    // sent by construction).
+    assert!(
+        output
+            .contains("pub async fn create_account(\n        &self,\n        body: &AccountWrite,"),
+        "\n{output}"
+    );
+    assert!(output.contains("body: &SyncedRecordWrite"), "\n{output}");
+
+    // Response enums decode into READ views.
+    assert!(
+        enum_block(&output, "CreateAccountResponse").contains("Created201(AccountRead),"),
+        "\n{output}"
+    );
+    assert!(
+        enum_block(&output, "ListAuditEntriesResponse").contains("Ok200(AuditEntryRead),"),
+        "\n{output}"
+    );
+    assert!(
+        enum_block(&output, "SyncRecordResponse").contains("Ok200(SyncedRecordRead),"),
+        "\n{output}"
+    );
+
+    // The shared models are fully replaced on the wire paths: no bare
+    // Account/AuditEntry/SyncedRecord payload remains anywhere.
+    for shared in ["Account)", "AuditEntry)", "SyncedRecord)"] {
+        assert!(
+            !output.contains(shared),
+            "shared-model payload `{shared}` must not remain:\n{output}"
+        );
+    }
+
+    // View types import from `super::views`, and the module documents the
+    // directional policy.
+    assert!(output.contains("use super::views::"), "\n{output}");
+    assert!(
+        output.contains("Directional views (companion §5"),
+        "\n{output}"
+    );
 }

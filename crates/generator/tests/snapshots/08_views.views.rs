@@ -27,6 +27,7 @@ use super::models::SyncedRecord;
 
 /// Directional write view of `Account` (companion §5): client request encode and server request decode wire shape.
 /// Every property survives in this direction.
+/// Decoding ignores unrecognized keys unless the schema declares `additionalProperties: false`; off-direction fields sent out of place therefore never fail decode here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountWrite {
     pub id: String,
@@ -61,6 +62,7 @@ impl From<&AccountWrite> for Account {
 
 /// Directional read view of `Account` (companion §5): server response encode and client response decode wire shape.
 /// writeOnly properties are omitted here: password.
+/// Decoding ignores unrecognized keys unless the schema declares `additionalProperties: false`; off-direction fields sent out of place therefore never fail decode here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountRead {
     pub id: String,
@@ -81,6 +83,7 @@ impl From<&Account> for AccountRead {
 
 /// Directional write view of `AuditEntry` (companion §5): client request encode and server request decode wire shape.
 /// readOnly properties are omitted here: created_at.
+/// Decoding ignores unrecognized keys unless the schema declares `additionalProperties: false`; off-direction fields sent out of place therefore never fail decode here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditEntryWrite {
     #[serde(rename = "draftNote")]
@@ -103,6 +106,7 @@ impl From<&AuditEntry> for AuditEntryWrite {
 
 /// Directional read view of `AuditEntry` (companion §5): server response encode and client response decode wire shape.
 /// writeOnly properties are omitted here: draft_note.
+/// Decoding ignores unrecognized keys unless the schema declares `additionalProperties: false`; off-direction fields sent out of place therefore never fail decode here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuditEntryRead {
     #[serde(rename = "createdAt")]
@@ -136,8 +140,10 @@ impl From<&AuditEntryRead> for AuditEntry {
 
 /// Directional write view of `SyncedRecord` (companion §5): client request encode and server request decode wire shape.
 /// readOnly properties are omitted here: id, reviewed_by.
+/// Decoding ignores unrecognized keys unless the schema declares `additionalProperties: false`; off-direction fields sent out of place therefore never fail decode here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SyncedRecordWrite {
+    /// Constraints (enforced by generated routers on server requests, companion §9; lenient on client decode): minLength >= 3.
     pub label: String,
     #[serde(rename = "secretToken")]
     #[serde(default, skip_serializing_if = "openapi_support::optional::is_absent")]
@@ -155,11 +161,32 @@ impl From<&SyncedRecord> for SyncedRecordWrite {
     }
 }
 
+impl SyncedRecordWrite {
+    /// Server-side request validation (companion §9): structural checks stay in Serde decode; these enforce the D-§2
+    /// bucket-2 constraints. Client decoding stays lenient.
+    pub fn validate_request(
+        &self,
+    ) -> ::std::result::Result<(), ::openapi_support::validation::Violation> {
+        ::openapi_support::validation::validate_string(
+            &self.label,
+            &::openapi_support::validation::StringConstraints {
+                pattern: None,
+                min_length: Some(3),
+                max_length: None,
+            },
+        )
+        .map_err(|error| error.at_field("label"))?;
+        Ok(())
+    }
+}
+
 /// Directional read view of `SyncedRecord` (companion §5): server response encode and client response decode wire shape.
 /// writeOnly properties are omitted here: secret_token.
+/// Decoding ignores unrecognized keys unless the schema declares `additionalProperties: false`; off-direction fields sent out of place therefore never fail decode here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SyncedRecordRead {
     pub id: String,
+    /// Constraints (enforced by generated routers on server requests, companion §9; lenient on client decode): minLength >= 3.
     pub label: String,
     #[serde(rename = "reviewedBy")]
     #[serde(default, skip_serializing_if = "openapi_support::optional::is_absent")]

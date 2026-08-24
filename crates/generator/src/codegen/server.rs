@@ -14,7 +14,28 @@
 //! constructors.
 //!
 //! Generated code references only `::openapi_support`, `::axum`, `::http`,
-//! `::mime`, `::bytes`, `serde_json`, and `super::models`.
+//! `::mime`, `::bytes`, `serde_json`, `super::models`, and `super::views`.
+//!
+//! # Directional views (companion §5, main spec §50 test 50)
+//!
+//! Request payloads decode into `<M>Write` for view-carrying components
+//! (readOnly fields structurally absent from the wire; required-in-write
+//! fields mandatory at Serde decode → data errors reject 422 pre-handler);
+//! response payloads carry `<M>Read` so writeOnly fields never reach the
+//! wire. Views do NOT set `deny_unknown_fields` (unless a schema declares
+//! `additionalProperties: false`): surplus keys — e.g. a client sending an
+//! off-direction field — are IGNORED on decode like the shared models'
+//! default policy.
+//!
+//! Recorded trait-signature contract decision (router auto-converts when
+//! lossless): a single-content structured body whose `<M>Write` view can
+//! reconstruct the shared model (`From<&<M>Write> for <M>` exists, §5
+//! lossless rule) keeps the SHARED model on the API-trait signature; the
+//! router decodes the view, runs its `validate_request`, converts through
+//! the lossless `From`, and passes the shared value to the trait. When
+//! reconstruction would lose data (a dropped required field), the trait
+//! takes the `<M>Write` view itself. Multi-content request enums always
+//! carry decoded views end-to-end; handlers convert per-variant.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -54,7 +75,7 @@ pub fn generate_server(doc: &NormalizedDocument, plan: &PlannedApi) -> String {
     }
 
     let mut emitter = Emitter::new();
-    emit_header(&mut emitter, doc);
+    emit_header(&mut emitter, doc, &flags);
 
     // The generated encoders and no-body arms CALL `IntoResponse::
     // into_response`, so the trait must be in scope; importing it whenever
@@ -499,7 +520,12 @@ fn is_decodable_content(content: &PlannedContent) -> bool {
 
 #[derive(Debug, Default)]
 struct Flags {
+    /// Shared-model type names referenced somewhere (`use super::models::…`).
     model_types: BTreeSet<String>,
+    /// Directional-view type names referenced somewhere
+    /// (`use super::views::…`, companion §5): decoded `<M>Write` request
+    /// payloads and encoded `<M>Read` response payloads.
+    view_types: BTreeSet<String>,
     has_operations: bool,
     needs_into_response_trait: bool,
     needs_invalid_parameter: bool,
@@ -595,6 +621,26 @@ impl Flags {
         for content in &operation.request_contents {
             self.scan_request_content(content);
         }
+        // Directional-view contract (companion §5): a SINGLE-content
+        // structured/codec body whose write view reconstructs losslessly
+        // keeps the SHARED model on the trait signature, so its import rides
+        // here; enum/multipart/stream bodies never convert.
+        if operation.request_body_enum_name.is_none() {
+            if let [content] = operation.request_contents.as_slice() {
+                if let Some(view) = &content.view {
+                    let convertible = content.codec.is_some()
+                        || (!content.is_wildcard
+                            && content.stream.is_none()
+                            && matches!(
+                                content.media_class,
+                                MediaClass::JsonFamily | MediaClass::UrlEncodedForm
+                            ));
+                    if convertible && view.write_lossless {
+                        self.model_types.insert(view.shared_type.clone());
+                    }
+                }
+            }
+        }
         for status in &operation.statuses {
             self.scan_status(status);
         }
@@ -608,8 +654,7 @@ impl Flags {
             // §45 codec-claimed request entry: bounded collect then the
             // generated per-codec decode (D-impl-codec-plugins).
             self.decode_codecs.insert(binding.plugin_id.to_owned());
-            self.model_types
-                .extend(model_type_names(&binding.model_path));
+            self.note_payload(&binding.model_path, binding.model_from_views);
             self.import_body_validator(content);
             return;
         }
@@ -619,8 +664,7 @@ impl Flags {
         }
         match content.media_class {
             MediaClass::JsonFamily => {
-                self.model_types
-                    .extend(model_type_names(&content.model_expr));
+                self.note_payload(&content.model_expr, content.view.is_some());
                 self.import_body_validator(content);
                 self.needs_json_decode = true;
                 self.needs_charset_check = true;
@@ -628,8 +672,7 @@ impl Flags {
             MediaClass::UrlEncodedForm => {
                 // Bounded form decode per §16/D-impl-forms; axum's Form
                 // extractor is never used (the router self-decodes).
-                self.model_types
-                    .extend(model_type_names(&content.model_expr));
+                self.note_payload(&content.model_expr, content.view.is_some());
                 self.import_body_validator(content);
                 self.needs_form_decode = true;
                 self.needs_charset_check = true;
@@ -672,8 +715,7 @@ impl Flags {
                     self.request_framings.insert(framing);
                 }
                 if let Some(stream) = &content.stream {
-                    self.model_types
-                        .extend(model_type_names(&stream.item_model_path));
+                    self.note_payload(&stream.item_model_path, stream.item_from_views);
                 }
             }
             // Planning rejects SSE/NDJSON/JSON-seq; they are later
@@ -693,6 +735,16 @@ impl Flags {
         }
     }
 
+    /// Routes one payload type name into the right import bucket: shared
+    /// models vs directional views (`super::views`, companion §5).
+    fn note_payload(&mut self, expr: &str, from_views: bool) {
+        if from_views {
+            self.view_types.extend(model_type_names(expr));
+        } else {
+            self.model_types.extend(model_type_names(expr));
+        }
+    }
+
     fn scan_status(&mut self, status: &PlannedStatus) {
         if !status.headers.is_empty() {
             self.needs_typed_headers = true;
@@ -704,27 +756,18 @@ impl Flags {
             }
             match content.media_class {
                 MediaClass::JsonFamily => {
-                    self.model_types
-                        .extend(model_type_names(&content.model_expr));
+                    self.note_payload(&content.model_expr, content.view.is_some());
                     self.needs_serialize_json = true;
                 }
                 MediaClass::PlainText => self.needs_encode_text = true,
                 MediaClass::Binary | MediaClass::RawUnknown if content.codec.is_some() => {
                     // §45: codec-claimed response entries encode bounded
                     // through the generated per-codec helper.
-                    let plugin_id = content
-                        .codec
-                        .as_ref()
-                        .expect("codec binding checked")
-                        .plugin_id;
-                    self.encode_codecs.insert(plugin_id.to_owned());
-                    self.model_types.extend(model_type_names(
-                        &content
-                            .codec
-                            .as_ref()
-                            .expect("codec binding checked")
-                            .model_path,
-                    ));
+                    let binding = content.codec.as_ref().expect("codec binding checked");
+                    self.encode_codecs.insert(binding.plugin_id.to_owned());
+                    let model_path = binding.model_path.clone();
+                    let from_views = binding.model_from_views;
+                    self.note_payload(&model_path, from_views);
                 }
                 MediaClass::Binary | MediaClass::RawUnknown => {
                     self.needs_stream_response = true;
@@ -736,8 +779,7 @@ impl Flags {
                         self.response_framings.insert(framing);
                     }
                     if let Some(stream) = &content.stream {
-                        self.model_types
-                            .extend(model_type_names(&stream.item_model_path));
+                        self.note_payload(&stream.item_model_path, stream.item_from_views);
                     }
                 }
                 _ => unreachable!(
@@ -834,15 +876,13 @@ fn model_type_names(expr: &str) -> Vec<String> {
 // Module header and gated imports
 // ----------------------------------------------------------------------
 
-fn emit_header(emitter: &mut Emitter, doc: &NormalizedDocument) {
-    emitter.docs(
-        0,
-        &[
-            "Axum server generated from the OpenAPI document (main spec §8 \
-             Output B)."
-                .to_owned(),
-            String::new(),
-            "Mode A traits (§37), bounded JSON/form bodies (§34; axum's Form \
+fn emit_header(emitter: &mut Emitter, doc: &NormalizedDocument, flags: &Flags) {
+    let mut docs = vec![
+        "Axum server generated from the OpenAPI document (main spec §8 \
+              Output B)."
+            .to_owned(),
+        String::new(),
+        "Mode A traits (§37), bounded JSON/form bodies (§34; axum's Form \
               extractor is never used — routes self-decode after the §28 \
              Content-Type dispatch), streaming raw payloads (§32), typed \
              documented response headers (§15: IntoResponse converts stored \
@@ -854,14 +894,34 @@ fn emit_header(emitter: &mut Emitter, doc: &NormalizedDocument) {
              Recorded decision for multi-content statuses WITH documented \
              headers: the typed fields hoist onto the status VARIANT beside \
              the content enum. The source document declares OpenAPI "
-                .to_owned()
-                + &doc.raw_version
-                + ".",
-            "Generated deterministically byte-for-byte (main spec §50 test \
-             39); do not edit by hand."
+            .to_owned()
+            + &doc.raw_version
+            + ".",
+    ];
+    // Documented ONLY when this API consumes directional views, so
+    // marker-free documents keep byte-identical output.
+    if !flags.view_types.is_empty() {
+        docs.push(String::new());
+        docs.push(
+            "Directional views (companion §5, main spec §50 test 50): request \
+             bodies decode into `<M>Write` (required write-only fields are \
+             mandatory there; required read-only fields are structurally \
+             absent and surplus keys are ignored unless a schema declares \
+             `additionalProperties: false`), response payloads carry \
+             `<M>Read` (write-only fields never reach the wire), and decoded \
+             request views run `validate_request()` before the handler. \
+             Recorded trait contract: when `<M>Write` reconstructs the \
+             shared model losslessly the router converts before invoking the \
+             trait; otherwise the trait takes the view itself."
                 .to_owned(),
-        ],
+        );
+    }
+    docs.push(
+        "Generated deterministically byte-for-byte (main spec §50 test \
+          39); do not edit by hand."
+            .to_owned(),
     );
+    emitter.docs(0, &docs);
 }
 
 fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
@@ -892,6 +952,13 @@ fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
             &model_imports,
             &["super"],
         ));
+    }
+    // Directional views (companion §5): `super::views` sorts directly after
+    // `super::models` under rustfmt's reorder_imports, so this slot keeps the
+    // block byte-stable.
+    if !flags.view_types.is_empty() {
+        let view_types: Vec<&str> = flags.view_types.iter().map(String::as_str).collect();
+        imports.push(braced_use("use super::views::", &view_types, &["super"]));
     }
 
     if flags.needs_into_response_trait {
@@ -1037,26 +1104,30 @@ fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
 /// keep the lowercase-initial-first ordering rule of the original emitter.
 fn braced_use(prefix: &str, items: &[&str], keyword_first: &[&str]) -> String {
     let _ = keyword_first;
+    // Empirical rule (verified against the pinned toolchain): a braced `use`
+    // tree stays on one line only up to [`RUSTFMT_MAX_WIDTH`] − 2 characters;
+    // the canonical broken form packs the items onto one continuation line
+    // when they fit under the same budget, else lists them one per line.
+    const USE_BUDGET: usize = RUSTFMT_MAX_WIDTH - 2;
     if items.len() == 1 {
+        // rustfmt drops redundant braces around a single use item.
         return format!("{prefix}{};", items[0]);
     }
     let joined = items.join(", ");
-    let single = format!("{prefix}{{{joined}}};");
-    if fits(0, &single) {
-        single
-    } else {
-        let mut text = format!("{prefix}{{\n");
-        let packed = format!("{joined},");
-        if fits(1, &packed) {
-            text.push_str(&format!("    {packed}\n"));
-        } else {
-            for item in items {
-                text.push_str(&format!("    {item},\n"));
-            }
-        }
-        text.push_str("};");
-        text
+    if prefix.chars().count() + joined.chars().count() + 3 <= USE_BUDGET {
+        return format!("{prefix}{{{joined}}};");
     }
+    let mut text = format!("{prefix}{{\n");
+    let packed = format!("{joined},");
+    if 4 + packed.chars().count() <= USE_BUDGET {
+        text.push_str(&format!("    {packed}\n"));
+    } else {
+        for item in items {
+            text.push_str(&format!("    {item},\n"));
+        }
+    }
+    text.push_str("};");
+    text
 }
 
 fn push_params_import(imports: &mut Vec<String>, flags: &Flags) {
@@ -3113,6 +3184,15 @@ fn trait_body_type(operation: &PlannedOperation, layout: &ServerLayout, op_index
         // wrapper (D-impl-request-direction-streams).
         return wrap(name.to_owned());
     }
+    // Directional-view contract (companion §5, recorded decision in the
+    // module docs): a lossless write view hands the router the shared model
+    // after conversion; otherwise the trait sees the decoded view itself.
+    if let Some(view) = &content.view {
+        if view.write_lossless {
+            return wrap(view.shared_type.clone());
+        }
+        return wrap(content.model_expr.clone());
+    }
     wrap(payload_type(content, None))
 }
 
@@ -3709,12 +3789,18 @@ enum EntryPayload {
     /// Single-content JSON: decodes to the model value itself.
     Json {
         model: String,
+        /// Shared-model target when the router auto-converts the decoded
+        /// `<M>Write` view before invoking the trait (companion §5 recorded
+        /// decision: lossless reconstructions only).
+        convert_to: Option<String>,
         validation: Option<PlannedBodyValidation>,
     },
     /// Single-content URL-encoded form: bounded collect then the support
     /// decoder (main spec §16); axum's `Form` extractor is never used.
     Form {
         model: String,
+        /// See [`EntryPayload::Json::convert_to`].
+        convert_to: Option<String>,
         validation: Option<PlannedBodyValidation>,
     },
     /// Single-content text: decodes to `String`.
@@ -3830,6 +3916,15 @@ impl EntryPayload {
             _ => None,
         }
     }
+
+    /// Shared-model target of the router's lossless auto-conversion
+    /// (companion §5 recorded decision), if this payload converts.
+    fn conversion_target(&self) -> Option<&str> {
+        match self {
+            Self::Json { convert_to, .. } | Self::Form { convert_to, .. } => convert_to.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 fn entry_payload(
@@ -3887,6 +3982,7 @@ fn entry_payload(
             },
             None => EntryPayload::Json {
                 model: content.model_expr.clone(),
+                convert_to: router_conversion_target(operation, content),
                 validation,
             },
         },
@@ -3898,6 +3994,7 @@ fn entry_payload(
             },
             None => EntryPayload::Form {
                 model: content.model_expr.clone(),
+                convert_to: router_conversion_target(operation, content),
                 validation,
             },
         },
@@ -3934,6 +4031,22 @@ fn entry_payload(
 fn route_is_buffered(operation: &PlannedOperation) -> bool {
     !operation.request_contents.is_empty()
         && operation.request_contents.iter().all(is_decodable_content)
+}
+
+/// Shared-model target of the router's lossless auto-conversion for a
+/// single-content structured body (companion §5 recorded decision in the
+/// module docs): only when the decoded `<M>Write` view reconstructs the
+/// shared model without inventing values. Multi-content enums, multipart,
+/// and streaming bodies never convert here.
+fn router_conversion_target(
+    operation: &PlannedOperation,
+    content: &PlannedContent,
+) -> Option<String> {
+    if operation.request_body_enum_name.is_some() {
+        return None;
+    }
+    let view = content.view.as_ref()?;
+    view.write_lossless.then(|| view.shared_type.clone())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4495,10 +4608,18 @@ fn emit_entry_yield(emitter: &mut Emitter, indent: usize, payload: &EntryPayload
         | EntryPayload::Codec { .. } => {
             // Optional bodies yield `Some(..)` so the outer presence match
             // separates Empty (None) from a decoded document (§28.2).
+            // Directional-view contract (companion §5): a lossless write
+            // view reconstructs the shared model as the arm's tail, so the
+            // trait keeps its domain type; validation already ran on the
+            // decoded view above.
+            let inner = payload
+                .conversion_target()
+                .map(|shared| format!("{shared}::from(&value)"))
+                .unwrap_or_else(|| "value".to_owned());
             if required {
-                emitter.line(indent, "value");
+                emitter.line(indent, &inner);
             } else {
-                emitter.line(indent, "Some(value)");
+                emitter.line(indent, &format!("Some({inner})"));
             }
         }
         EntryPayload::RawBody => {

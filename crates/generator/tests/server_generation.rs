@@ -1234,3 +1234,55 @@ fn no_aggregation_or_fabricated_statuses_in_streaming_snapshot() {
 fn output_probe(text: &str) -> Option<usize> {
     text.find("Self::Ok200(items) => {")
 }
+
+// ----------------------------------------------------------------------
+// Fixture 08 — directional view consumption (companion §5, §50 test 50)
+// ----------------------------------------------------------------------
+
+/// Recorded trait contract: the router decodes `<M>Write`, validates it,
+/// auto-converts when lossless (`AccountWrite` → `Account`), and otherwise
+/// hands the view to the trait (`SyncedRecordWrite`); responses carry
+/// `<M>Read` end-to-end so writeOnly fields never reach the wire.
+#[test]
+fn fixture_08_server_decodes_write_views_and_converts_lossless_bodies() {
+    let output = generate_fixture("08_views.yaml");
+
+    // Lossless request body: trait keeps the SHARED model; router converts.
+    assert!(
+        output.contains("async fn create_account(&self, body: Account) -> CreateAccountResponse;"),
+        "\n{output}"
+    );
+    let route = item_block(&output, "async fn route_create_account(");
+    assert!(
+        route.contains("let value: AccountWrite = decode_json_body(&bytes)?;")
+            && route.contains("Account::from(&value)\n        }"),
+        "router must decode the Write view then reconstruct losslessly:\n{route}"
+    );
+
+    // Lossy request body (required readOnly id would be lost): the trait
+    // takes the decoded view itself, and its validator runs pre-handler.
+    assert!(
+        output.contains(
+            "async fn sync_record(&self, body: SyncedRecordWrite) -> SyncRecordResponse;"
+        ),
+        "\n{output}"
+    );
+    let synced = item_block(&output, "async fn route_sync_record(");
+    assert!(
+        synced.contains("let value: SyncedRecordWrite = decode_json_body(&bytes)?;")
+            && synced.contains("value.validate_request())?;"),
+        "router must validate the decoded Write view:\n{synced}"
+    );
+
+    // Responses encode READ views; no shared-model payload remains.
+    assert!(
+        enum_block(&output, "CreateAccountResponse").contains("Created201(AccountRead),")
+            && enum_block(&output, "ListAuditEntriesResponse").contains("Ok200(AuditEntryRead),")
+            && enum_block(&output, "SyncRecordResponse").contains("Ok200(SyncedRecordRead),"),
+        "\n{output}"
+    );
+
+    // Imports split across models (lossless shared type only) and views.
+    assert!(output.contains("use super::models::Account;"), "\n{output}");
+    assert!(output.contains("use super::views::"), "\n{output}");
+}

@@ -36,6 +36,7 @@ pub struct AuditEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SyncedRecord {
     pub id: String,
+    /// Constraints (enforced by generated routers on server requests, companion §9; lenient on client decode): minLength >= 3.
     pub label: String,
     #[serde(rename = "secretToken")]
     #[serde(default, skip_serializing_if = "openapi_support::optional::is_absent")]
@@ -43,6 +44,25 @@ pub struct SyncedRecord {
     #[serde(rename = "reviewedBy")]
     #[serde(default, skip_serializing_if = "openapi_support::optional::is_absent")]
     pub reviewed_by: OptionalField<String>,
+}
+
+impl SyncedRecord {
+    /// Server-side request validation (companion §9): structural checks stay in Serde decode; these enforce the D-§2
+    /// bucket-2 constraints. Client decoding stays lenient.
+    pub fn validate_request(
+        &self,
+    ) -> ::std::result::Result<(), ::openapi_support::validation::Violation> {
+        ::openapi_support::validation::validate_string(
+            &self.label,
+            &::openapi_support::validation::StringConstraints {
+                pattern: None,
+                min_length: Some(3),
+                max_length: None,
+            },
+        )
+        .map_err(|error| error.at_field("label"))?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

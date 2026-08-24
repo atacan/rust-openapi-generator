@@ -59,12 +59,15 @@
 
 /// One planned codec claim over a media-type entry: carries everything the
 /// emitters need besides the plugin behavior itself. `model_path` follows the
-/// SAME models.rs resolution as the JSON family (shared Serde derives).
+/// SAME models.rs resolution as the JSON family (shared Serde derives),
+/// directionally cut to `<M>Write`/`<M>Read` when the resolved component
+/// carries directional views (companion §5).
 #[derive(Debug, Clone)]
 pub struct CodecBinding {
     /// Id of the claiming plugin ([`MediaCodecPlugin::id`]).
     pub plugin_id: &'static str,
-    /// Rust type path into `super::models`, resolved like JsonFamily.
+    /// Rust type path into `super::models` (or `super::views` when
+    /// [`Self::model_from_views`] is set), resolved like JsonFamily.
     pub model_path: String,
     /// Fully qualified runtime crate path referenced by emitted code
     /// (e.g. `"::quick_xml"`).
@@ -72,6 +75,8 @@ pub struct CodecBinding {
     /// Human-readable note about required crate features, surfaced on the
     /// binding for manifest/doc generation.
     pub feature_note: &'static str,
+    /// True when [`Self::model_path`] names a `super::views` type.
+    pub model_from_views: bool,
 }
 
 /// Compile-time codec plugin consulted during planning (§45).

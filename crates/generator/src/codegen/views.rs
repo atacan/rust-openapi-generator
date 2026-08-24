@@ -30,10 +30,52 @@
 //! byte-deterministic (declaration order only, no timestamps, no paths, main
 //! spec §50 test 39).
 //!
+//! Decode policy (companion §5): views never set `deny_unknown_fields`
+//! unless the schema itself declares `additionalProperties: false`, so extra
+//! keys — including an off-direction `readOnly` field a client sent on a
+//! request or a `writeOnly` field echoed in a response — are IGNORED on
+//! decode exactly like the shared models' default policy; directionality is
+//! enforced by the wire shape and directional requiredness, not by rejecting
+//! surplus keys.
+//!
+//! Operation-codec consumption (main spec §50 test 50): every JSON-family /
+//! form / stream / codec payload whose resolved component carries views is
+//! planned onto `<M>Write` on the request side and `<M>Read` on the response
+//! side ([`ViewBinding`] feeds [`super::plan`]); `Write` views carrying
+//! surviving constrained fields emit `validate_request()` through the exact
+//! shared statement builders of `super::models` so companion §9 guarantees
+//! hold for decoded views.
+//!
 //! Deviation note: §5 also allows a declared schema `default` to make an
 //! omitted required field reconstructible. Phase 1 models render defaults as
 //! documentation only, so a required non-nullable field counts as NOT lossless
 //! even when it carries a default; nothing is invented at any point.
+
+/// Planning-side facts about one component's directional views, extracted by
+/// the SAME deterministic discovery pass that renders `views.rs`, so the
+/// operation planner (`super::plan`) and this emitter can never disagree on
+/// names, losslessness, or validator presence (main spec §50 test 39).
+#[derive(Debug, Clone)]
+pub(crate) struct ViewBinding {
+    /// Request-side wire payload type (`<M>Write`), collision-suffixed
+    /// exactly as emitted.
+    pub(crate) write: String,
+    /// Response-side wire payload type (`<M>Read`).
+    pub(crate) read: String,
+    /// True when `From<&<M>Write> for <M>` exists: the view-omitted fields
+    /// are all optional in the shared model, so the router may reconstruct
+    /// the shared model losslessly before invoking the application trait.
+    pub(crate) write_lossless: bool,
+    /// True when the `Write` view emits a `validate_request()` method (at
+    /// least one kept field's subtree carries bucket-2 constraints).
+    pub(crate) write_validates: bool,
+}
+
+/// Runs the discovery pass once and returns the per-component view bindings
+/// keyed by the effective component arena id.
+pub(crate) fn view_bindings(doc: &NormalizedDocument) -> BTreeMap<u32, ViewBinding> {
+    build_generator(doc).bindings
+}
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -47,7 +89,10 @@ use crate::normalize::composition::{ClosedEnumChoice, MergedObject, ResolvedKind
 use crate::normalize::naming::{self, NameStyle};
 use crate::normalize::{NormalizedDocument, NormalizedSchema};
 
-use super::models::validation_lines;
+use super::models::{
+    emit_validate_request_impl, option_u64, validation_lines, wrap_property_count_intro, CheckCall,
+    ValidationStatements, Wrapper, METHOD_PAD,
+};
 use super::Emitter;
 
 /// Derive list shared with `super::models` (main spec §2.6 shape).
@@ -85,6 +130,13 @@ const RUSTFMT_MAX_WIDTH: usize = 100;
 /// pushed before their users, mirroring [`super::models`].
 #[must_use]
 pub fn generate_views(doc: &NormalizedDocument) -> String {
+    render(&build_generator(doc))
+}
+
+/// Runs the deterministic discovery pass shared by [`generate_views`] and
+/// [`view_bindings`]: identical input → identical names, blocks, and
+/// bindings (main spec §50 test 39).
+fn build_generator(doc: &NormalizedDocument) -> Generator<'_> {
     // Declaration order via ascending arena ids (components were pre-interned;
     // same recovery trick as generate_models).
     let mut components: Vec<&NormalizedSchema> = doc.schemas.values().collect();
@@ -113,13 +165,14 @@ pub fn generate_views(doc: &NormalizedDocument) -> String {
         needs_optional_field: false,
         needs_btree_map: false,
         needs_serde: false,
+        validation: ValidationStatements::new(doc),
+        bindings: BTreeMap::new(),
         blocks: Vec::new(),
     };
     for schema in &components {
         generator.define_component_views(schema);
     }
-
-    render(&generator)
+    generator
 }
 
 /// Public type name of one component including the fallback newtype suffix,
@@ -144,7 +197,7 @@ fn public_component_name(doc: &NormalizedDocument, schema: &NormalizedSchema) ->
 // Planning types
 // ----------------------------------------------------------------------
 
-/// One emitted top-level item; children always precede parents.
+/// One top-level item; children always precede parents.
 enum Block {
     Struct(StructDef),
     StringsEnum(EnumDef),
@@ -153,6 +206,12 @@ enum Block {
     ChoiceEnum(ChoiceEnumDef),
     TypeAlias(AliasDef),
     Conversion(ConversionDef),
+    /// Inherent `validate_request()` over one struct's surviving fields
+    /// (companion §9 continuity for codec-decoded views).
+    Validator {
+        name: String,
+        body: Vec<String>,
+    },
 }
 
 struct StructDef {
@@ -227,6 +286,12 @@ struct ResolvedProperty {
     copy_value: bool,
     field_name: String,
     docs: Vec<String>,
+    /// Alias-chased target of the property edge: the validation builders'
+    /// lookup key (constraints and composite verdicts live on resolutions).
+    effective: SchemaId,
+    /// Cycle-precise boxing of the property edge; validated-composite
+    /// recursion derefs through it.
+    boxed: bool,
 }
 
 /// Transport direction of a view (companion §5 bullet list).
@@ -283,6 +348,16 @@ impl Direction {
                 dropped.join(", ")
             ));
         }
+        // Views never set deny_unknown_fields (unless the schema itself
+        // declares additionalProperties: false), so surplus keys — including
+        // off-direction fields sent out of place — are ignored on decode
+        // exactly like the shared models' default policy.
+        lines.push(
+            "Decoding ignores unrecognized keys unless the schema declares \
+             `additionalProperties: false`; off-direction fields sent out of \
+             place therefore never fail decode here."
+                .to_owned(),
+        );
         lines
     }
 
@@ -311,6 +386,12 @@ struct Generator<'a> {
     needs_optional_field: bool,
     needs_btree_map: bool,
     needs_serde: bool,
+    /// Shared bucket-2 check-statement builders (companion §9), byte-identical
+    /// to `super::models`.
+    validation: ValidationStatements<'a>,
+    /// Planning facts per qualifying component, keyed by the component's
+    /// source arena id ([`view_bindings`] consumes these).
+    bindings: BTreeMap<u32, ViewBinding>,
     blocks: Vec<Block>,
 }
 
@@ -418,13 +499,38 @@ impl<'a> Generator<'a> {
         let reconstruction_read =
             self.reconstruction(component, &read_name, Direction::Read, &resolved);
 
+        // Companion §9 continuity: the WRITE view validates the fields it
+        // keeps so router-side checks on decoded request views enforce the
+        // same bucket-2 constraints as the shared model would.
+        let write_validator_body = self.validation_body(effective, Direction::Write, &resolved);
+
+        // Planning facts extracted from the SAME pass that renders the file,
+        // so `super::plan` can never disagree with this emitter (main spec
+        // §50 test 50 wiring).
+        self.bindings.insert(
+            schema.source.0,
+            ViewBinding {
+                write: write_name.clone(),
+                read: read_name.clone(),
+                write_lossless: reconstruction_write.is_some(),
+                write_validates: !write_validator_body.is_empty(),
+            },
+        );
+
         // Anonymous children were registered during resolution and already sit
         // in `blocks`; each view struct is followed immediately by its
-        // conversions for deterministic, reviewable ordering.
+        // conversions (and its validator) for deterministic, reviewable
+        // ordering.
         self.blocks.push(Block::Struct(write_struct));
         self.blocks.push(Block::Conversion(projection_write));
         if let Some(back) = reconstruction_write {
             self.blocks.push(Block::Conversion(back));
+        }
+        if !write_validator_body.is_empty() {
+            self.blocks.push(Block::Validator {
+                name: write_name,
+                body: write_validator_body,
+            });
         }
         self.blocks.push(Block::Struct(read_struct));
         self.blocks.push(Block::Conversion(projection_read));
@@ -485,9 +591,69 @@ impl<'a> Generator<'a> {
                 base_type,
                 field_name,
                 docs,
+                effective,
+                boxed: matches!(property.schema.indirection, Indirection::Boxed),
             });
         }
         resolved
+    }
+
+    /// Bucket-2 check statements (companion §9) over one direction's
+    /// surviving fields, byte-identical to the shared-model emission of
+    /// `super::models`: same builders, same wrappers, same property-count
+    /// accounting. Empty when nothing kept enforces anything.
+    fn validation_body(
+        &self,
+        object: SchemaId,
+        direction: Direction,
+        all: &[ResolvedProperty],
+    ) -> Vec<String> {
+        let object_validation = self.validation_of(object);
+        let counting = object_validation.min_properties.is_some()
+            || object_validation.max_properties.is_some();
+        let mut body = Vec::new();
+        for property in all.iter().filter(|property| direction.keeps(property)) {
+            let wrapper = Wrapper::from_cell(property.required, property.nullable);
+            let validation = self.validation_of(property.effective);
+            let mut checks = self.validation.field_check_lines(
+                &property.field_name,
+                property.effective,
+                &validation,
+                property.boxed,
+                wrapper,
+            );
+            if counting {
+                let count_expr = match (property.required, property.nullable) {
+                    (true, false) => String::from("1_usize;"),
+                    (_, true) => {
+                        format!("usize::from(self.{}.is_some());", property.field_name)
+                    }
+                    (false, false) => format!(
+                        "usize::from(matches!(self.{}, OptionalField::Present(_)));",
+                        property.field_name
+                    ),
+                };
+                checks.push(format!("{METHOD_PAD}property_count += {count_expr}"));
+            }
+            body.extend(checks);
+        }
+        if counting {
+            // v1 counts surviving properties toward declared bounds; the
+            // dropped off-direction fields never appear on this wire shape.
+            body.extend(
+                CheckCall {
+                    callee: "::openapi_support::validation::validate_object_props".to_owned(),
+                    args: vec![
+                        String::from("property_count"),
+                        option_u64(object_validation.min_properties),
+                        option_u64(object_validation.max_properties),
+                    ],
+                    field: None,
+                }
+                .render(2),
+            );
+        }
+        wrap_property_count_intro(body, counting)
     }
 
     /// One directional view struct from the surviving properties plus the
@@ -701,8 +867,12 @@ impl<'a> Generator<'a> {
                 let validation = self.validation_of(effective);
                 let docs = self.definition_docs(effective, &[], &validation);
                 self.needs_serde = true;
-                let def = self.build_anon_struct(name, docs, &properties, additional);
+                let (def, validator) =
+                    self.build_anon_struct(effective, name, docs, &properties, additional);
                 self.blocks.push(Block::Struct(def));
+                if let Some((name, body)) = validator {
+                    self.blocks.push(Block::Validator { name, body });
+                }
             }
             ResolvedKind::IntersectedScalar(scalar) => {
                 let validation = self.validation_of(effective);
@@ -742,8 +912,12 @@ impl<'a> Generator<'a> {
                     let validation = self.validation_of(effective);
                     let docs = self.definition_docs(effective, &[], &validation);
                     self.needs_serde = true;
-                    let def = self.build_anon_struct(name, docs, &properties, additional);
+                    let (def, validator) =
+                        self.build_anon_struct(effective, name, docs, &properties, additional);
                     self.blocks.push(Block::Struct(def));
+                    if let Some((name, body)) = validator {
+                        self.blocks.push(Block::Validator { name, body });
+                    }
                 }
                 SchemaKind::Enum { values } => self.define_enum(effective, name, values),
                 _ => {}
@@ -897,11 +1071,12 @@ impl<'a> Generator<'a> {
     /// referenced shape itself rather than a directional cut.
     fn build_anon_struct(
         &mut self,
+        object: SchemaId,
         name: &str,
         docs: Vec<String>,
         properties: &[PropertyIr],
         additional: AdditionalPropertiesPolicy,
-    ) -> StructDef {
+    ) -> (StructDef, Option<(String, Vec<String>)>) {
         debug_assert!(
             !matches!(additional, AdditionalPropertiesPolicy::Deny)
                 || !matches!(additional, AdditionalPropertiesPolicy::Schema(_)),
@@ -910,8 +1085,12 @@ impl<'a> Generator<'a> {
         let deny_unknown_fields = matches!(additional, AdditionalPropertiesPolicy::Deny);
 
         let struct_name = name.to_owned();
+        let object_validation = self.validation_of(object);
+        let counting = object_validation.min_properties.is_some()
+            || object_validation.max_properties.is_some();
         let mut fields = Vec::with_capacity(properties.len() + 1);
         let mut used_field_names: BTreeSet<String> = BTreeSet::new();
+        let mut validation_body: Vec<String> = Vec::new();
         for property in properties {
             let effective = self.chase(property.schema.target);
             let node = self.doc.arena.get(effective);
@@ -919,21 +1098,10 @@ impl<'a> Generator<'a> {
                 "{name}{}",
                 naming::ident(&property.wire_name, NameStyle::Pascal)
             );
-            let resolved = ResolvedProperty {
-                wire_name: property.wire_name.clone(),
-                required: property.required,
-                read_only: node.read_only,
-                write_only: node.write_only,
-                nullable: self.nullable_of(effective),
-                copy_value: false,
-                base_type: self.edge_type(property.schema, &hint),
-                field_name: naming::ident(&property.wire_name, NameStyle::Snake),
-                docs: Vec::new(),
-            };
-            let (ty, cell_attr) = self.matrix_cell(&resolved);
-
+            // Collision-resolved FIRST so the check statements reference the
+            // exact emitted field (mirrors `super::models::build_field`).
             let field_name = {
-                let base = resolved.field_name.clone();
+                let base = naming::ident(&property.wire_name, NameStyle::Snake);
                 let mut candidate = base.clone();
                 let mut counter = 1_u32;
                 while !used_field_names.insert(candidate.clone()) {
@@ -942,6 +1110,21 @@ impl<'a> Generator<'a> {
                 }
                 candidate
             };
+            let resolved = ResolvedProperty {
+                wire_name: property.wire_name.clone(),
+                required: property.required,
+                read_only: node.read_only,
+                write_only: node.write_only,
+                nullable: self.nullable_of(effective),
+                copy_value: false,
+                base_type: self.edge_type(property.schema, &hint),
+                field_name: field_name.clone(),
+                docs: Vec::new(),
+                effective,
+                boxed: matches!(property.schema.indirection, Indirection::Boxed),
+            };
+            let (ty, cell_attr) = self.matrix_cell(&resolved);
+
             let mut attrs = Vec::new();
             if field_name != property.wire_name {
                 attrs.push(format!(
@@ -964,27 +1147,75 @@ impl<'a> Generator<'a> {
             fields.push(Field {
                 docs: field_docs,
                 attrs,
-                name: field_name,
+                name: field_name.clone(),
                 ty,
             });
+            // Anonymous structs keep EVERY property (they describe the
+            // referenced shape, not a directional cut), so their validators
+            // mirror the shared model's exactly.
+            let wrapper = Wrapper::from_cell(property.required, resolved.nullable);
+            let mut checks = self.validation.field_check_lines(
+                &field_name,
+                effective,
+                &self.validation_of(effective),
+                resolved.boxed,
+                wrapper,
+            );
+            if counting {
+                let count_expr = match (property.required, resolved.nullable) {
+                    (true, false) => String::from("1_usize;"),
+                    (_, true) => format!("usize::from(self.{field_name}.is_some());"),
+                    (false, false) => format!(
+                        "usize::from(matches!(self.{field_name}, OptionalField::Present(_)));"
+                    ),
+                };
+                checks.push(format!("{METHOD_PAD}property_count += {count_expr}"));
+            }
+            validation_body.extend(checks);
         }
         if let AdditionalPropertiesPolicy::Schema(edge) = additional {
             self.needs_btree_map = true;
             let value_type = self.edge_type(edge, &format!("{name}Additional"));
+            let ident = unique_in(&mut used_field_names, "additional");
             fields.push(Field {
                 docs: Vec::new(),
                 attrs: vec!["#[serde(flatten)]".to_owned()],
-                name: unique_in(&mut used_field_names, "additional"),
+                name: ident.clone(),
                 ty: format!("BTreeMap<String, {value_type}>"),
             });
+            if counting {
+                // v1 counts schema-valued map entries toward the property
+                // count; the VALUE schemas stay metadata-only (documented).
+                validation_body.push(format!("{METHOD_PAD}property_count += self.{ident}.len();"));
+            }
         }
+        if counting {
+            validation_body.extend(
+                CheckCall {
+                    callee: "::openapi_support::validation::validate_object_props".to_owned(),
+                    args: vec![
+                        String::from("property_count"),
+                        option_u64(object_validation.min_properties),
+                        option_u64(object_validation.max_properties),
+                    ],
+                    field: None,
+                }
+                .render(2),
+            );
+        }
+        let validation_body = wrap_property_count_intro(validation_body, counting);
+        let validator =
+            (!validation_body.is_empty()).then(|| (struct_name.clone(), validation_body));
 
-        StructDef {
-            name: struct_name,
-            docs,
-            deny_unknown_fields,
-            fields,
-        }
+        (
+            StructDef {
+                name: struct_name,
+                docs,
+                deny_unknown_fields,
+                fields,
+            },
+            validator,
+        )
     }
 
     /// Newtype choice enum over proven-exclusive branches (companion §4.2).
@@ -1304,6 +1535,9 @@ fn emit_block(emitter: &mut Emitter, block: &Block) {
         Block::ChoiceEnum(choice) => emit_choice_enum(emitter, choice),
         Block::TypeAlias(alias) => emit_alias(emitter, alias),
         Block::Conversion(conversion) => emit_conversion(emitter, conversion),
+        Block::Validator { name, body } => {
+            emit_validate_request_impl(emitter, name, body);
+        }
     }
 }
 

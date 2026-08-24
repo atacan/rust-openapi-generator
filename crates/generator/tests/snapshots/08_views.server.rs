@@ -1,8 +1,13 @@
 /// Axum server generated from the OpenAPI document (main spec §8 Output B).
 ///
 /// Mode A traits (§37), bounded JSON/form bodies (§34; axum's Form extractor is never used — routes self-decode after the §28 Content-Type dispatch), streaming raw payloads (§32), typed documented response headers (§15: IntoResponse converts stored domain values through the well-defined internal error path of §48, firing the encode hook and emitting the fixed empty 500 on failure), pre-handler protocol rejections outside the documented enums (§39), identity-only inbound content coding (§30.4), and the §28 Content-Type dispatch state machine. Recorded decision for multi-content statuses WITH documented headers: the typed fields hoist onto the status VARIANT beside the content enum. The source document declares OpenAPI 3.1.0.
+///
+/// Directional views (companion §5, main spec §50 test 50): request bodies decode into `<M>Write` (required write-only fields are mandatory there; required read-only fields are structurally absent and surplus keys are ignored unless a schema declares `additionalProperties: false`), response payloads carry `<M>Read` (write-only fields never reach the wire), and decoded request views run `validate_request()` before the handler. Recorded trait contract: when `<M>Write` reconstructs the shared model losslessly the router converts before invoking the trait; otherwise the trait takes the view itself.
 /// Generated deterministically byte-for-byte (main spec §50 test 39); do not edit by hand.
-use super::models::{Account, AuditEntry, SyncedRecord};
+use super::models::Account;
+use super::views::{
+    AccountRead, AccountWrite, AuditEntryRead, SyncedRecordRead, SyncedRecordWrite,
+};
 use ::axum::response::IntoResponse;
 use ::openapi_support::collect::{collect_body_limited, CollectLimitedError};
 use ::openapi_support::content_coding::ensure_identity_content_coding;
@@ -12,13 +17,15 @@ use ::openapi_support::limits::BodyLimits;
 use ::openapi_support::mediatype::{
     is_wildcard_incoming, match_entry, parse_content_type, EntryMatch, ParsedMediaType,
 };
+use ::openapi_support::params::{decode_path_segment, ParamSpec, ParamStyle, ParamValue};
 use ::openapi_support::rejection::{ProtocolRejection, RejectionKind};
+use ::std::collections::HashMap;
 
 /// Documented outcomes for `create_account` (main spec §8/§13): exhaustive match required; deliberately not `#[non_exhaustive]` (§47).
 #[derive(Debug)]
 pub enum CreateAccountResponse {
     /// HTTP 201 Created.
-    Created201(Account),
+    Created201(AccountRead),
 }
 
 /// Bounded encoder for [`CreateAccountResponse`] (main spec §8 Output B, §41): JSON/text serialize under `structured_encode_bytes`; overflow discards partial output, fires the hook, and emits a fixed empty 500 (§34.1). Range/default statuses validate their carried status (§48).
@@ -53,7 +60,7 @@ impl ::axum::response::IntoResponse for CreateAccountResponse {
 #[derive(Debug)]
 pub enum ListAuditEntriesResponse {
     /// HTTP 200 Ok.
-    Ok200(AuditEntry),
+    Ok200(AuditEntryRead),
 }
 
 /// Bounded encoder for [`ListAuditEntriesResponse`] (main spec §8 Output B, §41): JSON/text serialize under `structured_encode_bytes`; overflow discards partial output, fires the hook, and emits a fixed empty 500 (§34.1). Range/default statuses validate their carried status (§48).
@@ -88,7 +95,7 @@ impl ::axum::response::IntoResponse for ListAuditEntriesResponse {
 #[derive(Debug)]
 pub enum SyncRecordResponse {
     /// HTTP 200 Ok.
-    Ok200(SyncedRecord),
+    Ok200(SyncedRecordRead),
 }
 
 /// Bounded encoder for [`SyncRecordResponse`] (main spec §8 Output B, §41): JSON/text serialize under `structured_encode_bytes`; overflow discards partial output, fires the hook, and emits a fixed empty 500 (§34.1). Range/default statuses validate their carried status (§48).
@@ -126,13 +133,13 @@ pub trait Api: Send + Sync + 'static {
     /// Operation `createAccount`.
     async fn create_account(&self, body: Account) -> CreateAccountResponse;
 
-    /// `GET` `/audit-entries`.
+    /// `GET` `/audit/{id}`.
     /// Operation `listAuditEntries`.
-    async fn list_audit_entries(&self) -> ListAuditEntriesResponse;
+    async fn list_audit_entries(&self, id: String) -> ListAuditEntriesResponse;
 
-    /// `POST` `/synced-records`.
+    /// `PUT` `/synced`.
     /// Operation `syncRecord`.
-    async fn sync_record(&self, body: SyncedRecord) -> SyncRecordResponse;
+    async fn sync_record(&self, body: SyncedRecordWrite) -> SyncRecordResponse;
 }
 
 /// Shared state threaded through every generated handler.
@@ -174,8 +181,8 @@ async fn route_create_account(
             if bytes.is_empty() {
                 return Err(malformed_body("documented request body arrived empty"));
             }
-            let value: Account = decode_json_body(&bytes)?;
-            value
+            let value: AccountWrite = decode_json_body(&bytes)?;
+            Account::from(&value)
         }
         RequestEntryMatch::Entry(_) => unreachable!("request entry index out of range"),
     };
@@ -184,18 +191,33 @@ async fn route_create_account(
     Ok(response.into_response_with_limits(&limits, hook))
 }
 
-/// Route handler for `GET` `/audit-entries` (main spec §38): identity-only content coding, parameter decoding, the §28 Content-Type state machine, and bounded collection all run before the application observes the request; every failure returns a `ProtocolRejection` outside the documented enum (§39 rule 1).
+/// Route handler for `GET` `/audit/{id}` (main spec §38): identity-only content coding, parameter decoding, the §28 Content-Type state machine, and bounded collection all run before the application observes the request; every failure returns a `ProtocolRejection` outside the documented enum (§39 rule 1).
 async fn route_list_audit_entries(
     ::axum::extract::State(__state): ::axum::extract::State<ServerState>,
+    ::axum::extract::Path(__path): ::axum::extract::Path<HashMap<String, String>>,
 ) -> Result<::axum::response::Response, ProtocolRejection> {
     let limits = __state.limits;
     let hook = __state.encode_overflow_hook.as_ref();
+    let spec = ParamSpec::new("id", ParamStyle::Simple, false, false);
+    let raw_segment = match __path.get("id") {
+        Some(segment) => segment.as_str(),
+        None => {
+            return Err(invalid_parameter("missing path parameter `id`"));
+        }
+    };
+    let decoded = match decode_path_segment(&spec, raw_segment) {
+        Ok(value) => value,
+        Err(_) => {
+            return Err(invalid_parameter("path parameter `id` is malformed"));
+        }
+    };
+    let id: String = expect_text(decoded, "id")?;
     let api = __state.api.as_ref();
-    let response = api.list_audit_entries().await;
+    let response = api.list_audit_entries(id).await;
     Ok(response.into_response_with_limits(&limits, hook))
 }
 
-/// Route handler for `POST` `/synced-records` (main spec §38): identity-only content coding, parameter decoding, the §28 Content-Type state machine, and bounded collection all run before the application observes the request; every failure returns a `ProtocolRejection` outside the documented enum (§39 rule 1).
+/// Route handler for `PUT` `/synced` (main spec §38): identity-only content coding, parameter decoding, the §28 Content-Type state machine, and bounded collection all run before the application observes the request; every failure returns a `ProtocolRejection` outside the documented enum (§39 rule 1).
 async fn route_sync_record(
     ::axum::extract::State(__state): ::axum::extract::State<ServerState>,
     __headers: ::http::HeaderMap,
@@ -226,7 +248,8 @@ async fn route_sync_record(
             if bytes.is_empty() {
                 return Err(malformed_body("documented request body arrived empty"));
             }
-            let value: SyncedRecord = decode_json_body(&bytes)?;
+            let value: SyncedRecordWrite = decode_json_body(&bytes)?;
+            require_valid_request("body", value.validate_request())?;
             value
         }
         RequestEntryMatch::Entry(_) => unreachable!("request entry index out of range"),
@@ -256,16 +279,21 @@ pub fn router(
             ),
         )
         .route(
-            "/audit-entries",
+            "/audit/{id}",
             ::axum::routing::get(route_list_audit_entries),
         )
         .route(
-            "/synced-records",
-            ::axum::routing::post(route_sync_record).layer(::axum::extract::DefaultBodyLimit::max(
+            "/synced",
+            ::axum::routing::put(route_sync_record).layer(::axum::extract::DefaultBodyLimit::max(
                 limits.structured_request_bytes,
             )),
         )
         .with_state(state)
+}
+
+/// Canonical §39 mapping row 1: invalid or missing required  path/query/header parameter → 400.
+fn invalid_parameter(detail: impl Into<::std::borrow::Cow<'static, str>>) -> ProtocolRejection {
+    ProtocolRejection::new(RejectionKind::InvalidParameter).with_detail(detail)
 }
 
 /// §39 mapping row 2: syntactically malformed framing → 400; empty  bodies on required-body operations count as missing (§28.3).
@@ -378,6 +406,18 @@ where
     })
 }
 
+/// Runs one companion §9 request-body/part validator after decode: a violation rejects 422 SchemaViolation outside the documented enum, with a location-prefixed diagnostic detail (§39 rows 6; details stay off the wire per rule 3).
+fn require_valid_request(
+    location: &str,
+    validation: ::std::result::Result<(), ::openapi_support::validation::Violation>,
+) -> ::std::result::Result<(), ProtocolRejection> {
+    validation.map_err(|violation| {
+        ProtocolRejection::new(RejectionKind::SchemaViolation).with_detail(format!(
+            "request body failed schema validation at `{location}`: {violation}",
+        ))
+    })
+}
+
 /// §28.4 charset policy (D-impl-charset-rejection): textual media  decode as UTF-8; any other declared charset is MalformedBody 400.
 fn ensure_utf8_charset(parsed: Option<&ParsedMediaType>) -> Result<(), ProtocolRejection> {
     let Some(parsed) = parsed else {
@@ -390,6 +430,22 @@ fn ensure_utf8_charset(parsed: Option<&ParsedMediaType>) -> Result<(), ProtocolR
         }
     }
     Ok(())
+}
+
+/// Unwraps a scalar decode product; `None` means the parameter was  absent (required parameters reject with 400, §39 row 1).
+fn expect_text(
+    decoded: Option<ParamValue>,
+    parameter: &'static str,
+) -> Result<String, ProtocolRejection> {
+    match decoded {
+        Some(ParamValue::Text(text)) => Ok(text),
+        Some(_) => Err(invalid_parameter(format!(
+            "parameter `{parameter}` has an unexpected shape"
+        ))),
+        None => Err(invalid_parameter(format!(
+            "missing required parameter `{parameter}`"
+        ))),
+    }
 }
 
 /// §34.1 steps 1–3: partial output is discarded, nothing partial  reaches the wire, and the hook carries the operation id, variant,  and limit for observability.

@@ -249,7 +249,12 @@ fn status_name_part(status: &PlannedStatus) -> String {
 /// under `-D warnings`).
 #[derive(Debug, Default)]
 struct Flags {
+    /// Shared-model type names referenced somewhere (`use super::models::…`).
     model_types: BTreeSet<String>,
+    /// Directional-view type names referenced somewhere
+    /// (`use super::views::…`, companion §5): `<M>Write` request payloads and
+    /// `<M>Read` response payloads.
+    view_types: BTreeSet<String>,
     needs_body_limit_direction: bool,
     needs_serialize_json: bool,
     needs_serialize_form: bool,
@@ -326,24 +331,23 @@ impl Flags {
             // `&T`/owned parameter like the JSON family.
             self.encode_codecs.insert(binding.plugin_id.to_owned());
             self.needs_body_limit_direction = true;
-            self.model_types
-                .extend(model_type_names(&binding.model_path));
+            self.note_payload(&binding.model_path, binding.model_from_views);
             return;
         }
         match content.media_class {
             MediaClass::JsonFamily => {
                 self.needs_serialize_json = true;
                 self.needs_body_limit_direction = true;
-                self.model_types
-                    .extend(model_type_names(&content.model_expr));
+                let from_views = content.view.is_some();
+                self.note_payload(&content.model_expr, from_views);
             }
             MediaClass::UrlEncodedForm => {
                 // Bounded form serialization per §34/D-impl-forms; Reqwest's
                 // `.form()` convenience is never used.
                 self.needs_serialize_form = true;
                 self.needs_body_limit_direction = true;
-                self.model_types
-                    .extend(model_type_names(&content.model_expr));
+                let from_views = content.view.is_some();
+                self.note_payload(&content.model_expr, from_views);
             }
             MediaClass::Multipart => {
                 // §17 Output A: owned input struct; JSON parts serialize
@@ -370,8 +374,7 @@ impl Flags {
             _ if content.stream.is_some() => {
                 if let Some(stream) = &content.stream {
                     self.request_framings.insert(stream.framing);
-                    self.model_types
-                        .extend(model_type_names(&stream.item_model_path));
+                    self.note_payload(&stream.item_model_path, stream.item_from_views);
                 }
                 self.needs_body_limit_direction = true;
             }
@@ -417,15 +420,14 @@ impl Flags {
         for content in &status.contents {
             if let Some(binding) = &content.codec {
                 self.decode_codecs.insert(binding.plugin_id.to_owned());
-                self.model_types
-                    .extend(model_type_names(&binding.model_path));
+                self.note_payload(&binding.model_path, binding.model_from_views);
                 self.needs_collect = true;
                 continue;
             }
             match content.media_class {
                 MediaClass::JsonFamily => {
-                    self.model_types
-                        .extend(model_type_names(&content.model_expr));
+                    let from_views = content.view.is_some();
+                    self.note_payload(&content.model_expr, from_views);
                     self.needs_collect = true;
                     self.needs_empty_json_body = true;
                 }
@@ -436,14 +438,52 @@ impl Flags {
                 _ if content.stream.is_some() => {
                     if let Some(stream) = &content.stream {
                         self.response_framings.insert(stream.framing);
-                        self.model_types
-                            .extend(model_type_names(&stream.item_model_path));
+                        self.note_payload(&stream.item_model_path, stream.item_from_views);
                     }
                 }
                 _ => {}
             }
         }
     }
+
+    /// Routes one payload type name into the right import bucket: shared
+    /// models vs directional views (`super::views`, companion §5).
+    fn note_payload(&mut self, expr: &str, from_views: bool) {
+        if from_views {
+            self.view_types.extend(model_type_names(expr));
+        } else {
+            self.model_types.extend(model_type_names(expr));
+        }
+    }
+}
+
+/// Renders one granular `use` line, breaking the brace list vertically when
+/// the single-line form exceeds rustfmt's width. Empirical rule (verified
+/// against the pinned toolchain): a braced `use` tree stays on one line only
+/// up to [`RUSTFMT_MAX_WIDTH`] − 2 characters; the canonical broken form
+/// packs the items onto one continuation line when they fit under the same
+/// budget, else lists them one per line.
+fn braced_use(prefix: &str, items: &[&str]) -> String {
+    const USE_BUDGET: usize = RUSTFMT_MAX_WIDTH - 2;
+    if items.len() == 1 {
+        // rustfmt drops redundant braces around a single use item.
+        return format!("{prefix}{};", items[0]);
+    }
+    let joined = items.join(", ");
+    if prefix.chars().count() + joined.chars().count() + 3 <= USE_BUDGET {
+        return format!("{prefix}{{{joined}}};");
+    }
+    let mut text = format!("{prefix}{{\n");
+    let packed = format!("{joined},");
+    if 4 + packed.chars().count() <= USE_BUDGET {
+        text.push_str(&format!("    {packed}\n"));
+    } else {
+        for item in items {
+            text.push_str(&format!("    {item},\n"));
+        }
+    }
+    text.push_str("};");
+    text
 }
 
 /// Bare model type names referenced by an expression (`Option<T>`,
@@ -482,53 +522,69 @@ fn model_type_names(expr: &str) -> Vec<String> {
 // ----------------------------------------------------------------------
 
 fn emit_header(emitter: &mut Emitter, doc: &NormalizedDocument, flags: &Flags) {
-    emitter.docs(
-        0,
-        &[
-            "Reqwest client generated from the OpenAPI document (main spec §8 \
-             Output A)."
+    let mut docs = vec![
+        "Reqwest client generated from the OpenAPI document (main spec §8 \
+              Output A)."
+            .to_owned(),
+        String::new(),
+        "Bounded JSON/form bodies (§34), streaming raw payloads (§32), \
+              exhaustive documented-status enums (§2.4), typed documented \
+              response headers (§15), redirects off by default (§30.1), and \
+              the authoritative `ClientError` (§36). Recorded decision for \
+              multi-content statuses WITH documented headers: the typed fields \
+              hoist onto the status VARIANT beside the content enum. The \
+              source document declares OpenAPI "
+            .to_owned()
+            + &doc.raw_version
+            + ".",
+        String::new(),
+        "Servers (companion §8): operation-level `servers` override \
+              path-level, path-level overrides root-level, and within each \
+              effective array the first entry is that operation's default \
+              base. Every DISTINCT effective default URL becomes its own \
+              stored base: `base_url` is the primary (the first operation's \
+              first effective server); further bases live in \
+              `base_url_<key>` fields whose keys are documented under \
+              `ClientBuilder::secondary_base_url`. Recorded decision: an \
+              explicit `base_url` replaces ONLY the primary base; each other \
+              base needs its own `secondary_base_url` override, so a relative \
+              secondary still requires an absolute value there \
+              (D-impl-relative-servers)."
+            .to_owned(),
+    ];
+    // Documented ONLY when this API consumes directional views, so
+    // marker-free documents keep byte-identical output.
+    if !flags.view_types.is_empty() {
+        docs.push(String::new());
+        docs.push(
+            "Directional views (companion §5, main spec §50 test 50): request \
+             payloads of view-carrying components take `<M>Write` (readOnly \
+             fields structurally absent from the wire) and response payloads \
+             take `<M>Read` (writeOnly fields absent); components without \
+             markers keep their shared models. Decode ignores unrecognized \
+             keys unless a schema declares `additionalProperties: false`, so \
+             off-direction fields sent out of place never fail decode."
                 .to_owned(),
-            String::new(),
-            "Bounded JSON/form bodies (§34), streaming raw payloads (§32), \
-             exhaustive documented-status enums (§2.4), typed documented \
-             response headers (§15), redirects off by default (§30.1), and \
-             the authoritative `ClientError` (§36). Recorded decision for \
-             multi-content statuses WITH documented headers: the typed fields \
-             hoist onto the status VARIANT beside the content enum. The \
-             source document declares OpenAPI "
-                .to_owned()
-                + &doc.raw_version
-                + ".",
-            String::new(),
-            "Servers (companion §8): operation-level `servers` override \
-             path-level, path-level overrides root-level, and within each \
-             effective array the first entry is that operation's default \
-             base. Every DISTINCT effective default URL becomes its own \
-             stored base: `base_url` is the primary (the first operation's \
-             first effective server); further bases live in \
-             `base_url_<key>` fields whose keys are documented under \
-             `ClientBuilder::secondary_base_url`. Recorded decision: an \
-             explicit `base_url` replaces ONLY the primary base; each other \
-             base needs its own `secondary_base_url` override, so a relative \
-             secondary still requires an absolute value there \
-             (D-impl-relative-servers)."
-                .to_owned(),
-            "Generated deterministically byte-for-byte (main spec §50 test 39); \
-             do not edit by hand."
-                .to_owned(),
-        ],
+        );
+    }
+    docs.push(
+        "Generated deterministically byte-for-byte (main spec §50 test 39); \
+         do not edit by hand."
+            .to_owned(),
     );
+    emitter.docs(0, &docs);
 
     let mut imports: Vec<String> = Vec::new();
     if !flags.model_types.is_empty() {
-        if flags.model_types.len() == 1 {
-            let only = flags.model_types.iter().next().expect("one model type");
-            imports.push(format!("use super::models::{only};"));
-        } else {
-            let models: Vec<String> = flags.model_types.iter().cloned().collect();
-            let joined = models.join(", ");
-            imports.push(format!("use super::models::{{{joined}}};"));
-        }
+        let models: Vec<&str> = flags.model_types.iter().map(String::as_str).collect();
+        imports.push(braced_use("use super::models::", &models));
+    }
+    // Directional views (companion §5): `super::views` sorts directly after
+    // `super::models` under rustfmt's reorder_imports, so this slot keeps the
+    // block byte-stable.
+    if !flags.view_types.is_empty() {
+        let view_types: Vec<&str> = flags.view_types.iter().map(String::as_str).collect();
+        imports.push(braced_use("use super::views::", &view_types));
     }
     if flags.needs_body_limit_direction {
         imports.push(
