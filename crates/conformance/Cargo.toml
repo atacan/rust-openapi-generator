@@ -38,3 +38,7 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 tokio-util = { workspace = true }
 tower = { workspace = true }
 futures-util = { workspace = true }
+# Negative conformance suite (§50 test 38): each fixture under
+# tests/compile_fail/ must FAIL to compile, with the committed `.stderr`
+# snapshot pinning the exact diagnostic.
+trybuild = { workspace = true }

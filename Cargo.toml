@@ -23,6 +23,11 @@ tokio-util = { version = "0.7", features = ["io"] }
 futures-core = "0.3"
 futures-util = "0.3"
 tower = { version = "0.5", features = ["util"] }
+# Compile-fail fixtures (§50 test 38's negative half). Held to <1.0.120:
+# trybuild 1.0.120 raised its rust-version to 1.88, past the workspace's
+# pinned MSRV tuple of 1.85 (main spec §3.1), so the exact 1.85-compatible
+# minor stays locked here.
+trybuild = "=1.0.119"
 serde_yaml = "0.9"
 # Optional media-codec families (main spec §45): runtime deps of GENERATED
 # crates only — openapi-support stays dependency-light

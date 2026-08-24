@@ -1,0 +1,10 @@
+error[E0599]: no method named `text` found for struct `ExportRecords200Stream` in the current scope
+  --> tests/compile_fail/streaming_wrapper_hides_aggregation.rs:16:25
+   |
+16 |     let _text = wrapper.text();
+   |                         ^^^^ method not found in `ExportRecords200Stream`
+   |
+help: one of the expressions' fields has a method of the same name
+   |
+16 |     let _text = wrapper.response.text();
+   |                         +++++++++

@@ -1,0 +1,5 @@
+error[E0425]: cannot find value `VariantNotInSpec` in module `openapi_support::client_error`
+  --> tests/compile_fail/client_error_non_authoritative_variant.rs:10:49
+   |
+10 |     let _error = openapi_support::client_error::VariantNotInSpec;
+   |                                                 ^^^^^^^^^^^^^^^^ not found in `openapi_support::client_error`

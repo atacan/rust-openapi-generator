@@ -1,0 +1,5 @@
+error[E0425]: cannot find function `to_vec_unbounded` in module `openapi_support::encode`
+  --> tests/compile_fail/serde_json_to_vec_not_exposed_via_support.rs:10:45
+   |
+10 |     let _payload = openapi_support::encode::to_vec_unbounded(&"value");
+   |                                             ^^^^^^^^^^^^^^^^ not found in `openapi_support::encode`
