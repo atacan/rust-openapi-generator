@@ -10,7 +10,8 @@
 
 use std::path::PathBuf;
 
-use openapi_to_rust_generator::codegen::plan::plan_api;
+use openapi_to_rust_generator::codegen::models::generate_models;
+use openapi_to_rust_generator::codegen::plan::{plan_api, plan_api_with_config, PlanConfig};
 use openapi_to_rust_generator::codegen::server::generate_server;
 use openapi_to_rust_generator::normalize::{
     normalize_with_config, NormalizeConfig, NormalizedDocument,
@@ -31,6 +32,7 @@ const SNAPSHOT_FIXTURES: &[&str] = &[
     "10_forms_headers.yaml",
     "11_multipart.yaml",
     "12_multipart_order.yaml",
+    "13_validation.yaml",
 ];
 
 /// Every fixture must plan + render without diagnostics.
@@ -47,6 +49,7 @@ const ALL_FIXTURES: &[&str] = &[
     "10_forms_headers.yaml",
     "11_multipart.yaml",
     "12_multipart_order.yaml",
+    "13_validation.yaml",
 ];
 
 fn fixtures_dir() -> PathBuf {
@@ -948,4 +951,58 @@ fn handler_block_contains(output: &str, needle: &str) -> bool {
     let handler = item_block(output, "async fn route_upload_document(");
     let trimmed = needle.replace(", ", ",\n            ");
     handler.contains(needle) || handler.contains(&trimmed)
+}
+
+// ----------------------------------------------------------------------
+// Companion §9 — bucket-2 runtime validation wiring (fixture 13)
+// ----------------------------------------------------------------------
+
+#[test]
+fn fixture_13_wires_post_decode_validation_calls_into_routes() {
+    let output = generate_fixture("13_validation.yaml");
+    // Composite JSON/form bodies call their inherent validator.
+    assert!(
+        output.contains("require_valid_request(\"body\", value.validate_request())?;"),
+        "composite bodies must validate post-decode"
+    );
+    // Constrained scalar alias bodies + multipart parts call the free fn.
+    assert!(
+        output.contains("require_valid_request(\"body\", validate_slug_request(&value))?;"),
+        "alias bodies must route through the models.rs free validator"
+    );
+    assert!(
+        output.contains("require_valid_request(\"part `kind`\","),
+        "multipart scalar parts backed by an alias must validate in the collector"
+    );
+}
+
+#[test]
+fn fixture_13_emits_model_validators_alongside_router_calls() {
+    let doc = normalize_fixture("13_validation.yaml");
+    let models = generate_models(&doc);
+    assert!(models.contains("pub fn validate_request("));
+    assert!(models.contains("pub fn validate_slug_request("));
+    assert!(models.contains(".map_err(|error| error.at_field(\"code\"))"));
+    assert!(models.contains("::openapi_support::validation::located("));
+}
+
+#[test]
+fn server_runtime_validation_off_skips_calls_but_keeps_model_validators() {
+    let doc = normalize_fixture("13_validation.yaml");
+
+    let config = PlanConfig {
+        server_runtime_validation: false,
+        ..PlanConfig::default()
+    };
+    let plan = plan_api_with_config(&doc, &config).expect("plans without diagnostics");
+    let off = generate_server(&doc, &plan);
+    assert!(
+        !off.contains("require_valid_request"),
+        "policy off must skip every router validation CALL"
+    );
+    assert!(!off.contains("validate_slug_request"));
+
+    // Validators themselves stay emitted: the flag gates calls only.
+    let models = generate_models(&doc);
+    assert!(models.contains("pub fn validate_request("));
 }

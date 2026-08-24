@@ -26,6 +26,7 @@ const SNAPSHOT_FIXTURES: &[&str] = &[
     "10_forms_headers.yaml",
     "11_multipart.yaml",
     "12_multipart_order.yaml",
+    "13_validation.yaml",
 ];
 
 /// Every fixture must plan + render without diagnostics (07/08 included).
@@ -42,6 +43,7 @@ const ALL_FIXTURES: &[&str] = &[
     "10_forms_headers.yaml",
     "11_multipart.yaml",
     "12_multipart_order.yaml",
+    "13_validation.yaml",
 ];
 
 fn fixtures_dir() -> PathBuf {

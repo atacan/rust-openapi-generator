@@ -22,6 +22,7 @@ pub mod params;
 pub mod percent;
 pub mod rejection;
 pub mod stream_errors;
+pub mod validation;
 
 #[cfg(feature = "client")]
 pub mod client_error;

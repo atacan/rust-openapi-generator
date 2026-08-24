@@ -420,11 +420,11 @@ fn emit_header(emitter: &mut Emitter, doc: &NormalizedDocument, flags: &Flags) {
     if flags.needs_collect {
         imports.push("use ::openapi_support::collect::collect_reqwest_limited;".to_owned());
     }
-    if flags.needs_serialize_json {
-        imports.push("use ::openapi_support::encode::serialize_json_limited;".to_owned());
-    }
     if flags.needs_serialize_form {
         imports.push("use ::openapi_support::encode::serialize_form_limited;".to_owned());
+    }
+    if flags.needs_serialize_json {
+        imports.push("use ::openapi_support::encode::serialize_json_limited;".to_owned());
     }
     imports.push("use ::openapi_support::limits::BodyLimits;".to_owned());
     if flags.needs_content_type_helpers {

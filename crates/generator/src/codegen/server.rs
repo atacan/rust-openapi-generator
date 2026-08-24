@@ -25,8 +25,8 @@ use crate::normalize::naming::{self, NameStyle};
 use crate::normalize::NormalizedDocument;
 
 use super::plan::{
-    PlannedApi, PlannedContent, PlannedMultipartFieldKind, PlannedOperation, PlannedParameter,
-    PlannedStatus,
+    PlannedApi, PlannedBodyValidation, PlannedContent, PlannedMultipartFieldKind, PlannedOperation,
+    PlannedParameter, PlannedStatus,
 };
 use super::Emitter;
 
@@ -84,6 +84,18 @@ pub fn generate_server(doc: &NormalizedDocument, plan: &PlannedApi) -> String {
         || flags.needs_charset_check
         || flags.needs_cookie_decode
         || flags.needs_multipart;
+    // Companion §9: the shared 422 constructor exists only with call sites.
+    flags.needs_request_schema_violation = plan.server_runtime_validation
+        && plan.operations.iter().any(|operation| {
+            operation.request_contents.iter().any(|content| {
+                content.body_validation.is_some()
+                    || content.multipart_spec.as_ref().is_some_and(|spec| {
+                        spec.fields
+                            .iter()
+                            .any(|field| field.scalar_validator.is_some())
+                    })
+            })
+        });
     emit_imports(&mut emitter, &flags);
 
     let mut invalid_status_range_emitted = false;
@@ -197,11 +209,18 @@ struct ServerLayout {
     /// Operation index → `<Op>TrailingParts` carrier for scalar/JSON parts
     /// decoded BEHIND a live streaming part (wire-arrival-based §17.1).
     multipart_trailing: BTreeMap<usize, String>,
+    /// Companion §9 policy (D-impl-runtime-validation-timing): when true the
+    /// emitted routes run `validate_request`/free validators after decode.
+    runtime_validation: bool,
 }
 
 impl ServerLayout {
     fn new(plan: &PlannedApi, used: &mut BTreeSet<String>) -> Self {
-        let mut layout = Self::default();
+        let runtime_validation = plan.server_runtime_validation;
+        let mut layout = Self {
+            runtime_validation,
+            ..Self::default()
+        };
         for (op_index, operation) in plan.operations.iter().enumerate() {
             for (status_index, status) in operation.statuses.iter().enumerate() {
                 if !status.is_no_body_status && status.contents.len() >= 2 {
@@ -424,6 +443,13 @@ struct Flags {
     /// A typed (non-String) textual multipart part exists somewhere: pulls
     /// in the FromStr-based scalar part decoder.
     needs_multipart_scalar: bool,
+    /// Companion §9 validators are CALLED somewhere (policy on + at least
+    /// one constrained body/part): pulls in the shared SchemaViolation 422
+    /// constructor for post-decode validation failures.
+    needs_request_schema_violation: bool,
+    /// Free validator functions referenced from super::models; imported ONLY
+    /// when the validation policy is on (the calls disappear otherwise).
+    body_validator_fns: BTreeSet<String>,
 }
 
 impl Flags {
@@ -470,6 +496,7 @@ impl Flags {
             MediaClass::JsonFamily => {
                 self.model_types
                     .extend(model_type_names(&content.model_expr));
+                self.import_body_validator(content);
                 self.needs_json_decode = true;
                 self.needs_charset_check = true;
             }
@@ -478,10 +505,12 @@ impl Flags {
                 // extractor is never used (the router self-decodes).
                 self.model_types
                     .extend(model_type_names(&content.model_expr));
+                self.import_body_validator(content);
                 self.needs_form_decode = true;
                 self.needs_charset_check = true;
             }
             MediaClass::PlainText => {
+                self.import_body_validator(content);
                 self.needs_text_decode = true;
                 self.needs_charset_check = true;
             }
@@ -500,6 +529,9 @@ impl Flags {
                                 // Even `String` parts decode through the
                                 // strict-UTF-8 helper.
                                 self.needs_multipart_scalar = true;
+                                if let Some(name) = &field.scalar_validator {
+                                    self.body_validator_fns.insert(name.clone());
+                                }
                             }
                             PlannedMultipartFieldKind::BinaryPart => {}
                         }
@@ -513,6 +545,14 @@ impl Flags {
                 "planner emitted Phase 2 media class {:?}",
                 content.media_class
             ),
+        }
+    }
+
+    /// Companion §9: free validators live in super::models next to the
+    /// model types; their imports follow the policy flag at emission time.
+    fn import_body_validator(&mut self, content: &PlannedContent) {
+        if let Some(PlannedBodyValidation::ScalarFn(name)) = &content.body_validation {
+            self.body_validator_fns.insert(name.clone());
         }
     }
 
@@ -686,12 +726,26 @@ fn emit_brace_import(emitter: &mut Emitter, prefix: &str, items: &[&str]) {
 
 fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
     let path_extractor = flags.needs_path_extractor;
-    if !flags.model_types.is_empty() {
-        let models: Vec<&str> = flags.model_types.iter().map(String::as_str).collect();
-        if models.len() == 1 {
-            emitter.line(0, &format!("use super::models::{};", models[0]));
+    // Companion §9 free validators share the super::models import with the
+    // model types — but only when the policy is ON and the calls exist.
+    // rustfmt (2021 style) orders brace items LOWERCASE-INITIAL first, so
+    // validator fn names precede type names; each run stays byte-sorted.
+    let mut model_imports: Vec<&str> = flags.model_types.iter().map(String::as_str).collect();
+    if flags.needs_request_schema_violation {
+        model_imports.extend(flags.body_validator_fns.iter().map(String::as_str));
+        model_imports.sort_unstable_by_key(|item| {
+            (
+                item.chars().next().is_some_and(char::is_uppercase),
+                item.to_owned(),
+            )
+        });
+        model_imports.dedup();
+    }
+    if !model_imports.is_empty() {
+        if model_imports.len() == 1 {
+            emitter.line(0, &format!("use super::models::{};", model_imports[0]));
         } else {
-            emit_brace_import(emitter, "use super::models::", &models);
+            emit_brace_import(emitter, "use super::models::", &model_imports);
         }
     }
 
@@ -2818,14 +2872,18 @@ enum EntryPayload {
     /// Single-content JSON: decodes to the model value itself.
     Json {
         model: String,
+        validation: Option<PlannedBodyValidation>,
     },
     /// Single-content URL-encoded form: bounded collect then the support
     /// decoder (main spec §16); axum's `Form` extractor is never used.
     Form {
         model: String,
+        validation: Option<PlannedBodyValidation>,
     },
     /// Single-content text: decodes to `String`.
-    Text,
+    Text {
+        validation: Option<PlannedBodyValidation>,
+    },
     /// Single-content streaming: the raw body passes through.
     RawBody,
     /// Single-content wildcard: the generated `<Op>RequestBody` struct.
@@ -2835,14 +2893,17 @@ enum EntryPayload {
     EnumJson {
         enum_name: String,
         variant: String,
+        validation: Option<PlannedBodyValidation>,
     },
     EnumForm {
         enum_name: String,
         variant: String,
+        validation: Option<PlannedBodyValidation>,
     },
     EnumText {
         enum_name: String,
         variant: String,
+        validation: Option<PlannedBodyValidation>,
     },
     EnumRaw {
         enum_name: String,
@@ -2867,7 +2928,7 @@ impl EntryPayload {
             self,
             Self::Json { .. }
                 | Self::Form { .. }
-                | Self::Text
+                | Self::Text { .. }
                 | Self::EnumJson { .. }
                 | Self::EnumForm { .. }
                 | Self::EnumText { .. }
@@ -2881,6 +2942,19 @@ impl EntryPayload {
     fn is_form(&self) -> bool {
         matches!(self, Self::Form { .. } | Self::EnumForm { .. })
     }
+
+    /// Companion §9 check attached to this payload, if any.
+    fn validation(&self) -> Option<&PlannedBodyValidation> {
+        match self {
+            Self::Json { validation, .. }
+            | Self::Form { validation, .. }
+            | Self::Text { validation }
+            | Self::EnumJson { validation, .. }
+            | Self::EnumForm { validation, .. }
+            | Self::EnumText { validation, .. } => validation.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 fn entry_payload(
@@ -2891,6 +2965,12 @@ fn entry_payload(
 ) -> EntryPayload {
     let content = &operation.request_contents[index];
     let enum_name = operation.request_body_enum_name.clone();
+    // Companion §9: validation calls ride the payload only when the policy
+    // is on (validators stay emitted in models.rs either way).
+    let validation = layout
+        .runtime_validation
+        .then(|| content.body_validation.clone())
+        .flatten();
     if content.is_wildcard {
         return match enum_name {
             Some(enum_name) => EntryPayload::EnumWildcard {
@@ -2910,26 +2990,31 @@ fn entry_payload(
             Some(enum_name) => EntryPayload::EnumJson {
                 enum_name,
                 variant: content.variant_name.clone(),
+                validation,
             },
             None => EntryPayload::Json {
                 model: content.model_expr.clone(),
+                validation,
             },
         },
         MediaClass::UrlEncodedForm => match enum_name {
             Some(enum_name) => EntryPayload::EnumForm {
                 enum_name,
                 variant: content.variant_name.clone(),
+                validation,
             },
             None => EntryPayload::Form {
                 model: content.model_expr.clone(),
+                validation,
             },
         },
         MediaClass::PlainText => match enum_name {
             Some(enum_name) => EntryPayload::EnumText {
                 enum_name,
                 variant: content.variant_name.clone(),
+                validation,
             },
-            None => EntryPayload::Text,
+            None => EntryPayload::Text { validation },
         },
         MediaClass::Binary | MediaClass::RawUnknown => match enum_name {
             Some(enum_name) => EntryPayload::EnumRaw {
@@ -3200,7 +3285,7 @@ fn emit_entry_arm(
     if payload.is_decodable() {
         emitter.line(indent + 1, "ensure_utf8_charset(parsed.as_ref())?;");
         let limit_field = match payload {
-            EntryPayload::Text | EntryPayload::EnumText { .. } => "text_body_bytes",
+            EntryPayload::Text { .. } | EntryPayload::EnumText { .. } => "text_body_bytes",
             _ => "structured_request_bytes",
         };
         if required {
@@ -3225,7 +3310,7 @@ fn emit_entry_arm(
             );
         }
         match payload {
-            EntryPayload::Json { model } => {
+            EntryPayload::Json { model, .. } => {
                 let bind = format!("let value: {model} = decode_json_body(&bytes)?;");
                 if fits(indent + 1, &bind) {
                     emitter.line(indent + 1, &bind);
@@ -3234,7 +3319,7 @@ fn emit_entry_arm(
                     emitter.line(indent + 2, "decode_json_body(&bytes)?;");
                 }
             }
-            EntryPayload::Form { model } => {
+            EntryPayload::Form { model, .. } => {
                 let call = format!("decode_form_body(&bytes, limits.{limit_field})?;");
                 let bind = format!("let value: {model} = {call}");
                 if fits(indent + 1, &bind) {
@@ -3255,9 +3340,49 @@ fn emit_entry_arm(
                 emitter.line(indent + 1, "let value = decode_text_body(bytes)?;");
             }
         }
+        // Companion §9: bucket-2 checks run AFTER a successful decode, so a
+        // violating body never reaches the handler (§39 rule 1; SchemaViolation
+        // → 422).
+        if let Some(validation) = payload.validation() {
+            emit_request_validation_call(emitter, indent + 1, "body", validation);
+        }
     }
     emit_entry_yield(emitter, indent + 1, payload, required);
     emitter.line(indent, "}");
+}
+
+/// Emits one post-decode validation statement against the arm's `value`
+/// binding: inherent `validate_request()` for composites, free models.rs
+/// validators for constrained scalar aliases — routed through the shared
+/// SchemaViolation 422 constructor with a location prefix. A single flat
+/// call keeps rustfmt layout width-predictable.
+fn emit_request_validation_call(
+    emitter: &mut Emitter,
+    indent: usize,
+    location: &str,
+    validation: &PlannedBodyValidation,
+) {
+    let inner = match validation {
+        PlannedBodyValidation::Inherent => "value.validate_request()".to_owned(),
+        PlannedBodyValidation::ScalarFn(name) => format!("{name}(&value)"),
+    };
+    let quoted = format!("\"{location}\"");
+    emit_flat_call(emitter, indent, "require_valid_request", &[&quoted, &inner]);
+}
+
+/// Emits `NAME(ARG0, ARG1)?;` flat when it fits the rustfmt budget, else in
+/// rustfmt's canonical vertical form (one argument per line).
+fn emit_flat_call(emitter: &mut Emitter, indent: usize, name: &str, args: &[&str]) {
+    let flat = format!("{name}({})?;", args.join(", "));
+    if fits(indent, &flat) {
+        emitter.line(indent, &flat);
+        return;
+    }
+    emitter.line(indent, &format!("{name}("));
+    for arg in args {
+        emitter.line(indent + 1, &format!("{arg},"));
+    }
+    emitter.line(indent, ")?;");
 }
 
 /// Emits `RequestEntryMatch::Entry(i) => EXPR,` with rustfmt-canonical
@@ -3305,9 +3430,15 @@ fn emit_entry_yield_expr(
                 emitter.line(indent, "}),");
             }
         }
-        EntryPayload::EnumJson { enum_name, variant }
-        | EntryPayload::EnumForm { enum_name, variant }
-        | EntryPayload::EnumText { enum_name, variant } => {
+        EntryPayload::EnumJson {
+            enum_name, variant, ..
+        }
+        | EntryPayload::EnumForm {
+            enum_name, variant, ..
+        }
+        | EntryPayload::EnumText {
+            enum_name, variant, ..
+        } => {
             emit_inline(emitter, format!("{enum_name}::{variant}(value)"));
         }
         EntryPayload::EnumRaw { enum_name, variant } => {
@@ -3343,7 +3474,7 @@ fn emit_entry_yield_expr(
                 emitter.line(indent, "}),");
             }
         }
-        EntryPayload::Json { .. } | EntryPayload::Form { .. } | EntryPayload::Text => {
+        EntryPayload::Json { .. } | EntryPayload::Form { .. } | EntryPayload::Text { .. } => {
             unreachable!("decodable payloads keep block arms");
         }
     }
@@ -3368,7 +3499,7 @@ fn emit_entry_yield(emitter: &mut Emitter, indent: usize, payload: &EntryPayload
     };
 
     match payload {
-        EntryPayload::Json { .. } | EntryPayload::Form { .. } | EntryPayload::Text => {
+        EntryPayload::Json { .. } | EntryPayload::Form { .. } | EntryPayload::Text { .. } => {
             // Optional bodies yield `Some(..)` so the outer presence match
             // separates Empty (None) from a decoded document (§28.2).
             if required {
@@ -3402,9 +3533,15 @@ fn emit_entry_yield(emitter: &mut Emitter, indent: usize, payload: &EntryPayload
                 ],
             );
         }
-        EntryPayload::EnumJson { enum_name, variant }
-        | EntryPayload::EnumForm { enum_name, variant }
-        | EntryPayload::EnumText { enum_name, variant } => {
+        EntryPayload::EnumJson {
+            enum_name, variant, ..
+        }
+        | EntryPayload::EnumForm {
+            enum_name, variant, ..
+        }
+        | EntryPayload::EnumText {
+            enum_name, variant, ..
+        } => {
             if required {
                 emitter.line(indent, &format!("{enum_name}::{variant}(value)"));
             } else {
@@ -3541,6 +3678,7 @@ fn emit_multipart_types(
             part_name,
             &resolved,
             trailing_name,
+            layout.runtime_validation,
         );
     }
     let has_binary = resolved
@@ -3701,6 +3839,7 @@ fn emit_multipart_field_doc(emitter: &mut Emitter, indent: usize, entry: &Multip
 
 /// One live streaming part type plus its private tail-scan stage enum and
 /// (when scalar/JSON fields exist) the operation's trailing-parts carrier.
+#[allow(clippy::too_many_arguments)]
 fn emit_live_part_type(
     emitter: &mut Emitter,
     operation: &PlannedOperation,
@@ -3708,6 +3847,7 @@ fn emit_live_part_type(
     part_name: &str,
     resolved: &[MultipartFieldIdents],
     trailing_name: Option<&str>,
+    validate_parts: bool,
 ) {
     // The single binary entry of this body (plan time caps bodies at one).
     let entry = resolved
@@ -3800,7 +3940,13 @@ fn emit_live_part_type(
     }
     emitter.blank();
     emitter.line(0, &format!("impl {part_name} {{"));
-    emit_next_chunk(emitter, &tail_stage, &buffered, !buffered.is_empty());
+    emit_next_chunk(
+        emitter,
+        &tail_stage,
+        &buffered,
+        !buffered.is_empty(),
+        validate_parts,
+    );
     emitter.line(0, "}");
 }
 
@@ -3873,6 +4019,7 @@ fn emit_next_chunk(
     tail_stage: &str,
     buffered: &[&MultipartFieldIdents],
     has_buffered: bool,
+    validate_parts: bool,
 ) {
     emitter.docs(
         1,
@@ -3974,12 +4121,40 @@ fn emit_next_chunk(
     ];
     emit_or_pattern_head(emitter, 5, &idle_drain, " => {}");
     for entry in buffered {
-        emit_tail_decode_arm(emitter, tail_stage, entry);
+        emit_tail_decode_arm(emitter, tail_stage, entry, validate_parts);
     }
     emitter.line(4, "},");
     emitter.line(3, "}");
     emitter.line(2, "}");
     emitter.line(1, "}");
+}
+
+/// Emits one post-decode validator call for a multipart scalar part
+/// (companion §9): constrained scalar aliases validate right where the part
+/// bytes become typed values, so a violating part rejects 422 before any
+/// application code runs.
+fn emit_part_validation_call(
+    emitter: &mut Emitter,
+    indent: usize,
+    entry: &MultipartFieldIdents,
+    value_expr: &str,
+    validate_parts: bool,
+) {
+    let Some(name) = entry.field.scalar_validator.as_deref() else {
+        return;
+    };
+    if !validate_parts {
+        return;
+    }
+    let location_text = format!("part `{}`", entry.field.wire_name);
+    let location = rust_string_literal(&location_text);
+    let inner = format!("{name}({value_expr})");
+    emit_flat_call(
+        emitter,
+        indent,
+        "require_valid_request",
+        &[&location, &inner],
+    );
 }
 
 /// Stage variant name (no enum path) for one buffered trailing field.
@@ -4049,7 +4224,12 @@ fn emit_tail_begin_arm(emitter: &mut Emitter, tail_stage: &str, entry: &Multipar
 
 /// One `PartEnd` decode arm of the tail scan: bounded-buffered bytes become
 /// typed values on the trailing-parts carrier.
-fn emit_tail_decode_arm(emitter: &mut Emitter, tail_stage: &str, entry: &MultipartFieldIdents) {
+fn emit_tail_decode_arm(
+    emitter: &mut Emitter,
+    tail_stage: &str,
+    entry: &MultipartFieldIdents,
+    validate_parts: bool,
+) {
     emitter.line(
         5,
         &format!("{} => {{", tail_stage_variant_name(tail_stage, entry)),
@@ -4063,6 +4243,7 @@ fn emit_tail_decode_arm(emitter: &mut Emitter, tail_stage: &str, entry: &Multipa
                     "let value = multipart_scalar_text::<{rust_type}>({wire}, &self.buffer)?;"
                 ),
             );
+            emit_part_validation_call(emitter, 6, entry, "&value", validate_parts);
         }
         PlannedMultipartFieldKind::JsonPart(model) => {
             let bind = format!("let value: {model} = decode_json_body(&self.buffer)?;");
@@ -4220,9 +4401,12 @@ fn emit_multipart_collector(
                 }
             }
         }
+        // Binary parts never track `seen_` here: their PartBegin arm hands
+        // off immediately, so a same-name reopening always arrives BEHIND
+        // the stream where the tail scan's `seen_single_valued` rejects it
+        // (§17.1 wire-arrival enforcement).
         let needs_seen = !entry.field.repeated
-            && !(entry.field.required
-                && matches!(entry.field.kind, PlannedMultipartFieldKind::BinaryPart));
+            && !matches!(entry.field.kind, PlannedMultipartFieldKind::BinaryPart);
         if needs_seen {
             emitter.line(1, &format!("let mut seen_{} = false;", entry.ident));
         }
@@ -4279,7 +4463,7 @@ fn emit_multipart_collector(
         if matches!(entry.field.kind, PlannedMultipartFieldKind::BinaryPart) {
             continue;
         }
-        emit_collector_decode_arm(emitter, entry);
+        emit_collector_decode_arm(emitter, entry, layout.runtime_validation);
     }
     emitter.line(3, "},");
     emitter.line(2, "}");
@@ -4377,9 +4561,8 @@ fn emit_collector_field_arm(
 ) {
     let wire = rust_string_literal(&entry.field.wire_name);
     emitter.line(5, &format!("{wire} => {{"));
-    let needs_seen = !entry.field.repeated
-        && !(entry.field.required
-            && matches!(entry.field.kind, PlannedMultipartFieldKind::BinaryPart));
+    let needs_seen =
+        !entry.field.repeated && !matches!(entry.field.kind, PlannedMultipartFieldKind::BinaryPart);
     if needs_seen {
         emitter.line(6, &format!("if seen_{} {{", entry.ident));
         emitter.line(7, "return Err(schema_violation(format!(");
@@ -4482,7 +4665,11 @@ fn emit_collector_field_arm(
 }
 
 /// One `PartEnd` decode arm: bounded-buffered bytes become typed values.
-fn emit_collector_decode_arm(emitter: &mut Emitter, entry: &MultipartFieldIdents) {
+fn emit_collector_decode_arm(
+    emitter: &mut Emitter,
+    entry: &MultipartFieldIdents,
+    validate_parts: bool,
+) {
     let variant = naming::ident(&entry.field.rust_name, NameStyle::Pascal);
     let stage = if entry.field.repeated {
         format!("Stage::{variant}Element")
@@ -4497,6 +4684,7 @@ fn emit_collector_decode_arm(emitter: &mut Emitter, entry: &MultipartFieldIdents
                 5,
                 &format!("let value = multipart_scalar_text::<{rust_type}>({wire}, &buffer)?;"),
             );
+            emit_part_validation_call(emitter, 5, entry, "&value", validate_parts);
         }
         PlannedMultipartFieldKind::JsonPart(model) => {
             let bind = format!("let value: {model} = decode_json_body(&buffer)?;");
@@ -4682,6 +4870,10 @@ fn emit_module_helpers(emitter: &mut Emitter, flags: &Flags) {
     if flags.needs_multipart_scalar {
         emitter.blank();
         emit_multipart_scalar_text(emitter);
+    }
+    if flags.needs_request_schema_violation {
+        emitter.blank();
+        emit_request_schema_violation(emitter);
     }
     if flags.needs_charset_check {
         emitter.blank();
@@ -5224,6 +5416,41 @@ fn emit_multipart_rejection(emitter: &mut Emitter) {
         "MultipartError::MalformedFraming => malformed_body(\"malformed multipart framing\"),",
     );
     emitter.line(1, "}");
+    emitter.line(0, "}");
+}
+
+/// Runs one companion §9 body/part validator AFTER a successful decode: a
+/// violation becomes SchemaViolation 422 with a location-prefixed detail;
+/// the handler never observes it (§39 rules 1/3). Taking the WHOLE result
+/// keeps every call site a single flat call.
+fn emit_request_schema_violation(emitter: &mut Emitter) {
+    emitter.docs(
+        0,
+        &[String::from(
+            "Runs one companion §9 request-body/part validator after decode: \
+             a violation rejects 422 SchemaViolation outside the documented \
+             enum, with a location-prefixed diagnostic detail (§39 rows 6; \
+             details stay off the wire per rule 3).",
+        )],
+    );
+    emitter.line(0, "fn require_valid_request(");
+    emitter.line(1, "location: &str,");
+    emitter.line(
+        1,
+        "validation: ::std::result::Result<(), ::openapi_support::validation::Violation>,",
+    );
+    emitter.line(0, ") -> ::std::result::Result<(), ProtocolRejection> {");
+    emitter.line(1, "validation.map_err(|violation| {");
+    emitter.line(
+        2,
+        "ProtocolRejection::new(RejectionKind::SchemaViolation).with_detail(format!(",
+    );
+    emitter.line(
+        3,
+        "\"request body failed schema validation at `{location}`: {violation}\",",
+    );
+    emitter.line(2, "))");
+    emitter.line(1, "})");
     emitter.line(0, "}");
 }
 

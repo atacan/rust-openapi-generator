@@ -1,0 +1,199 @@
+# Fixture 13 — bucket-2 runtime validation (companion §9, D-§2 bucket 2,
+# D-impl-runtime-validation-timing Phase 2 half). Generated routers call the
+# emitted validators after every successful decode of a server request body
+# and reject violations via SchemaViolation → 422; client decoding stays
+# lenient. Coverage:
+# - createTicket: composite JSON body walking string pattern/minLength/
+#   formats (date-time, email), exclusive integer/number bounds +
+#   multipleOf, array minItems/maxItems/uniqueItems/items, object
+#   minProperties over a schema-valued map, and a NESTED validator chain
+#   (Ticket → LevelA → LevelB).
+# - registerSlug: request body that IS a constrained scalar alias (`Slug`,
+#   allOf intersection carrying minLength AND pattern) → free validator fn.
+# - postNote: plain-text body of the constrained alias → free validator fn
+#   over the decoded String.
+# - sendFeedback: URL-encoded form body with exclusive bound + pattern →
+#   inherent validator after the bounded form decode.
+# - uploadAttachment: multipart/form-data whose textual parts carry the
+#   constrained alias and a pattern'd string → per-part validation at decode
+#   time inside the collector (§17.1).
+openapi: 3.1.0
+info:
+  title: runtime validation
+  version: "1"
+paths:
+  /tickets:
+    post:
+      operationId: createTicket
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Ticket'
+      responses:
+        '201':
+          description: Ticket created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ticket'
+  /slugs:
+    post:
+      operationId: registerSlug
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Slug'
+      responses:
+        '201':
+          description: Slug registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisteredSlug'
+  /notes:
+    post:
+      operationId: postNote
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              $ref: '#/components/schemas/Slug'
+      responses:
+        '201':
+          description: Note stored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NoteReceipt'
+  /feedback:
+    post:
+      operationId: sendFeedback
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/FeedbackForm'
+      responses:
+        '204':
+          description: Feedback recorded
+  /uploads:
+    post:
+      operationId: uploadAttachment
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [title, kind]
+              properties:
+                title:
+                  type: string
+                  minLength: 3
+                  pattern: '[A-Za-z0-9 ._-]+'
+                kind:
+                  $ref: '#/components/schemas/Slug'
+                attachment:
+                  type: string
+                  format: binary
+            encoding:
+              attachment:
+                contentType: application/octet-stream
+      responses:
+        '201':
+          description: Attachment stored
+          content:
+            application/json:
+              schema:
+                type: object
+components:
+  schemas:
+    RegisteredSlug:
+      type: object
+      properties:
+        slug:
+          $ref: '#/components/schemas/Slug'
+    NoteReceipt:
+      type: object
+      required: [stored]
+      properties:
+        stored:
+          type: boolean
+    Slug:
+      allOf:
+        - type: string
+          minLength: 2
+        - type: string
+          pattern: '^[a-z][a-z0-9-]*$'
+    Ticket:
+      type: object
+      required: [code, when, seats, price, tags]
+      properties:
+        code:
+          type: string
+          pattern: '^[A-Z]{3}-[0-9]{4}$'
+          minLength: 8
+        when:
+          type: string
+          format: date-time
+        contact:
+          type: string
+          format: email
+        seats:
+          type: integer
+          format: int32
+          exclusiveMinimum: 0
+          exclusiveMaximum: 13
+        price:
+          type: number
+          minimum: 0
+          multipleOf: 0.5
+        tags:
+          type: array
+          minItems: 2
+          maxItems: 4
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+        meta:
+          type: object
+          minProperties: 1
+          additionalProperties:
+            type: string
+        nested:
+          $ref: '#/components/schemas/LevelA'
+    LevelA:
+      type: object
+      required: [label, next]
+      properties:
+        label:
+          type: string
+          pattern: '^[a-z]+$'
+        next:
+          $ref: '#/components/schemas/LevelB'
+    LevelB:
+      type: object
+      required: [weight]
+      properties:
+        weight:
+          type: integer
+          exclusiveMinimum: 0
+    FeedbackForm:
+      type: object
+      required: [rating, comment]
+      properties:
+        rating:
+          type: integer
+          exclusiveMinimum: 0
+          exclusiveMaximum: 6
+        comment:
+          type: string
+          minLength: 4
+          maxLength: 140

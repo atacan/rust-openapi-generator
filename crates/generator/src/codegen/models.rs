@@ -24,6 +24,7 @@ use crate::normalize::composition::{
 use crate::normalize::naming::{self, NameStyle};
 use crate::normalize::{NormalizedDocument, NormalizedSchema};
 
+use super::validation::{analyze, enforceable_with, Analysis, ScalarParamKind};
 use super::Emitter;
 
 /// Cell attribute for required + nullable properties (companion §2.1 row 2):
@@ -105,6 +106,7 @@ pub fn generate_models(doc: &NormalizedDocument) -> String {
         needs_optional_field: false,
         needs_btree_map: false,
         needs_serde: false,
+        analysis: analyze(doc),
         defs: Vec::new(),
     };
     for (schema, name) in components.iter().zip(names.iter()) {
@@ -133,6 +135,9 @@ struct StructDef {
     docs: Vec<String>,
     deny_unknown_fields: bool,
     fields: Vec<Field>,
+    /// Rendered statements of `validate_request` (fully pre-indented lines);
+    /// empty when the model carries no runtime-enforceable constraints.
+    validation_body: Vec<String>,
 }
 
 struct EnumDef {
@@ -156,12 +161,27 @@ struct ChoiceEnumDef {
     docs: Vec<String>,
     /// Newtype variants over branch types, branch declaration order.
     variants: Vec<(String, String)>,
+    /// Per-variant validator call when the branch payload type carries a
+    /// `validate_request` (`Some(option_wrapped)`); `None` otherwise.
+    variant_validations: Vec<Option<bool>>,
 }
 
 struct AliasDef {
     name: String,
     docs: Vec<String>,
     target: String,
+    /// Free `validate_<snake>_request` for a constrained scalar alias
+    /// (companion §9); `None` for unconstrained aliases and non-scalar
+    /// targets (free-form maps, tuples).
+    validator: Option<AliasValidator>,
+}
+
+/// Rendered free validator of one constrained scalar alias.
+struct AliasValidator {
+    fn_name: String,
+    param_ty: &'static str,
+    docs: Vec<String>,
+    body: Vec<String>,
 }
 
 struct FallbackDef {
@@ -183,6 +203,223 @@ struct Field {
 }
 
 // ----------------------------------------------------------------------
+// Runtime-validation emission fragments (companion §9, D-§2 bucket 2)
+// ----------------------------------------------------------------------
+//
+// Every builder renders statements for an EXPLICIT indentation level
+// (four-space steps; a `validate_request` method body sits at level two,
+// free alias validators at level one) because rustfmt's chain layout
+// depends on absolute column position — wrapper blocks pass deeper levels
+// down instead of re-prefixing pre-rendered text. Layout mirrors rustfmt's
+// rules so generated output stays rustfmt-clean (main spec §50 test 40):
+// 1. call plus annotation fit in [`RUSTFMT_MAX_WIDTH`] → one line;
+// 2. otherwise the call fits alone → its own line, `.map_err` link one
+//    level deeper;
+// 3. otherwise the argument list breaks vertically with the closing paren
+//    AND the `.map_err` link at the statement's own indent.
+
+/// Max text width of generated code, matching rustfmt's default.
+const RUSTFMT_MAX_WIDTH: usize = 100;
+
+/// Statement pad inside an inherent `validate_request` method body
+/// (indentation level two).
+const METHOD_PAD: &str = "        ";
+
+/// One support-crate validation call with optional field annotation
+/// (companion §9): `field` names the generated location so routers surface
+/// `Violation::Field` paths through SchemaViolation 422 details.
+struct CheckCall {
+    /// Callee expression WITHOUT the opening paren.
+    callee: String,
+    /// Fully rendered arguments (may themselves be nested blocks).
+    args: Vec<String>,
+    /// Field label for `Violation::at_field`; `None` leaves bare errors
+    /// (undecidable-context predicates feeding `is_ok()` only).
+    field: Option<String>,
+}
+
+/// Annotated composite-recursion statement
+/// (`::openapi_support::validation::located("field", EXPR.validate_request())?;`).
+/// A single flat call keeps emitted code free of multi-method chains, whose
+/// rustfmt layout is context-dependent; [`CheckCall::render`] owns the width
+/// decisions.
+fn annotated_call(expr: &str, field: Option<&str>, level: usize) -> Vec<String> {
+    let Some(field) = field else {
+        return vec![format!("{}{};", "    ".repeat(level), expr)];
+    };
+    CheckCall {
+        callee: "::openapi_support::validation::located".to_owned(),
+        args: vec![format!("\"{}\"", escape_string(field)), expr.to_owned()],
+        field: None,
+    }
+    .render(level)
+}
+
+impl CheckCall {
+    fn render(&self, level: usize) -> Vec<String> {
+        let pad = "    ".repeat(level);
+        let inner = format!("{pad}    ");
+        let annotation = self.field.as_deref().map(|field| {
+            format!(
+                ".map_err(|error| error.at_field(\"{}\"))",
+                escape_string(field)
+            )
+        });
+        let flat_call = format!("{}({})", self.callee, self.args.join(", "));
+        let terminator = "?;";
+        match &annotation {
+            Some(annotation) => {
+                let one_line = format!("{pad}{flat_call}{annotation}{terminator}");
+                if one_line.chars().count() <= RUSTFMT_MAX_WIDTH {
+                    return vec![one_line];
+                }
+                let flat_head = format!("{pad}{flat_call}");
+                if flat_head.chars().count() <= RUSTFMT_MAX_WIDTH {
+                    return vec![flat_head, format!("{pad}    {annotation}{terminator}")];
+                }
+            }
+            None => {
+                let one_line = format!("{pad}{flat_call}{terminator}");
+                if one_line.chars().count() <= RUSTFMT_MAX_WIDTH {
+                    return vec![one_line];
+                }
+            }
+        }
+        // Vertical form; multi-line arguments carry their INNER relative
+        // layout (four-space steps), prefixed here to the argument column.
+        let mut lines = vec![format!("{}{}(", pad, self.callee)];
+        for arg in &self.args {
+            let mut segments = arg.split('\n').map(ToOwned::to_owned).collect::<Vec<_>>();
+            let last = segments.len() - 1;
+            for (index, segment) in segments.iter_mut().enumerate() {
+                let line = format!("{inner}{segment}");
+                *segment = if index == last {
+                    format!("{line},")
+                } else {
+                    line
+                };
+            }
+            lines.extend(segments);
+        }
+        match &annotation {
+            None => lines.push(format!("{pad}){terminator}")),
+            Some(annotation) => {
+                lines.push(format!("{pad})"));
+                lines.push(format!("{pad}{annotation}{terminator}"));
+            }
+        }
+        lines
+    }
+}
+
+/// `validate_string` + `validate_format_string` against one accessor
+/// expression (already borrow-shaped, e.g. `&self.code` or `value`).
+fn string_check_lines(
+    accessor: &str,
+    validation: &ValidationMeta,
+    field: Option<&str>,
+    level: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if validation.pattern.is_some()
+        || validation.min_length.is_some()
+        || validation.max_length.is_some()
+    {
+        let pattern = validation
+            .pattern
+            .as_deref()
+            .map(|pattern| format!("Some(\"{}\")", escape_string(pattern)))
+            .unwrap_or_else(|| "None".to_owned());
+        lines.extend(
+            CheckCall {
+                callee: "::openapi_support::validation::validate_string".to_owned(),
+                args: vec![
+                    accessor.to_owned(),
+                    format!(
+                        "&::openapi_support::validation::StringConstraints {{\n    \
+                         pattern: {pattern},\n    min_length: {},\n    max_length: {},\n}}",
+                        option_u64(validation.min_length),
+                        option_u64(validation.max_length)
+                    ),
+                ],
+                field: field.map(ToOwned::to_owned),
+            }
+            .render(level),
+        );
+    }
+    if let Some(format) = known_format(validation.format.as_deref()) {
+        lines.extend(
+            CheckCall {
+                callee: "::openapi_support::validation::validate_format_string".to_owned(),
+                args: vec![accessor.to_owned(), format!("\"{format}\"")],
+                field: field.map(ToOwned::to_owned),
+            }
+            .render(level),
+        );
+    }
+    lines
+}
+
+/// `validate_number` against one value expression.
+fn number_check_lines(
+    value_expr: &str,
+    numeric: &crate::ir::schema::NumericValidation,
+    field: Option<&str>,
+    level: usize,
+) -> Vec<String> {
+    let min = match numeric.exclusive_minimum {
+        Some(bound) => Some((bound, true)),
+        None => numeric.minimum.map(|bound| (bound, false)),
+    };
+    let max = match numeric.exclusive_maximum {
+        Some(bound) => Some((bound, true)),
+        None => numeric.maximum.map(|bound| (bound, false)),
+    };
+    let bound_lit = |bound: Option<(f64, bool)>| match bound {
+        Some((value, exclusive)) => format!("Some(({}, {}))", float_literal(value), exclusive),
+        None => "None".to_owned(),
+    };
+    let multiple_of = numeric
+        .multiple_of
+        .map(|divisor| format!("Some({})", float_literal(divisor)))
+        .unwrap_or_else(|| "None".to_owned());
+    CheckCall {
+        callee: "::openapi_support::validation::validate_number".to_owned(),
+        args: vec![
+            value_expr.to_owned(),
+            bound_lit(min),
+            bound_lit(max),
+            multiple_of,
+        ],
+        field: field.map(ToOwned::to_owned),
+    }
+    .render(level)
+}
+
+fn option_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "None".to_owned(), |value| format!("Some({value})"))
+}
+
+/// Deterministic float literal with an explicit fractional part.
+fn float_literal(value: f64) -> String {
+    if value.is_finite() && value.fract() == 0.0 && value.abs() < 1e15 {
+        format!("{value:.1}")
+    } else {
+        format!("{value}")
+    }
+}
+
+/// The v1 recognized formats; unknown names stay metadata-only (documented).
+fn known_format(format: Option<&str>) -> Option<&str> {
+    match format? {
+        "date-time" | "date" | "time" | "email" | "hostname" | "uri" | "uuid" => {
+            Some(format.unwrap())
+        }
+        _ => None,
+    }
+}
+
+// ----------------------------------------------------------------------
 // Discovery pass
 // ----------------------------------------------------------------------
 
@@ -196,6 +433,9 @@ struct Generator<'a> {
     needs_optional_field: bool,
     needs_btree_map: bool,
     needs_serde: bool,
+    /// Shared runtime-validation verdicts (companion §9); consulted for
+    /// nested recursion and alias free functions.
+    analysis: Analysis,
     defs: Vec<Def>,
 }
 
@@ -246,10 +486,12 @@ impl<'a> Generator<'a> {
                 docs = description_lines(&self.doc.arena.get(effective).description.clone());
             }
             let target = self.reference_type(effective, component_name);
+            let validator = self.alias_validator(component_name, effective);
             self.defs.push(Def::TypeAlias(AliasDef {
                 name: component_name.to_owned(),
                 docs,
                 target,
+                validator,
             }));
             return;
         }
@@ -268,7 +510,7 @@ impl<'a> Generator<'a> {
                 let validation = self.validation_of(effective);
                 let docs = self.definition_docs(effective, &[], &validation);
                 self.needs_serde = true;
-                let def = self.build_struct(name, docs, &properties, additional);
+                let def = self.build_struct(name, docs, &properties, additional, &validation);
                 self.defs.push(def);
             }
             ResolvedKind::IntersectedScalar(scalar) => {
@@ -304,7 +546,7 @@ impl<'a> Generator<'a> {
                     let validation = self.validation_of(effective);
                     let docs = self.definition_docs(effective, &[], &validation);
                     self.needs_serde = true;
-                    let def = self.build_struct(name, docs, &properties, additional);
+                    let def = self.build_struct(name, docs, &properties, additional, &validation);
                     self.defs.push(def);
                 }
                 SchemaKind::Enum { values } => self.define_enum(effective, name, values),
@@ -327,6 +569,7 @@ impl<'a> Generator<'a> {
                         name: name.to_owned(),
                         docs,
                         target: "serde_json::Map<String, serde_json::Value>".to_owned(),
+                        validator: None,
                     }));
                 }
                 other_kind => {
@@ -334,10 +577,12 @@ impl<'a> Generator<'a> {
                     let docs = self.definition_docs(effective, &[], &ValidationMeta::default());
                     self.needs_serde = true;
                     let target = self.scalar_target(&other_kind, &hint);
+                    let validator = self.alias_validator(name, effective);
                     self.defs.push(Def::TypeAlias(AliasDef {
                         name: name.to_owned(),
                         docs,
                         target,
+                        validator,
                     }));
                 }
             },
@@ -346,7 +591,8 @@ impl<'a> Generator<'a> {
 
     /// Intersected scalars render as ONE validated type carrying every check
     /// as documentation (companion §4.1, main spec §50 test 51); intersected
-    /// homogeneous enums still need a nominal enum definition.
+    /// homogeneous enums still need a nominal enum definition. Constrained
+    /// scalar intersections additionally emit their free validator.
     fn define_intersected_scalar(
         &mut self,
         effective: SchemaId,
@@ -361,10 +607,12 @@ impl<'a> Generator<'a> {
                 let hint = name.to_owned();
                 self.needs_serde = true;
                 let target = self.scalar_target(&other_kind, &hint);
+                let validator = self.alias_validator(name, effective);
                 self.defs.push(Def::TypeAlias(AliasDef {
                     name: name.to_owned(),
                     docs,
                     target,
+                    validator,
                 }));
             }
         }
@@ -523,13 +771,15 @@ impl<'a> Generator<'a> {
     /// Schema(edge) → trailing flattened `BTreeMap` (D-impl-flatten-map-
     /// deterministic). Deny and flatten can never co-occur: the policy is a
     /// single enum value and normalization treats deny ∩ schema-valued as
-    /// unrepresentable.
+    /// unrepresentable. When the object (or its subtree) carries bucket-2
+    /// constraints, the rendered `validate_request` body rides along.
     fn build_struct(
         &mut self,
         name: &str,
         docs: Vec<String>,
         properties: &[PropertyIr],
         additional: AdditionalPropertiesPolicy,
+        object_validation: &ValidationMeta,
     ) -> Def {
         debug_assert!(
             !matches!(additional, AdditionalPropertiesPolicy::Deny)
@@ -539,39 +789,71 @@ impl<'a> Generator<'a> {
         let deny_unknown_fields = matches!(additional, AdditionalPropertiesPolicy::Deny);
 
         let struct_name = name.to_owned();
+        let counting = object_validation.min_properties.is_some()
+            || object_validation.max_properties.is_some();
         let mut fields = Vec::with_capacity(properties.len() + 1);
         let mut used_field_names = BTreeSet::new();
+        let mut validation_body = Vec::new();
         for property in properties {
-            fields.push(self.build_field(&struct_name, property, &mut used_field_names));
+            let built = self.build_field(&struct_name, property, &mut used_field_names, counting);
+            validation_body.extend(built.checks);
+            fields.push(built.field);
         }
-        if let AdditionalPropertiesPolicy::Schema(edge) = additional {
+        let additional_ident = if let AdditionalPropertiesPolicy::Schema(edge) = additional {
             self.needs_btree_map = true;
             let value_type = self.edge_type(edge, &format!("{name}Additional"));
+            let ident = unique_in(&mut used_field_names, "additional");
             fields.push(Field {
                 docs: Vec::new(),
                 attrs: vec!["#[serde(flatten)]".to_owned()],
-                name: unique_in(&mut used_field_names, "additional"),
+                name: ident.clone(),
                 ty: format!("BTreeMap<String, {value_type}>"),
             });
+            if counting {
+                // v1 counts schema-valued map entries toward the property
+                // count; the VALUE schemas stay metadata-only (documented).
+                validation_body.push(format!("{METHOD_PAD}property_count += self.{ident}.len();"));
+            }
+            Some(ident)
+        } else {
+            None
+        };
+        if counting {
+            validation_body.extend(
+                CheckCall {
+                    callee: "::openapi_support::validation::validate_object_props".to_owned(),
+                    args: vec![
+                        String::from("property_count"),
+                        option_u64(object_validation.min_properties),
+                        option_u64(object_validation.max_properties),
+                    ],
+                    field: None,
+                }
+                .render(2),
+            );
         }
+        let _ = additional_ident;
 
         Def::Struct(StructDef {
             name: struct_name,
             docs,
             deny_unknown_fields,
             fields,
+            validation_body: wrap_property_count_intro(validation_body, counting),
         })
     }
 
     /// One property through the companion §2.1 matrix cell-for-cell:
     /// requiredness from [`PropertyIr::required`], nullability from the
-    /// referenced node's resolution.
+    /// referenced node's resolution — plus the runtime-validation checks of
+    /// companion §9 when the referenced shape carries any.
     fn build_field(
         &mut self,
         parent: &str,
         property: &PropertyIr,
         used_field_names: &mut BTreeSet<String>,
-    ) -> Field {
+        counting: bool,
+    ) -> BuiltField {
         let effective = self.chase(property.schema.target);
         let nullable = self.nullable_of(effective);
         let hint = format!(
@@ -579,6 +861,7 @@ impl<'a> Generator<'a> {
             naming::ident(&property.wire_name, NameStyle::Pascal)
         );
         let base = self.edge_type(property.schema, &hint);
+        let boxed = matches!(property.schema.indirection, Indirection::Boxed);
 
         let (ty, cell_attr) = match (property.required, nullable) {
             (true, false) => (base, None),
@@ -627,13 +910,452 @@ impl<'a> Generator<'a> {
             docs.push(format!("Default: `{json}`."));
         }
 
-        Field {
-            docs,
-            attrs,
-            name: field_name,
-            ty,
+        // Runtime checks (companion §9): wrapped cells validate only their
+        // present-inner value; plain cells validate directly.
+        let wrapper = Wrapper::from_cell(property.required, nullable);
+        let validation = self.validation_of(effective);
+        let mut checks =
+            self.field_check_lines(&field_name, effective, &validation, boxed, wrapper);
+        if counting {
+            let count_expr = match (property.required, nullable) {
+                (true, false) => String::from("1_usize;"),
+                (_, true) => format!("usize::from(self.{field_name}.is_some());"),
+                (false, false) => {
+                    format!("usize::from(matches!(self.{field_name}, OptionalField::Present(_)));")
+                }
+            };
+            checks.push(format!("{METHOD_PAD}property_count += {count_expr}"));
+        }
+
+        BuiltField {
+            field: Field {
+                docs,
+                attrs,
+                name: field_name,
+                ty,
+            },
+            checks,
         }
     }
+
+    /// All statements for one object field: scalar constraints, array
+    /// cardinality/uniqueness/items/contains, recursion into validated
+    /// composites — each guarded by the presence wrapper when the matrix
+    /// cell wraps the value. Direct statements render at method-body level
+    /// two; wrapped statements at level three inside their `if let` head.
+    fn field_check_lines(
+        &self,
+        field_name: &str,
+        effective: SchemaId,
+        validation: &ValidationMeta,
+        boxed: bool,
+        wrapper: Wrapper,
+    ) -> Vec<String> {
+        const LEVEL: usize = 2;
+        let direct_string = format!("&self.{field_name}");
+        let direct_numeric = format!("(self.{field_name}) as f64");
+        let direct_float = format!("self.{field_name}");
+        // Array helpers take owned-method receivers (`self.f.len()`), never
+        // a leading reference (companion §9 emission contract).
+        let direct_array = format!("self.{field_name}");
+
+        let base_kind = self.effective_base_kind(effective);
+        let mut lines: Vec<String> = Vec::new();
+        let numeric_declared =
+            validation.numeric != crate::ir::schema::NumericValidation::default();
+        // Rejection details name the generated Rust field (companion §9).
+        let label = field_name.to_owned();
+        let some_label = Some(label.as_str());
+        match (wrapper, base_kind.as_ref()) {
+            (Wrapper::Direct, Some(SchemaKind::String_ { binary: false, .. })) => lines.extend(
+                string_check_lines(&direct_string, validation, some_label, LEVEL),
+            ),
+            (Wrapper::Direct, Some(SchemaKind::Integer { .. })) if numeric_declared => {
+                lines.extend(number_check_lines(
+                    &direct_numeric,
+                    &validation.numeric,
+                    some_label,
+                    LEVEL,
+                ));
+            }
+            (Wrapper::Direct, Some(SchemaKind::Number { .. })) if numeric_declared => {
+                lines.extend(number_check_lines(
+                    &direct_float,
+                    &validation.numeric,
+                    some_label,
+                    LEVEL,
+                ));
+            }
+            (Wrapper::Direct, Some(SchemaKind::Array { items })) => {
+                lines.extend(self.array_check_lines(
+                    &direct_array,
+                    *items,
+                    validation,
+                    some_label,
+                    LEVEL,
+                ));
+            }
+            (Wrapper::OptionalField, Some(SchemaKind::String_ { binary: false, .. })) => {
+                lines.extend(string_check_lines("value", validation, some_label, 3));
+            }
+            (Wrapper::Option | Wrapper::OptionalField, Some(SchemaKind::Integer { .. }))
+                if numeric_declared =>
+            {
+                lines.extend(number_check_lines(
+                    "*value as f64",
+                    &validation.numeric,
+                    some_label,
+                    3,
+                ));
+            }
+            (Wrapper::Option | Wrapper::OptionalField, Some(SchemaKind::Number { .. }))
+                if numeric_declared =>
+            {
+                lines.extend(number_check_lines(
+                    "*value",
+                    &validation.numeric,
+                    some_label,
+                    3,
+                ));
+            }
+            (Wrapper::OptionalField, Some(SchemaKind::Array { items })) => {
+                lines.extend(self.array_check_lines("value", *items, validation, some_label, 3));
+            }
+            _ => {}
+        }
+        // Recurse into validated composite children (Box derefs implicitly).
+        if self.is_validated_composite(effective) {
+            let call_target = match wrapper {
+                Wrapper::Direct if boxed => format!("(*self.{field_name})."),
+                Wrapper::Direct => format!("self.{field_name}."),
+                Wrapper::Option | Wrapper::OptionalField => "value.".to_owned(),
+            };
+            let level = if wrapper == Wrapper::Direct { LEVEL } else { 3 };
+            lines.extend(annotated_call(
+                &format!("{call_target}validate_request()"),
+                some_label,
+                level,
+            ));
+        }
+        if lines.is_empty() || wrapper == Wrapper::Direct {
+            return lines;
+        }
+        let head = match wrapper {
+            Wrapper::Direct => unreachable!("handled above"),
+            Wrapper::Option => format!("if let Some(value) = self.{field_name}.as_ref() {{"),
+            Wrapper::OptionalField => {
+                format!("if let OptionalField::Present(value) = &self.{field_name} {{")
+            }
+        };
+        let mut guarded = vec![format!("{METHOD_PAD}{head}")];
+        guarded.extend(lines);
+        guarded.push(format!("{METHOD_PAD}}}"));
+        guarded
+    }
+
+    /// Array-field statements: length bounds, uniqueness (string/number
+    /// elements only, documented v1 limit), per-item checks, and the
+    /// `contains` match-count block when representable.
+    fn array_check_lines(
+        &self,
+        accessor: &str,
+        items: SchemaEdge,
+        validation: &ValidationMeta,
+        field: Option<&str>,
+        level: usize,
+    ) -> Vec<String> {
+        // Normalize the receiver: helpers take method-call form
+        // (`self.f.len()`), the item loop borrows explicitly (`&self.f`).
+        let base = accessor.strip_prefix('&').unwrap_or(accessor);
+        let mut lines = Vec::new();
+        if validation.min_items.is_some() || validation.max_items.is_some() {
+            lines.extend(
+                CheckCall {
+                    callee: "::openapi_support::validation::validate_array_len".to_owned(),
+                    args: vec![
+                        format!("{base}.len()"),
+                        format!(
+                            "&::openapi_support::validation::ArrayConstraints {{\n    \
+                             min_items: {},\n    max_items: {},\n}}",
+                            option_u64(validation.min_items),
+                            option_u64(validation.max_items)
+                        ),
+                    ],
+                    field: field.map(ToOwned::to_owned),
+                }
+                .render(level),
+            );
+        }
+
+        let element = self.chase(items.target);
+        let element_kind = self.effective_base_kind(element);
+        let unique_kind = match element_kind.as_ref() {
+            Some(SchemaKind::String_ { binary: false, .. }) => UniqueKind::Strings,
+            Some(SchemaKind::Integer { .. } | SchemaKind::Number { .. }) => UniqueKind::Numbers,
+            _ => UniqueKind::None,
+        };
+        match unique_kind {
+            UniqueKind::None => {}
+            UniqueKind::Strings => {
+                lines.extend(
+                    CheckCall {
+                        callee: "::openapi_support::validation::require_unique_strings".to_owned(),
+                        args: vec![format!("{base}.iter()")],
+                        field: field.map(ToOwned::to_owned),
+                    }
+                    .render(level),
+                );
+            }
+            UniqueKind::Numbers => {
+                let map = match element_kind.as_ref() {
+                    Some(SchemaKind::Number { .. }) => ".iter().copied()",
+                    _ => ".iter().map(|value| *value as f64)",
+                };
+                lines.extend(
+                    CheckCall {
+                        callee: "::openapi_support::validation::require_unique_numbers".to_owned(),
+                        args: vec![format!("{base}{map}")],
+                        field: field.map(ToOwned::to_owned),
+                    }
+                    .render(level),
+                );
+            }
+        }
+
+        // Per-item statements: the item's OWN metadata (works through alias
+        // chasing even when the element type renders inline). Rejection
+        // details label elements `<field>[*]`.
+        let item_label = field.map(|field| format!("{field}[*]"));
+        let item_lines = self.element_item_lines(element, item_label.as_deref(), level + 1);
+        let loop_head = format!("for item in &{base} {{");
+        if !item_lines.is_empty() {
+            lines.push(format!("{}{loop_head}", "    ".repeat(level)));
+            lines.extend(item_lines);
+            lines.push(format!("{}}}", "    ".repeat(level)));
+        }
+
+        if let Some(contains_edge) = validation.contains {
+            if let Some(count_block) =
+                self.contains_block(&loop_head, element_kind.as_ref(), contains_edge, level)
+            {
+                lines.extend(count_block);
+            }
+        }
+        lines
+    }
+
+    /// Item-level check statements for one array ELEMENT schema (`item` is
+    /// the loop binding).
+    fn element_item_lines(
+        &self,
+        element: SchemaId,
+        field: Option<&str>,
+        level: usize,
+    ) -> Vec<String> {
+        let validation = self.validation_of(element);
+        match self.effective_base_kind(element).as_ref() {
+            Some(SchemaKind::String_ { binary: false, .. }) => {
+                string_check_lines("item", &validation, field, level)
+            }
+            Some(SchemaKind::Integer { .. }) => {
+                number_check_lines("*item as f64", &validation.numeric, field, level)
+            }
+            Some(SchemaKind::Number { .. }) => {
+                number_check_lines("*item", &validation.numeric, field, level)
+            }
+            _ => {
+                if self.is_validated_composite(element) {
+                    annotated_call("item.validate_request()", field, level)
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    }
+
+    /// The `contains` block: counts elements satisfying the CONTAINS
+    /// schema's own scalar constraints (v1: only same-family scalar contains
+    /// schemas are decidable; anything else skips, documented).
+    fn contains_block(
+        &self,
+        loop_head: &str,
+        element_kind: Option<&SchemaKind>,
+        contains_edge: SchemaEdge,
+        level: usize,
+    ) -> Option<Vec<String>> {
+        let contains_effective = self.chase(contains_edge.target);
+        let validation = self.validation_of(contains_effective);
+        let contains_kind = self.effective_base_kind(contains_effective)?;
+        // `format` enforces at runtime on string shapes only (companion §9
+        // v1 policy); numeric formats are type-shaping at decode.
+        let format_checked = matches!(contains_kind, SchemaKind::String_ { binary: false, .. });
+        if !enforceable_with(format_checked, &validation) {
+            return None;
+        }
+        let same_family = matches!(
+            (&contains_kind, element_kind),
+            (
+                SchemaKind::String_ { binary: false, .. },
+                Some(SchemaKind::String_ { binary: false, .. }),
+            ) | (SchemaKind::Integer { .. }, Some(SchemaKind::Integer { .. }),)
+                | (SchemaKind::Number { .. }, Some(SchemaKind::Number { .. }),)
+        );
+        if !same_family {
+            return None;
+        }
+        let pad = "    ".repeat(level);
+        let inner = format!("{pad}    ");
+        let inner2 = format!("{inner}    ");
+        // Predicate errors stay UNANNOTATED: the verdict feeds is_ok() and
+        // the aggregate count reports through validate_contains_count.
+        let (param_ty, mut predicate) = match &contains_kind {
+            SchemaKind::Integer { .. } => (
+                "&i64",
+                number_check_lines("*item as f64", &validation.numeric, None, level + 2),
+            ),
+            SchemaKind::Number { .. } => (
+                "&f64",
+                number_check_lines("*item", &validation.numeric, None, level + 2),
+            ),
+            _ => (
+                "&String",
+                string_check_lines("item", &validation, None, level + 2),
+            ),
+        };
+        // The last statement becomes the closure's tail expression so the
+        // call site can branch on `is_ok()`.
+        if let Some(last) = predicate.last_mut() {
+            *last = last.trim_end().trim_end_matches(';').to_owned();
+        }
+        // minContains defaults to 1 when the document omitted it.
+        let min = option_u64(validation.min_contains.or(Some(1)));
+        let max = option_u64(validation.max_contains);
+        let mut lines = Vec::new();
+        lines.push(format!("{pad}{{"));
+        lines.push(format!("{inner}let item_matches = |item: {param_ty}| {{"));
+        lines.extend(predicate);
+        lines.push(format!("{inner}}};"));
+        lines.push(format!("{inner}let mut matched = 0_usize;"));
+        lines.push(format!("{inner}{loop_head}"));
+        lines.push(format!("{inner2}if item_matches(item).is_ok() {{"));
+        lines.push(format!("{inner2}matched += 1;"));
+        lines.push(format!("{inner2}}}"));
+        lines.push(format!("{inner}}}"));
+        lines.extend(
+            CheckCall {
+                callee: "::openapi_support::validation::validate_contains_count".to_owned(),
+                args: vec!["matched".to_owned(), min, max],
+                field: None,
+            }
+            .render(level + 1),
+        );
+        lines.push(format!("{pad}}}"));
+        Some(lines)
+    }
+
+    /// Base [`SchemaKind`] after composition resolution; composite verdicts
+    /// come from the resolution itself, not this view.
+    fn effective_base_kind(&self, effective: SchemaId) -> Option<SchemaKind> {
+        match self.resolution_of(effective).clone() {
+            ResolvedKind::IntersectedScalar(scalar) => Some(scalar.base_kind),
+            ResolvedKind::RawValueFallback(_) | ResolvedKind::Alias(_) => None,
+            ResolvedKind::MergedObject(_) | ResolvedKind::ClosedEnum(_) => None,
+            ResolvedKind::Plain => Some(self.doc.arena.get(effective).kind.clone()),
+        }
+    }
+
+    /// Composite shapes that emit a `validate_request` method.
+    fn is_validated_composite(&self, effective: SchemaId) -> bool {
+        let composite = matches!(
+            self.resolution_of(effective),
+            ResolvedKind::MergedObject(_) | ResolvedKind::ClosedEnum(_)
+        ) || matches!(self.resolution_of(effective), ResolvedKind::Plain)
+            && matches!(
+                self.doc.arena.get(effective).kind,
+                SchemaKind::Object { .. }
+            );
+        composite && self.analysis.has_validator(effective)
+    }
+
+    /// Free validator function for a constrained scalar alias component
+    /// (the `Slug` case); `None` for everything else.
+    fn alias_validator(&self, component_name: &str, effective: SchemaId) -> Option<AliasValidator> {
+        let alias = self.analysis.scalar_alias(effective)?;
+        let validation = self.doc.resolution(effective).validation.clone();
+        // Free function bodies sit at indentation level one; the whole-alias
+        // value carries no field label (routers add the body context).
+        let mut body = match alias.kind {
+            ScalarParamKind::Str => string_check_lines("value", &validation, None, 1),
+            ScalarParamKind::Int => {
+                number_check_lines("*value as f64", &validation.numeric, None, 1)
+            }
+            ScalarParamKind::Float => number_check_lines("*value", &validation.numeric, None, 1),
+        };
+        body.push("    Ok(())".to_owned());
+        let param_ty = match alias.kind {
+            ScalarParamKind::Str => "&str",
+            ScalarParamKind::Int => "&i64",
+            ScalarParamKind::Float => "&f64",
+        };
+        Some(AliasValidator {
+            fn_name: alias.fn_name.clone(),
+            param_ty,
+            docs: vec![format!(
+                "Server-side request validation (companion §9) for the \
+                 constrained scalar alias `{component_name}`: bucket-2 \
+                 constraints enforced on server requests; client encoding \
+                 stays lenient."
+            )],
+            body,
+        })
+    }
+}
+
+/// Presence wrapper of one field in the generated struct, deciding both the
+/// accessor expressions and the `if let` guard of its checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wrapper {
+    /// Required + non-nullable: validate the field directly.
+    Direct,
+    /// Required + nullable or optional + nullable (`Option<T>`).
+    Option,
+    /// Optional + non-nullable (`OptionalField<T>`).
+    OptionalField,
+}
+
+impl Wrapper {
+    fn from_cell(required: bool, nullable: bool) -> Self {
+        match (required, nullable) {
+            (true, false) => Self::Direct,
+            (false, false) => Self::OptionalField,
+            (_, true) => Self::Option,
+        }
+    }
+}
+
+/// A built struct field plus its runtime-validation statements.
+struct BuiltField {
+    field: Field,
+    checks: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UniqueKind {
+    None,
+    Strings,
+    Numbers,
+}
+
+/// Emits the `let mut property_count = 0_usize;` prologue ahead of the
+/// accumulated `+=` contributions when the object declares property-count
+/// bounds.
+fn wrap_property_count_intro(body: Vec<String>, counting: bool) -> Vec<String> {
+    if !counting || body.is_empty() {
+        return body;
+    }
+    let mut out = vec![format!("{METHOD_PAD}let mut property_count = 0_usize;")];
+    out.extend(body);
+    out
 }
 
 // ----------------------------------------------------------------------
@@ -735,6 +1457,7 @@ impl<'a> Generator<'a> {
     ) -> Def {
         let mut used_variants = BTreeSet::new();
         let mut variants = Vec::with_capacity(choice.branches.len());
+        let mut variant_validations = Vec::with_capacity(choice.branches.len());
         for (index, branch) in choice.branches.iter().enumerate() {
             let effective = self.chase(branch.target);
             let fallback_hint = format!("{name}Branch{}", index + 1);
@@ -744,18 +1467,28 @@ impl<'a> Generator<'a> {
                 .cloned()
                 .unwrap_or_else(|| fallback_hint.clone());
             let variant_name = unique_in(&mut used_variants, &base_variant_name);
+            let nullable = self.nullable_of(effective);
             let payload_base = self.edge_type(*branch, &fallback_hint);
-            let payload = if self.nullable_of(effective) {
+            let payload = if nullable {
                 format!("Option<{payload_base}>")
             } else {
                 payload_base
             };
+            // Validate through branch payloads that carry validators
+            // (recursion; raw/value fallbacks never do, documented).
+            let validation = if self.analysis.has_validator(effective) {
+                Some(nullable)
+            } else {
+                None
+            };
             variants.push((variant_name, payload));
+            variant_validations.push(validation);
         }
         Def::ChoiceEnum(ChoiceEnumDef {
             name: name.to_owned(),
             docs,
             variants,
+            variant_validations,
         })
     }
 }
@@ -825,7 +1558,8 @@ fn is_binary_string(doc: &NormalizedDocument, effective: SchemaId) -> bool {
 }
 
 /// Bucket-2 validation metadata rendered as documentation (D-§2 bucket 2;
-/// enforced at runtime starting Phase 2, D-impl-runtime-validation-timing).
+/// enforced on server requests at runtime since the Phase 2 validation
+/// package, D-impl-runtime-validation-timing).
 pub fn validation_lines(validation: &ValidationMeta) -> Vec<String> {
     let mut parts: Vec<String> = Vec::new();
     if let Some(pattern) = &validation.pattern {
@@ -903,8 +1637,8 @@ pub fn validation_lines(validation: &ValidationMeta) -> Vec<String> {
         return Vec::new();
     }
     vec![format!(
-        "Constraints (runtime enforcement starts in Phase 2, \
-         DECISIONS.md D-impl-runtime-validation-timing): {}.",
+        "Constraints (enforced by generated routers on server requests, \
+         companion §9; lenient on client decode): {}.",
         parts.join("; ")
     )]
 }
@@ -1018,9 +1752,10 @@ fn emit_crate_docs(emitter: &mut Emitter) {
         "suffixes, companion §10).",
         "",
         "Property presence/nullability follows companion §2.1 cell-for-cell; bucket-2",
-        "validation constraints ride as documentation until Phase 2 runtime enforcement",
-        "(DECISIONS.md D-impl-runtime-validation-timing). This file is generated",
-        "deterministically byte-for-byte (main spec §50 test 39); do not edit by hand.",
+        "validation constraints ride as documentation and as emitted `validate_request`",
+        "methods (companion §9; D-impl-runtime-validation-timing Phase 2 half). This file",
+        "is generated deterministically byte-for-byte (main spec §50 test 39); do not edit",
+        "by hand.",
     ];
     let owned: Vec<String> = docs.iter().map(|line| (*line).to_owned()).collect();
     emitter.docs(0, &owned);
@@ -1028,14 +1763,124 @@ fn emit_crate_docs(emitter: &mut Emitter) {
 
 fn emit_def(emitter: &mut Emitter, def: &Def) {
     match def {
-        Def::Struct(struct_def) => emit_struct(emitter, struct_def),
+        Def::Struct(struct_def) => {
+            emit_struct(emitter, struct_def);
+            if !struct_def.validation_body.is_empty() {
+                emitter.blank();
+                emit_validate_request_impl(emitter, &struct_def.name, &struct_def.validation_body);
+            }
+        }
         Def::StringsEnum(enum_def) => emit_enum(emitter, enum_def, false),
         Def::MixedEnum(enum_def) => emit_enum(emitter, enum_def, true),
         Def::IntegersEnum(integers) => emit_integers_enum(emitter, integers),
-        Def::ChoiceEnum(choice) => emit_choice_enum(emitter, choice),
-        Def::TypeAlias(alias) => emit_alias(emitter, alias),
+        Def::ChoiceEnum(choice) => {
+            emit_choice_enum(emitter, choice);
+            if choice.variant_validations.iter().any(Option::is_some) {
+                emitter.blank();
+                emit_choice_enum_validator(emitter, choice);
+            }
+        }
+        Def::TypeAlias(alias) => {
+            emit_alias(emitter, alias);
+            if let Some(validator) = &alias.validator {
+                emitter.blank();
+                emit_alias_validator(emitter, validator);
+            }
+        }
         Def::FallbackNewtype(fallback) => emit_fallback(emitter, fallback),
     }
+}
+
+/// The shared `validate_request` inherent method (companion §9): structural
+/// checks stay in Serde decode; these enforce the D-§2 bucket-2 constraints.
+fn emit_validate_request_impl(emitter: &mut Emitter, name: &str, body: &[String]) {
+    emitter.line(0, &format!("impl {name} {{"));
+    emitter.docs(
+        1,
+        &[
+            String::from(
+                "Server-side request validation (companion §9): structural \
+                 checks stay in Serde decode; these enforce the D-§2",
+            ),
+            String::from("bucket-2 constraints. Client decoding stays lenient."),
+        ],
+    );
+    emitter.line(1, "pub fn validate_request(");
+    emitter.line(2, "&self,");
+    emitter.line(
+        1,
+        ") -> ::std::result::Result<(), ::openapi_support::validation::Violation> {",
+    );
+    for line in body {
+        emitter.line(0, line);
+    }
+    emitter.line(2, "Ok(())");
+    emitter.line(1, "}");
+    emitter.line(0, "}");
+}
+
+/// Validator over a proven-exclusive choice enum: recurses into branch
+/// payloads that carry their own validators (raw/value fallback branches
+/// never appear here — they are separate `<Type>Fallback` newtypes).
+fn emit_choice_enum_validator(emitter: &mut Emitter, def: &ChoiceEnumDef) {
+    emitter.line(0, &format!("impl {} {{", def.name));
+    emitter.docs(
+        1,
+        &[
+            String::from(
+                "Server-side request validation (companion §9): each branch \
+                 validates its payload when that branch type carries",
+            ),
+            String::from("constraints; nullable branches validate only when present."),
+        ],
+    );
+    emitter.line(1, "pub fn validate_request(");
+    emitter.line(2, "&self,");
+    emitter.line(
+        1,
+        ") -> ::std::result::Result<(), ::openapi_support::validation::Violation> {",
+    );
+    emitter.line(2, "match self {");
+    for ((variant_name, _payload), validation) in def.variants.iter().zip(&def.variant_validations)
+    {
+        match *validation {
+            None => emitter.line(3, &format!("Self::{variant_name}(_) => {{}}")),
+            Some(false) => {
+                emitter.line(3, &format!("Self::{variant_name}(inner) => {{"));
+                for line in annotated_call("inner.validate_request()", Some(variant_name), 4) {
+                    emitter.line(0, &line);
+                }
+                emitter.line(3, "}");
+            }
+            Some(true) => {
+                emitter.line(3, &format!("Self::{variant_name}(Some(inner)) => {{"));
+                for line in annotated_call("inner.validate_request()", Some(variant_name), 4) {
+                    emitter.line(0, &line);
+                }
+                emitter.line(3, "}");
+                emitter.line(3, &format!("Self::{variant_name}(None) => {{}}"));
+            }
+        }
+    }
+    emitter.line(2, "}");
+    emitter.line(2, "Ok(())");
+    emitter.line(1, "}");
+    emitter.line(0, "}");
+}
+
+/// The free validator of one constrained scalar alias.
+fn emit_alias_validator(emitter: &mut Emitter, validator: &AliasValidator) {
+    emitter.docs(0, &validator.docs);
+    emitter.line(0, &format!("pub fn {}(", validator.fn_name));
+    emitter.line(1, &format!("value: {},", validator.param_ty));
+    emitter.line(
+        0,
+        ") -> ::std::result::Result<(), ::openapi_support::validation::Violation> {",
+    );
+    for line in &validator.body {
+        emitter.line(0, line);
+    }
+    emitter.line(0, "}");
 }
 
 fn emit_struct(emitter: &mut Emitter, def: &StructDef) {
@@ -1117,8 +1962,6 @@ fn split_attr_arguments(inner: &str) -> Vec<String> {
     }
     arguments
 }
-
-const RUSTFMT_MAX_WIDTH: usize = 100;
 
 fn emit_enum(emitter: &mut Emitter, def: &EnumDef, untagged: bool) {
     emitter.docs(0, &def.docs);

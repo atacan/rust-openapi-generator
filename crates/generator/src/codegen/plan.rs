@@ -20,20 +20,40 @@ use crate::normalize::composition::ResolvedKind;
 use crate::normalize::naming::{self, NameStyle};
 use crate::normalize::{NormalizedDocument, NormalizedOperation};
 
+use super::validation::{analyze, Analysis};
+
 /// Generator configuration for planning (main spec §29 configured preference
 /// order hook).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PlanConfig {
     /// Media-type literals listed here are ordered first in every operation's
     /// `Accept` header, in the given preference order; everything else follows
     /// document declaration order (the default when this list is empty).
     pub accept_preference: Vec<String>,
+    /// Companion §9 runtime-validation policy (D-impl-runtime-validation-
+    /// timing Phase 2 half): when true (the default) generated routers call
+    /// the emitted `validate_request` validators on decoded server request
+    /// bodies and reject via `SchemaViolation` 422. Turning it off skips the
+    /// CALLS only; validators are still emitted into models.rs.
+    pub server_runtime_validation: bool,
+}
+
+impl Default for PlanConfig {
+    fn default() -> Self {
+        Self {
+            accept_preference: Vec::new(),
+            server_runtime_validation: true,
+        }
+    }
 }
 
 /// Planned API: every operation in document order.
 #[derive(Debug, Clone)]
 pub struct PlannedApi {
     pub operations: Vec<PlannedOperation>,
+    /// Effective companion §9 policy copied from [`PlanConfig`] so the
+    /// server emitter gates its validation calls without extra plumbing.
+    pub server_runtime_validation: bool,
 }
 
 /// One operation with every codegen decision precomputed so both emitters
@@ -122,6 +142,23 @@ pub struct PlannedContent {
     /// always `None` elsewhere (response-side multipart still
     /// stop-and-reports).
     pub multipart_spec: Option<PlannedMultipart>,
+    /// How the decoded body validates (companion §9); `None` when nothing
+    /// bucket-2 survives normalization for this entry. The router runs the
+    /// check after a successful decode and maps failures onto
+    /// SchemaViolation 422 — only when [`PlanConfig::server_runtime_validation`]
+    /// is on (the default).
+    pub body_validation: Option<PlannedBodyValidation>,
+}
+
+/// How one decoded request body validates (companion §9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlannedBodyValidation {
+    /// Composite payload with an emitted models.rs validator: call the
+    /// inherent `<value>.validate_request()`.
+    Inherent,
+    /// Constrained scalar alias: call the free models.rs
+    /// `validate_<snake>_request(&value)`.
+    ScalarFn(String),
 }
 
 /// Planned field set of one `multipart/form-data` schema (main spec §17):
@@ -150,6 +187,10 @@ pub struct PlannedMultipartField {
     /// True when the property schema is an array; the wire may then repeat
     /// the part name and values collect in arrival order (§17.1).
     pub repeated: bool,
+    /// Free validator function from models.rs when the part's schema is a
+    /// constrained scalar alias (companion §9); validated at decode time in
+    /// the collector / tail scan.
+    pub scalar_validator: Option<String>,
 }
 
 /// Per-part payload representation (§17 source mapping).
@@ -204,17 +245,24 @@ pub fn plan_api_with_config(
     config: &PlanConfig,
 ) -> Result<PlannedApi, Vec<Diagnostic>> {
     let mut diags = Diagnostics::new();
+    let analysis = analyze(doc);
     let mut operations = Vec::with_capacity(doc.operations.len());
     for operation in &doc.operations {
-        operations.push(plan_operation(doc, operation, config, &mut diags));
+        operations.push(plan_operation(
+            doc, operation, config, &analysis, &mut diags,
+        ));
     }
-    diags.into_result(PlannedApi { operations })
+    diags.into_result(PlannedApi {
+        operations,
+        server_runtime_validation: config.server_runtime_validation,
+    })
 }
 
 fn plan_operation(
     doc: &NormalizedDocument,
     operation: &NormalizedOperation,
     config: &PlanConfig,
+    analysis: &Analysis,
     diags: &mut Diagnostics,
 ) -> PlannedOperation {
     let location = operation_location(operation);
@@ -228,8 +276,14 @@ fn plan_operation(
     let mut request_body_required = false;
     if let Some(body) = &operation.request_body {
         request_body_required = body.required;
-        request_contents =
-            plan_contents(doc, &location, &body.content, diags, ContentSide::Request);
+        request_contents = plan_contents(
+            doc,
+            &location,
+            &body.content,
+            diags,
+            ContentSide::Request,
+            analysis,
+        );
         if request_contents.len() >= 2 {
             let stem = operation
                 .response_enum
@@ -253,6 +307,7 @@ fn plan_operation(
                 &response.content,
                 diags,
                 ContentSide::Response,
+                analysis,
             );
             let headers = plan_response_headers(doc, response, operation.method, &location, diags);
             let status = PlannedStatus {
@@ -448,6 +503,7 @@ fn plan_contents(
     contents: &[ContentEntryIr],
     diags: &mut Diagnostics,
     side: ContentSide,
+    analysis: &Analysis,
 ) -> Vec<PlannedContent> {
     let mut planned = Vec::with_capacity(contents.len());
     let mut used_variants: BTreeSet<String> = BTreeSet::new();
@@ -506,11 +562,34 @@ fn plan_contents(
             MediaClass::UrlEncodedForm => json_model_expr(doc, entry.schema, location, diags),
             MediaClass::PlainText => "String".to_owned(),
             MediaClass::Multipart => {
-                multipart_spec = plan_multipart_spec(doc, entry, location, diags);
+                multipart_spec = plan_multipart_spec(doc, entry, location, diags, analysis);
                 String::new()
             }
             // Binary/RawUnknown stream; each emitter renders its own payload.
             _ => String::new(),
+        };
+        // Constrained scalar aliases carry their models.rs free validator
+        // (companion §9); named composite payloads validate through their
+        // inherent `validate_request`. Anonymous shapes never validate:
+        // inline scalars have no validator to call (documented leniency),
+        // and anonymous composites are plan-time Errors anyway.
+        let body_validation = match entry.media_class {
+            MediaClass::JsonFamily | MediaClass::UrlEncodedForm | MediaClass::PlainText => {
+                let effective = doc.resolve_alias(entry.schema);
+                match analysis.scalar_alias(effective) {
+                    Some(alias) => Some(PlannedBodyValidation::ScalarFn(alias.fn_name.clone())),
+                    None if matches!(
+                        entry.media_class,
+                        MediaClass::JsonFamily | MediaClass::UrlEncodedForm
+                    ) && analysis.has_validator(effective)
+                        && component_name(doc, effective).is_some() =>
+                    {
+                        Some(PlannedBodyValidation::Inherent)
+                    }
+                    None => None,
+                }
+            }
+            _ => None,
         };
         planned.push(PlannedContent {
             variant_name: variant,
@@ -519,6 +598,7 @@ fn plan_contents(
             model_expr,
             is_wildcard: entry.is_wildcard,
             multipart_spec,
+            body_validation,
         });
     }
     planned
@@ -540,6 +620,7 @@ fn plan_multipart_spec(
     entry: &ContentEntryIr,
     location: &DocumentPath,
     diags: &mut Diagnostics,
+    analysis: &Analysis,
 ) -> Option<PlannedMultipart> {
     let schema_location = location.key("content").key(entry.media_type.clone());
     let effective = doc.resolve_alias(entry.schema);
@@ -608,6 +689,7 @@ fn plan_multipart_spec(
         fields.push(PlannedMultipartField {
             wire_name: property.wire_name.clone(),
             rust_name,
+            scalar_validator: scalar_validator_for(doc, property.schema.target, analysis),
             kind,
             required: property.required,
             content_type: encoding
@@ -637,6 +719,20 @@ fn plan_multipart_spec(
         return None;
     }
     Some(PlannedMultipart { fields })
+}
+
+/// Constrained scalar alias behind one schema edge → the models.rs free
+/// validator name (companion §9). Only textual scalar parts can carry it;
+/// JSON parts validate through their model's inherent method.
+fn scalar_validator_for(
+    doc: &NormalizedDocument,
+    schema: SchemaId,
+    analysis: &Analysis,
+) -> Option<String> {
+    let effective = doc.resolve_alias(schema);
+    analysis
+        .scalar_alias(effective)
+        .map(|alias| alias.fn_name.clone())
 }
 
 /// Maps one property schema onto its part representation, returning the kind

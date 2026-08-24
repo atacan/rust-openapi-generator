@@ -15,6 +15,7 @@ pub mod client;
 pub mod models;
 pub mod plan;
 pub mod server;
+mod validation;
 pub mod views;
 
 /// Indentation-aware line writer shared by the emitters: fixed four-space

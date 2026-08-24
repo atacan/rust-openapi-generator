@@ -7,9 +7,10 @@
 /// suffixes, companion §10).
 ///
 /// Property presence/nullability follows companion §2.1 cell-for-cell; bucket-2
-/// validation constraints ride as documentation until Phase 2 runtime enforcement
-/// (DECISIONS.md D-impl-runtime-validation-timing). This file is generated
-/// deterministically byte-for-byte (main spec §50 test 39); do not edit by hand.
+/// validation constraints ride as documentation and as emitted `validate_request`
+/// methods (companion §9; D-impl-runtime-validation-timing Phase 2 half). This file
+/// is generated deterministically byte-for-byte (main spec §50 test 39); do not edit
+/// by hand.
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

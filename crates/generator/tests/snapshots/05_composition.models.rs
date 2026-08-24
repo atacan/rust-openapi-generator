@@ -7,9 +7,10 @@
 /// suffixes, companion §10).
 ///
 /// Property presence/nullability follows companion §2.1 cell-for-cell; bucket-2
-/// validation constraints ride as documentation until Phase 2 runtime enforcement
-/// (DECISIONS.md D-impl-runtime-validation-timing). This file is generated
-/// deterministically byte-for-byte (main spec §50 test 39); do not edit by hand.
+/// validation constraints ride as documentation and as emitted `validate_request`
+/// methods (companion §9; D-impl-runtime-validation-timing Phase 2 half). This file
+/// is generated deterministically byte-for-byte (main spec §50 test 39); do not edit
+/// by hand.
 use openapi_support::optional::OptionalField;
 use serde::{Deserialize, Serialize};
 
@@ -24,9 +25,21 @@ pub struct BaseWidget {
 pub struct Timestamps {
     #[serde(default, skip_serializing_if = "openapi_support::optional::is_absent")]
     pub name: OptionalField<String>,
-    /// Constraints (runtime enforcement starts in Phase 2, DECISIONS.md D-impl-runtime-validation-timing): format `date-time`.
+    /// Constraints (enforced by generated routers on server requests, companion §9; lenient on client decode): format `date-time`.
     #[serde(rename = "createdAt")]
     pub created_at: String,
+}
+
+impl Timestamps {
+    /// Server-side request validation (companion §9): structural checks stay in Serde decode; these enforce the D-§2
+    /// bucket-2 constraints. Client decoding stays lenient.
+    pub fn validate_request(
+        &self,
+    ) -> ::std::result::Result<(), ::openapi_support::validation::Violation> {
+        ::openapi_support::validation::validate_format_string(&self.created_at, "date-time")
+            .map_err(|error| error.at_field("created_at"))?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -34,13 +47,40 @@ pub struct FullWidget {
     pub id: String,
     #[serde(default, skip_serializing_if = "openapi_support::optional::is_absent")]
     pub name: OptionalField<String>,
-    /// Constraints (runtime enforcement starts in Phase 2, DECISIONS.md D-impl-runtime-validation-timing): format `date-time`.
+    /// Constraints (enforced by generated routers on server requests, companion §9; lenient on client decode): format `date-time`.
     #[serde(rename = "createdAt")]
     pub created_at: String,
 }
 
-/// Constraints (runtime enforcement starts in Phase 2, DECISIONS.md D-impl-runtime-validation-timing): pattern `^[a-z]+$`; minLength >= 3.
+impl FullWidget {
+    /// Server-side request validation (companion §9): structural checks stay in Serde decode; these enforce the D-§2
+    /// bucket-2 constraints. Client decoding stays lenient.
+    pub fn validate_request(
+        &self,
+    ) -> ::std::result::Result<(), ::openapi_support::validation::Violation> {
+        ::openapi_support::validation::validate_format_string(&self.created_at, "date-time")
+            .map_err(|error| error.at_field("created_at"))?;
+        Ok(())
+    }
+}
+
+/// Constraints (enforced by generated routers on server requests, companion §9; lenient on client decode): pattern `^[a-z]+$`; minLength >= 3.
 pub type Slug = String;
+
+/// Server-side request validation (companion §9) for the constrained scalar alias `Slug`: bucket-2 constraints enforced on server requests; client encoding stays lenient.
+pub fn validate_slug_request(
+    value: &str,
+) -> ::std::result::Result<(), ::openapi_support::validation::Violation> {
+    ::openapi_support::validation::validate_string(
+        value,
+        &::openapi_support::validation::StringConstraints {
+            pattern: Some("^[a-z]+$"),
+            min_length: Some(3),
+            max_length: None,
+        },
+    )?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DogKind {

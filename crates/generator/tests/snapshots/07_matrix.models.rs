@@ -7,9 +7,10 @@
 /// suffixes, companion §10).
 ///
 /// Property presence/nullability follows companion §2.1 cell-for-cell; bucket-2
-/// validation constraints ride as documentation until Phase 2 runtime enforcement
-/// (DECISIONS.md D-impl-runtime-validation-timing). This file is generated
-/// deterministically byte-for-byte (main spec §50 test 39); do not edit by hand.
+/// validation constraints ride as documentation and as emitted `validate_request`
+/// methods (companion §9; D-impl-runtime-validation-timing Phase 2 half). This file
+/// is generated deterministically byte-for-byte (main spec §50 test 39); do not edit
+/// by hand.
 use std::collections::BTreeMap;
 
 use openapi_support::optional::OptionalField;
@@ -22,7 +23,7 @@ pub struct MatrixRecord {
         deserialize_with = "openapi_support::optional::presence::deserialize_required_nullable"
     )]
     pub req_nullable: Option<String>,
-    /// Constraints (runtime enforcement starts in Phase 2, DECISIONS.md D-impl-runtime-validation-timing): format `int32`.
+    /// Constraints (enforced by generated routers on server requests, companion §9; lenient on client decode): format `int32`.
     #[serde(default, skip_serializing_if = "openapi_support::optional::is_absent")]
     pub opt_plain: OptionalField<i32>,
     #[serde(default)]
