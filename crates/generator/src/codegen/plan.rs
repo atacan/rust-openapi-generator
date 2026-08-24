@@ -553,11 +553,21 @@ fn plan_contents(
             }
             _ => {}
         }
+        // §44 override (D-impl-x-rust-body-stream): `x-rust-body: stream`
+        // turns a bounded plain-text entry into the raw streaming family for
+        // BOTH directions; the literal (and therefore runtime matching,
+        // Accept, and the TextPlain variant name) stays verbatim.
+        let effective_class = if entry.stream_override && entry.media_class == MediaClass::PlainText
+        {
+            MediaClass::Binary
+        } else {
+            entry.media_class
+        };
         let base_literal = base_media_literal(&entry.media_type);
         let variant_base = content_variant_base(&base_literal, entry.is_wildcard);
         let variant = unique_variant(&variant_base, &mut used_variants);
         let mut multipart_spec = None;
-        let model_expr = match entry.media_class {
+        let model_expr = match effective_class {
             MediaClass::JsonFamily => json_model_expr(doc, entry.schema, location, diags),
             MediaClass::UrlEncodedForm => json_model_expr(doc, entry.schema, location, diags),
             MediaClass::PlainText => "String".to_owned(),
@@ -573,7 +583,7 @@ fn plan_contents(
         // inherent `validate_request`. Anonymous shapes never validate:
         // inline scalars have no validator to call (documented leniency),
         // and anonymous composites are plan-time Errors anyway.
-        let body_validation = match entry.media_class {
+        let body_validation = match effective_class {
             MediaClass::JsonFamily | MediaClass::UrlEncodedForm | MediaClass::PlainText => {
                 let effective = doc.resolve_alias(entry.schema);
                 match analysis.scalar_alias(effective) {
@@ -593,7 +603,7 @@ fn plan_contents(
         };
         planned.push(PlannedContent {
             variant_name: variant,
-            media_class: entry.media_class,
+            media_class: effective_class,
             media_type_literal: base_literal,
             model_expr,
             is_wildcard: entry.is_wildcard,
@@ -890,17 +900,22 @@ fn base_media_literal(media_type: &str) -> String {
 
 /// Content variant name from the subtype (§4/§25 examples): wildcards →
 /// `Any`, `text/*` → `Text<Pascal>`, everything else → `<Pascal(subtype)>`.
+/// Structured-suffix `+` separators join into the identifier
+/// (`application/problem+json` → `ProblemJson`, per Example 18).
 fn content_variant_base(base_literal: &str, is_wildcard: bool) -> String {
     if is_wildcard {
         return "Any".to_owned();
     }
     let Some((ty, subtype)) = base_literal.split_once('/') else {
-        return naming::ident(base_literal, NameStyle::Pascal);
+        return naming::ident(&base_literal.replace('+', "-"), NameStyle::Pascal);
     };
     if ty.eq_ignore_ascii_case("text") {
-        format!("Text{}", naming::ident(subtype, NameStyle::Pascal))
+        format!(
+            "Text{}",
+            naming::ident(&subtype.replace('+', "-"), NameStyle::Pascal)
+        )
     } else {
-        naming::ident(subtype, NameStyle::Pascal)
+        naming::ident(&subtype.replace('+', "-"), NameStyle::Pascal)
     }
 }
 

@@ -2348,14 +2348,17 @@ fn emit_request_enum_arm(
             flags.needs_encode_overflow = true;
             emitter.line(indent, &format!("{variant}(value) => {{"));
             emit_bounded_encode(emitter, indent + 1, "&value", "serialize_json_limited");
+            // The Content-Type + body chain always exceeds rustfmt's default
+            // chain_width, so the canonical form breaks after `request`.
+            emitter.line(indent + 1, "request");
             emitter.line(
-                indent + 1,
+                indent + 2,
                 &format!(
-                    "request.header(::http::header::CONTENT_TYPE, {})",
+                    ".header(::http::header::CONTENT_TYPE, {})",
                     rust_string_literal(&content.media_type_literal)
                 ),
             );
-            emitter.line(indent + 1, ".body(payload)");
+            emitter.line(indent + 2, ".body(payload)");
             emitter.line(indent, "}");
         }
         MediaClass::UrlEncodedForm => {
@@ -2365,14 +2368,15 @@ fn emit_request_enum_arm(
             flags.needs_encode_overflow = true;
             emitter.line(indent, &format!("{variant}(value) => {{"));
             emit_bounded_encode(emitter, indent + 1, "&value", "serialize_form_limited");
+            emitter.line(indent + 1, "request");
             emitter.line(
-                indent + 1,
+                indent + 2,
                 &format!(
-                    "request.header(::http::header::CONTENT_TYPE, {})",
+                    ".header(::http::header::CONTENT_TYPE, {})",
                     rust_string_literal(&content.media_type_literal)
                 ),
             );
-            emitter.line(indent + 1, ".body(payload)");
+            emitter.line(indent + 2, ".body(payload)");
             emitter.line(indent, "}");
         }
         MediaClass::PlainText => {
@@ -2380,14 +2384,17 @@ fn emit_request_enum_arm(
             flags.needs_encode_overflow = true;
             emitter.line(indent, &format!("{variant}(text) => {{"));
             emit_text_len_check(emitter, indent + 1, "text");
+            // The Content-Type + body chain always exceeds rustfmt's default
+            // chain_width, so the canonical form breaks after `request`.
+            emitter.line(indent + 1, "request");
             emitter.line(
-                indent + 1,
+                indent + 2,
                 &format!(
-                    "request.header(::http::header::CONTENT_TYPE, {})",
+                    ".header(::http::header::CONTENT_TYPE, {})",
                     rust_string_literal(&content.media_type_literal)
                 ),
             );
-            emitter.line(indent + 1, ".body(text)");
+            emitter.line(indent + 2, ".body(text)");
             emitter.line(indent, "}");
         }
         MediaClass::Multipart => {
@@ -2401,17 +2408,17 @@ fn emit_request_enum_arm(
             emitter.line(indent, "}");
         }
         _ => {
-            emitter.line(indent, &format!("{variant}(body) => {{"));
-            emitter.line(indent + 1, "request");
+            // Single trailing expression: rustfmt collapses the arm out of
+            // block form (same rule as `emit_simple_arm`).
+            emitter.line(indent, &format!("{variant}(body) => request"));
             emitter.line(
-                indent + 2,
+                indent + 1,
                 &format!(
                     ".header(::http::header::CONTENT_TYPE, {})",
                     rust_string_literal(&content.media_type_literal)
                 ),
             );
-            emitter.line(indent + 2, ".body(body)");
-            emitter.line(indent, "}");
+            emitter.line(indent + 1, ".body(body),");
         }
     }
 }
@@ -3094,9 +3101,18 @@ fn emit_bounded_encode(emitter: &mut Emitter, indent: usize, value_expr: &str, s
     if fits(arm_indent, err_line) {
         emitter.line(arm_indent, err_line);
     } else {
-        emitter.line(arm_indent, "Err(_) => return Err(encode_overflow_error(");
-        emitter.line(arm_indent + 1, "self.limits.structured_encode_bytes,");
-        emitter.line(arm_indent, ")),");
+        // rustfmt-canonical block form once the one-liner exceeds the width
+        // budget (enum dispatch arms nest one level deeper than methods).
+        emitter.line(arm_indent, "Err(_) => {");
+        let inner = "return Err(encode_overflow_error(self.limits.structured_encode_bytes));";
+        if fits(arm_indent + 1, inner) {
+            emitter.line(arm_indent + 1, inner);
+        } else {
+            emitter.line(arm_indent + 1, "return Err(encode_overflow_error(");
+            emitter.line(arm_indent + 2, "self.limits.structured_encode_bytes,");
+            emitter.line(arm_indent + 1, "));");
+        }
+        emitter.line(arm_indent, "}");
     }
     emitter.line(close_indent, "};");
 }
@@ -3547,13 +3563,12 @@ fn emit_module_helpers(emitter: &mut Emitter, flags: &Flags, has_variables: bool
         emitter.line(1, "bytes: ::bytes::Bytes,");
         emitter.line(1, "content_type: Option<::mime::Mime>,");
         emitter.line(0, ") -> Result<String, ClientError> {");
-        emitter.line(
-            1,
-            "String::from_utf8(bytes.to_vec()).map_err(|error| ClientError::Decode {",
-        );
-        emitter.line(2, "content_type,");
-        emitter.line(2, "source: Box::new(error),");
-        emitter.line(1, "})");
+        emitter.line(1, "::std::str::from_utf8(&bytes)");
+        emitter.line(2, ".map(|text| text.to_owned())");
+        emitter.line(2, ".map_err(|error| ClientError::Decode {");
+        emitter.line(3, "content_type,");
+        emitter.line(3, "source: Box::new(error),");
+        emitter.line(2, "})");
         emitter.line(0, "}");
     }
 

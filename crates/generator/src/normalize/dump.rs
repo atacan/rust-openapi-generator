@@ -539,6 +539,10 @@ fn dump_content(out: &mut String, content: &[crate::ir::document::ContentEntryIr
             indent(out, spaces + 4);
             let _ = writeln!(out, "stream-item-override: #{}", override_id.0);
         }
+        if entry.stream_override {
+            indent(out, spaces + 4);
+            let _ = writeln!(out, "x-rust-body: stream");
+        }
     }
 }
 

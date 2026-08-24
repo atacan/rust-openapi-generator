@@ -300,3 +300,19 @@ either buffer payloads or complicate the public API beyond v1 scope. Documents d
 than one binary field get a generation Error diagnostic (`multipart_schema_unsupported`).
 Repeated (array) binary fields are likewise rejected, symmetrically with the client, which
 cannot clone streaming bodies. Revisit when a concrete fixture needs multi-file uploads.
+
+### D-impl-x-rust-body-stream `x-rust-body: stream` forces raw streaming for plain-text entries
+Main spec §44 says a `text/plain` + `schema: {type: string}` entry maps to bounded `String` by
+default and that unbounded plain-text streaming SHOULD be available through an extension such as
+`x-rust-body: stream`. Decision: the extension is honored on media-type entries whose class is the
+§5.2 plain-text family (text/plain, text/html, text/csv, text/markdown, application/sql); planning
+re-classes such an entry into the streaming family for BOTH directions, while the media-type
+literal — and therefore runtime Content-Type matching, the operation's Accept contribution, and
+the `TextPlain` variant name — stays verbatim. Any other `x-rust-body` value remains an ignored
+vendor extension. JSON-family entries are deliberately NOT overridable this way: their bounded
+full-document decode is what produces the typed representation, and a raw JSON stream would erase
+the type contract instead of relaxing its memory bound.
+
+**Rationale.** Minimal-diff realization of §44: flipping the planned media class reuses the
+existing streaming emitters byte-for-byte on both sides instead of threading a third representation
+through every textual arm; boundedness is recovered by the application draining the stream.

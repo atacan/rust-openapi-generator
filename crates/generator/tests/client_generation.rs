@@ -27,6 +27,7 @@ const SNAPSHOT_FIXTURES: &[&str] = &[
     "11_multipart.yaml",
     "12_multipart_order.yaml",
     "13_validation.yaml",
+    "14_negotiation.yaml",
 ];
 
 /// Every fixture must plan + render without diagnostics (07/08 included).
@@ -44,6 +45,7 @@ const ALL_FIXTURES: &[&str] = &[
     "11_multipart.yaml",
     "12_multipart_order.yaml",
     "13_validation.yaml",
+    "14_negotiation.yaml",
 ];
 
 fn fixtures_dir() -> PathBuf {
@@ -437,6 +439,111 @@ fn fixture_04_ranges_default_and_explicit_precedence_ordering() {
     assert!(
         !method.contains("UndocumentedStatus"),
         "a documented `default` swallows every status\n{method}"
+    );
+}
+
+// ----------------------------------------------------------------------
+// Fixture 14 — wildcard/negotiation completion (§22, §25, §5.2, §29, §44)
+// ----------------------------------------------------------------------
+
+#[test]
+fn fixture_14_trio_and_exact_entries_rank_as_bounded_or_streaming_variants() {
+    let output = generate_fixture("14_negotiation.yaml");
+
+    // Example 18 trio (§25): all three FINITE variants on one status.
+    let trio = enum_block(&output, "GetReport400Content");
+    assert!(trio.contains("ProblemJson(ProblemDetails),"), "{trio}");
+    assert!(trio.contains("Json(LegacyError),"), "{trio}");
+    assert!(
+        trio.contains("TextPlain(String),"),
+        "text/plain + string stays a bounded String (§5.2):\n{trio}"
+    );
+
+    // §22: explicit JSON beats nothing here, but the octet-stream entry must
+    // stay response-OWNED streaming (never a bounded buffer).
+    let content_enum = enum_block(&output, "GetReport200Content");
+    assert!(content_enum.contains("Json(Report),"), "\n{content_enum}");
+    assert!(
+        content_enum.contains("OctetStream(::reqwest::Response),"),
+        "\n{content_enum}"
+    );
+}
+
+#[test]
+fn fixture_14_text_range_response_is_a_streaming_wrapper_not_a_string() {
+    let output = generate_fixture("14_negotiation.yaml");
+
+    // §5.2 range mode: `text/*` streams through a response-owned wrapper.
+    let wrapper = struct_block(&output, "GetRawText200");
+    assert!(
+        wrapper.contains("pub response: ::reqwest::Response,"),
+        "text/* must stream via the raw response:\n{wrapper}"
+    );
+    assert!(
+        !wrapper.contains("String"),
+        "text/* must never materialize as a bounded String:\n{wrapper}"
+    );
+    assert!(
+        enum_block(&output, "GetRawTextResponse").contains("Ok200(GetRawText200),"),
+        "\n{output}"
+    );
+}
+
+#[test]
+fn fixture_14_accept_includes_range_tokens_verbatim() {
+    let output = generate_fixture("14_negotiation.yaml");
+
+    // §29: the operation-wide Accept union carries the media RANGE token
+    // verbatim (no concrete expansion).
+    let method = method_block(&output, "get_raw_text");
+    assert!(
+        method.contains(".header(::http::header::ACCEPT, \"text/*\")"),
+        "Accept must carry `text/*` verbatim:\n{method}"
+    );
+
+    // The trio operation unions every decodable literal across statuses in
+    // declaration order (200's entries first, then 400's new ones).
+    let report = method_block(&output, "get_report");
+    assert!(
+        report.contains(
+            "\"application/json, application/octet-stream, \
+             application/problem+json, text/plain\""
+        ),
+        "§29 union in declaration order across all statuses:\n{report}"
+    );
+}
+
+#[test]
+fn fixture_14_stream_override_switches_request_representation_both_ways() {
+    let output = generate_fixture("14_negotiation.yaml");
+
+    // §44 default: bounded text/plain requests take &str.
+    assert!(
+        output.contains("pub async fn put_note(&self, id: &str, body: &str)"),
+        "plain text/plain stays bounded String/&str:\n{output}"
+    );
+
+    // §44 override: x-rust-body: stream takes reqwest::Body instead.
+    assert!(
+        output.contains(
+            "pub async fn post_stream_note(\n        &self,\n        body: ::reqwest::Body,"
+        ),
+        "x-rust-body: stream must force the raw streaming parameter:\n{output}"
+    );
+    let method = method_block(&output, "post_stream_note");
+    assert!(
+        method.contains(".header(::http::header::CONTENT_TYPE, \"text/plain\")")
+            && !method.contains("structured_encode_bytes"),
+        "streaming override skips bounded encoding but keeps its literal \
+         Content-Type:\n{method}"
+    );
+
+    // The request enum for {json, */*} keeps the wildcard variant streaming.
+    let body_enum = enum_block(&output, "PostMirrorRequestBody");
+    assert!(body_enum.contains("Json(Payload),"), "{body_enum}");
+    assert!(
+        body_enum.contains("Any(::reqwest::Body),"),
+        "the */* entry attaches reqwest::Body verbatim:\n{body_enum}"
     );
 }
 

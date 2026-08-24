@@ -205,6 +205,10 @@ pub struct ContentEntryIr {
     /// True for ranges like `text/*`, `application/*`, `*/*` which must be
     /// served as raw streaming bodies (main spec §5.10).
     pub is_wildcard: bool,
+    /// `x-rust-body: stream` override (main spec §44): a bounded textual
+    /// entry planned as raw streaming bytes in BOTH directions instead of
+    /// its default bounded representation.
+    pub stream_override: bool,
     pub schema: SchemaId,
     /// `x-rust-stream-item` override: when present it names the streamed
     /// item type while `schema` describes the envelope (main spec §18.1).

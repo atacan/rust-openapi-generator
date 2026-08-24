@@ -1,0 +1,141 @@
+# Fixture 14 — Phase 2 wildcard/content-negotiation completion (main spec
+# §22, §25/Example 18, §28, §5.2, §44): exact-beats-wildcard on one status,
+# the problem+json/json/text trio on ONE status, a request declaring
+# {json, */*}, a response declaring the text/* range only, bounded
+# text/plain requests, and the x-rust-body: stream override.
+openapi: 3.1.0
+info:
+  title: negotiation
+  version: "1"
+paths:
+  /reports/{id}:
+    get:
+      operationId: getReport
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Report representation with an explicit entry and a wildcard-free binary alternative
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Report'
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '400':
+          description: Failure details in one of three negotiated formats (Example 18 trio)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LegacyError'
+            text/plain:
+              schema:
+                type: string
+  /mirror:
+    post:
+      operationId: postMirror
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Payload'
+          '*/*':
+            schema: {}
+      responses:
+        '202':
+          description: Accepted
+  /raw-text:
+    get:
+      operationId: getRawText
+      responses:
+        '200':
+          description: Any textual representation (§5.2 range mode streams)
+          content:
+            'text/*':
+              schema: {}
+  /either:
+    get:
+      operationId: getEither
+      responses:
+        '200':
+          description: Explicit JSON representation versus the wildcard fallback (Example 15)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payload'
+            '*/*':
+              schema: {}
+  /notes/{id}:
+    put:
+      operationId: putNote
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+      responses:
+        '204':
+          description: Saved
+  /stream-notes:
+    post:
+      operationId: postStreamNote
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+            x-rust-body: stream
+      responses:
+        '204':
+          description: Stored
+components:
+  schemas:
+    Report:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+        summary:
+          type: string
+    ProblemDetails:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+        detail:
+          type: string
+    LegacyError:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: integer
+          format: int32
+        message:
+          type: string
+    Payload:
+      type: object
+      required: [kind]
+      properties:
+        kind:
+          type: string

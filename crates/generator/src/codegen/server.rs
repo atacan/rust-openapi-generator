@@ -1070,7 +1070,13 @@ fn emit_wrapper(
     emitter.line(0, &format!("pub struct {name} {{"));
     emit_header_fields(emitter, status, 1);
     match shape {
-        WrapperShape::Wildcard => emitter.line(1, "pub content_type: ::mime::Mime,"),
+        // §22 Output B: the wildcard carries BOTH the application-supplied
+        // Content-Type and the raw streaming body (`any_response` reads the
+        // pair from this wrapper).
+        WrapperShape::Wildcard => {
+            emitter.line(1, "pub content_type: ::mime::Mime,");
+            emitter.line(1, "pub body: ::axum::body::Body,");
+        }
         // TypedHeaders wrappers store the DECODED domain value (§48's
         // sanctioned store-domain-values choice), not the raw body.
         WrapperShape::TypedHeaders => emitter.line(
@@ -1274,12 +1280,18 @@ fn emit_encoding_impl(
     }
     emitter.line(1, "pub fn into_response_with_limits(");
     emitter.line(2, "self,");
-    // Degenerate operations (every variant is a bare status) never touch
+    // Operations whose every arm is a bare status or a pure passthrough
+    // (streaming/wildcard bodies without documented headers) never touch
     // the limits/hook pair; underscore names keep `-D warnings` clean.
-    let arg_uses = operation
-        .statuses
-        .iter()
-        .any(|status| !effective_contents(status).is_empty() || !status.headers.is_empty());
+    let arg_uses = operation.statuses.iter().any(|status| {
+        !status.headers.is_empty()
+            || effective_contents(status).iter().any(|content| {
+                matches!(
+                    content.media_class,
+                    MediaClass::JsonFamily | MediaClass::PlainText
+                ) && !content.is_wildcard
+            })
+    });
     let (limits_name, hook_name) = if arg_uses {
         ("limits", "hook")
     } else {
@@ -3282,6 +3294,8 @@ fn emit_entry_arm(
         return;
     }
     emitter.line(indent, &format!("RequestEntryMatch::Entry({index}) => {{"));
+    // Set false when the decode expression itself becomes the arm value.
+    let mut yield_value = true;
     if payload.is_decodable() {
         emitter.line(indent + 1, "ensure_utf8_charset(parsed.as_ref())?;");
         let limit_field = match payload {
@@ -3336,6 +3350,13 @@ fn emit_entry_arm(
                 let line = format!("let value = decode_form_body(&bytes, limits.{limit_field})?;");
                 emitter.line(indent + 1, &line);
             }
+            // A required single-text entry with no companion §9 validator
+            // has nothing between decode and yield: the `?` expression IS
+            // the arm value, avoiding clippy::let_and_return in the router.
+            EntryPayload::Text { validation: None } if required => {
+                emitter.line(indent + 1, "decode_text_body(bytes)?");
+                yield_value = false;
+            }
             _ => {
                 emitter.line(indent + 1, "let value = decode_text_body(bytes)?;");
             }
@@ -3347,7 +3368,9 @@ fn emit_entry_arm(
             emit_request_validation_call(emitter, indent + 1, "body", validation);
         }
     }
-    emit_entry_yield(emitter, indent + 1, payload, required);
+    if yield_value {
+        emit_entry_yield(emitter, indent + 1, payload, required);
+    }
     emitter.line(indent, "}");
 }
 
@@ -5579,10 +5602,11 @@ fn emit_mime_of(emitter: &mut Emitter) {
     );
     emitter.line(2, "None => parsed.subtype.clone(),");
     emitter.line(1, "};");
-    emitter.line(
-        1,
-        "format!(\"{}/{}\", parsed.ty, subtype).parse().unwrap_or(::mime::STAR_STAR)",
-    );
+    // The parse chain exceeds rustfmt's default chain_width, so the
+    // canonical form breaks after the head expression.
+    emitter.line(1, "format!(\"{}/{}\", parsed.ty, subtype)");
+    emitter.line(2, ".parse()");
+    emitter.line(2, ".unwrap_or(::mime::STAR_STAR)");
     emitter.line(0, "}");
 }
 
@@ -5835,12 +5859,15 @@ fn emit_any_response(emitter: &mut Emitter) {
     emitter.line(0, ") -> ::axum::response::Response {");
     emitter.line(1, "let declared = content_type.essence_str().to_owned();");
     emitter.line(1, "let mut response = (status, body).into_response();");
-    emitter.line(1, "let header = ::http::HeaderValue::try_from(declared)");
-    emitter.line(2, ".unwrap_or(::http::HeaderValue::from_static(\"*/*\"));");
+    emitter.line(1, "let header =");
     emitter.line(
-        1,
-        "response.headers_mut().insert(::http::header::CONTENT_TYPE, header);",
+        2,
+        "::http::HeaderValue::try_from(declared).unwrap_or(::http::HeaderValue::from_static(\"*/*\"));",
     );
+    // The insert chain exceeds rustfmt's default chain_width.
+    emitter.line(1, "response");
+    emitter.line(2, ".headers_mut()");
+    emitter.line(2, ".insert(::http::header::CONTENT_TYPE, header);");
     emitter.line(1, "response");
     emitter.line(0, "}");
 }

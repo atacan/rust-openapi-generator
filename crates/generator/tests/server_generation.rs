@@ -33,6 +33,7 @@ const SNAPSHOT_FIXTURES: &[&str] = &[
     "11_multipart.yaml",
     "12_multipart_order.yaml",
     "13_validation.yaml",
+    "14_negotiation.yaml",
 ];
 
 /// Every fixture must plan + render without diagnostics.
@@ -50,6 +51,7 @@ const ALL_FIXTURES: &[&str] = &[
     "11_multipart.yaml",
     "12_multipart_order.yaml",
     "13_validation.yaml",
+    "14_negotiation.yaml",
 ];
 
 fn fixtures_dir() -> PathBuf {
@@ -421,6 +423,93 @@ fn fixture_04_checked_range_constructors_and_debug_asserts_exist() {
 // Wildcard content (§22) — synthetic document, no committed fixture
 // ----------------------------------------------------------------------
 
+// ----------------------------------------------------------------------
+// Fixture 14 — wildcard/negotiation completion (§22, §25, §5.2, §28.5, §44)
+// ----------------------------------------------------------------------
+
+#[test]
+fn fixture_14_trio_status_keeps_all_three_bounded_payloads() {
+    let output = generate_fixture("14_negotiation.yaml");
+
+    // Example 18 (§25): problem+json / json / text/plain all bounded.
+    let trio = enum_block(&output, "GetReport400Content");
+    assert!(trio.contains("ProblemJson(ProblemDetails),"), "{trio}");
+    assert!(trio.contains("Json(LegacyError),"), "{trio}");
+    assert!(
+        trio.contains("TextPlain(String),"),
+        "text/plain + string stays a bounded String on the server (§5.2):\n{trio}"
+    );
+}
+
+#[test]
+fn fixture_14_text_range_response_is_any_like_with_app_supplied_content_type() {
+    let output = generate_fixture("14_negotiation.yaml");
+
+    // §22 Output B applied to the §5.2 range: the server cannot know a
+    // concrete textual type behind `text/*`, so it is Any-like and requires
+    // the application to supply the actual Content-Type.
+    let wrapper = struct_block(&output, "GetRawText200");
+    assert!(
+        wrapper.contains("pub content_type: ::mime::Mime,")
+            && wrapper.contains("pub body: ::axum::body::Body,"),
+        "text/* must be an Any-style payload:\n{wrapper}"
+    );
+    assert!(
+        !wrapper.contains("String"),
+        "text/* must never materialize as a bounded String:\n{wrapper}"
+    );
+}
+
+#[test]
+fn fixture_14_router_keeps_wildcard_dispatch_and_stream_override() {
+    let output = generate_fixture("14_negotiation.yaml");
+
+    // §28.5 exactly-one-entry rule survives in the emitted router helpers.
+    assert!(
+        output.contains("fn best_request_entry(")
+            && output.contains("if is_wildcard_incoming(parsed) {")
+            && output.contains("return if entries.len() == 1 { Some(0) } else { None };"),
+        "the §28.5 wildcard-incoming rejection must stay wired:\n{output}"
+    );
+
+    // The {json, */*} request enum keeps the wildcard variant as a struct
+    // carrying the negotiated Content-Type beside the raw body.
+    let body_enum = enum_block(&output, "PostMirrorRequestBody");
+    assert!(body_enum.contains("Json(Payload),"), "{body_enum}");
+    assert!(
+        body_enum.contains(
+            "Any {\n        content_type: ::mime::Mime,\n        body: ::axum::body::Body,\n    },"
+        ),
+        "{body_enum}"
+    );
+
+    // §44 default vs override: put_note decodes bounded String;
+    // post_stream_note passes the raw axum body through.
+    let notes_trait = trait_method_block(&output, "put_note");
+    assert!(notes_trait.contains("body: String"), "{notes_trait}");
+    let stream_trait = trait_method_block(&output, "post_stream_note");
+    assert!(
+        stream_trait.contains("body: ::axum::body::Body"),
+        "x-rust-body: stream must pass the raw body through:\n{stream_trait}"
+    );
+
+    // The streaming route skips bounded collection entirely (no
+    // classify-and-collect machinery between extraction and invoke).
+    let handler = item_block(&output, "async fn route_post_stream_note(");
+    assert!(
+        !handler.contains("collect_body_limited") && !handler.contains("decode_text_body"),
+        "streaming override must not buffer or decode:\n{handler}"
+    );
+    assert!(
+        handler.contains("PostStreamNoteRequestBody") || handler.contains("request_body"),
+        "{handler}"
+    );
+}
+
+// ----------------------------------------------------------------------
+// Wildcard shapes — synthetic document
+// ----------------------------------------------------------------------
+
 const WILDCARD_FIXTURE: &str = r#"openapi: 3.1.0
 info:
   title: wildcard shapes
@@ -527,6 +616,17 @@ fn enum_block(output: &str, name: &str) -> String {
 
 fn struct_block(output: &str, name: &str) -> String {
     item_block(output, &format!("pub struct {name} {{"))
+}
+
+/// One trait method signature through its closing `;` (Mode A trait shape).
+fn trait_method_block(output: &str, name: &str) -> String {
+    let marker = format!("async fn {name}(");
+    let start = output
+        .find(&marker)
+        .unwrap_or_else(|| panic!("trait method `{name}` not found"));
+    let rest = &output[start..];
+    let end = rest.find(';').map_or(rest.len(), |index| index + 1);
+    rest[..end].to_owned()
 }
 
 // ----------------------------------------------------------------------

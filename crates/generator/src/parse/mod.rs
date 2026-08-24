@@ -1814,10 +1814,17 @@ impl Loader {
                     )
                 });
             let encoding = parse_encoding_map(media_object);
+            // §44 override: `x-rust-body: stream` forces the raw streaming
+            // representation for a bounded textual entry (D-impl-x-rust-body-
+            // stream). Any other value stays an ignored vendor extension.
+            let stream_override = mapping_get_opt(media_object, "x-rust-body")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value.trim() == "stream");
             entries.push(ContentEntryIr {
                 media_type,
                 media_class,
                 is_wildcard,
+                stream_override,
                 schema,
                 stream_item_override,
                 encoding,

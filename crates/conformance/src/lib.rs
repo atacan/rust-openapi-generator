@@ -221,4 +221,19 @@ pub mod fixtures {
             include!(concat!(env!("OUT_DIR"), "/13_validation/server.rs"));
         }
     }
+
+    pub mod fixture_14_negotiation {
+        pub mod models {
+            include!(concat!(env!("OUT_DIR"), "/14_negotiation/models.rs"));
+        }
+        pub mod views {
+            include!(concat!(env!("OUT_DIR"), "/14_negotiation/views.rs"));
+        }
+        pub mod client {
+            include!(concat!(env!("OUT_DIR"), "/14_negotiation/client.rs"));
+        }
+        pub mod server {
+            include!(concat!(env!("OUT_DIR"), "/14_negotiation/server.rs"));
+        }
+    }
 }
