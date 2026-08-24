@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use openapi_conformance::fixtures::fixture_11_multipart as fx11;
 use openapi_conformance::fixtures::fixture_12_multipart_order as fx12;
-use openapi_support::hooks::EncodeOverflowHook;
+use openapi_support::hooks::{EncodeOverflowHook, NoOpStreamFailureHook, StreamFailureHook};
 use openapi_support::limits::BodyLimits;
 
 const BOUNDARY: &str = "XbOuNdArYx";
@@ -141,12 +141,14 @@ fn app_with_limits(limits: BodyLimits) -> (Arc<DocAppShared>, axum::Router) {
     let shared = Arc::new(DocAppShared::default());
     let hook: Arc<dyn EncodeOverflowHook> =
         Arc::new(openapi_support::hooks::NoOpEncodeOverflowHook);
+    let stream_hook = Arc::new(NoOpStreamFailureHook);
     let router = fx11::server::router(
         Arc::new(DocApp {
             shared: shared.clone(),
         }),
         limits,
         hook,
+        stream_hook,
     );
     (shared, router)
 }
@@ -158,13 +160,18 @@ fn app_with_limits(limits: BodyLimits) -> (Arc<DocAppShared>, axum::Router) {
 #[tokio::test]
 async fn multipart_upload_round_trips_two_mib_stream_in_many_chunks() {
     let shared = Arc::new(DocAppShared::default());
-    let (limits, hook): (BodyLimits, Arc<dyn EncodeOverflowHook>) = common::router_args();
+    let (limits, hook, stream_hook): (
+        BodyLimits,
+        Arc<dyn EncodeOverflowHook>,
+        Arc<dyn StreamFailureHook>,
+    ) = common::router_args();
     let address = common::spawn_router(fx11::server::router(
         Arc::new(DocApp {
             shared: shared.clone(),
         }),
         limits,
         hook,
+        stream_hook,
     ));
 
     let client = fx11::client::ClientBuilder::new()
@@ -427,12 +434,14 @@ fn file_first_router(limits: BodyLimits) -> (Arc<FileFirstShared>, axum::Router)
     let shared = Arc::new(FileFirstShared::default());
     let hook: Arc<dyn EncodeOverflowHook> =
         Arc::new(openapi_support::hooks::NoOpEncodeOverflowHook);
+    let stream_hook = Arc::new(NoOpStreamFailureHook);
     let router = fx12::server::router(
         Arc::new(FileFirstApp {
             shared: shared.clone(),
         }),
         limits,
         hook,
+        stream_hook,
     );
     (shared, router)
 }

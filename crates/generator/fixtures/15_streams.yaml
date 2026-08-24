@@ -1,0 +1,136 @@
+# Fixture 15 — Phase 3 streaming record formats (main spec §5.6–§5.8, §18,
+# §19, §20, §40): NDJSON export (200 NDJSON + 401 problem+json), SSE events
+# (200 SSE + 401), a JSON Text Sequence REQUEST body with a JSON 202
+# response (request-direction streams), and an SSE operation whose entry
+# schema documents an ENVELOPE while `x-rust-stream-item` overrides the
+# streamed item type (§18.1).
+openapi: 3.1.0
+info:
+  title: streams
+  version: "1"
+paths:
+  /records/export:
+    get:
+      operationId: exportRecords
+      responses:
+        '200':
+          description: Newline-delimited records
+          content:
+            application/x-ndjson:
+              schema:
+                $ref: '#/components/schemas/Record'
+        '401':
+          description: Unauthorized
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+  /events:
+    get:
+      operationId: streamEvents
+      responses:
+        '200':
+          description: Server-sent event stream of typed events
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/Event'
+        '401':
+          description: Unauthorized
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+  /envelope-events:
+    get:
+      operationId: streamEnvelopeEvents
+      responses:
+        '200':
+          description: Event stream whose schema describes an envelope; x-rust-stream-item names the bare item type (§18.1)
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/EventEnvelope'
+              x-rust-stream-item:
+                $ref: '#/components/schemas/EventPayload'
+        '404':
+          description: No such stream
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+  /metrics:
+    post:
+      operationId: pushMetrics
+      requestBody:
+        required: true
+        content:
+          application/json-seq:
+            schema:
+              $ref: '#/components/schemas/Metric'
+      responses:
+        '202':
+          description: Accepted for processing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ack'
+components:
+  schemas:
+    Record:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+        value:
+          type: number
+    Event:
+      type: object
+      required: [seq]
+      properties:
+        seq:
+          type: integer
+          format: int64
+        payload:
+          type: string
+    EventEnvelope:
+      type: object
+      required: [meta, payload]
+      properties:
+        meta:
+          type: string
+        payload:
+          $ref: '#/components/schemas/EventPayload'
+    EventPayload:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: integer
+          format: int32
+        message:
+          type: string
+    Metric:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        value:
+          type: number
+    Ack:
+      type: object
+      required: [accepted]
+      properties:
+        accepted:
+          type: boolean
+        received:
+          type: integer
+          format: int32
+    ProblemDetails:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string

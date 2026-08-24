@@ -120,7 +120,7 @@ pub enum GetReportResponse {
     BadRequest400(GetReport400Content),
 }
 
-/// Request payloads for `post_mirror` (main spec §12/§43): owning variants (D-§51.3); streaming variants attach `reqwest::Body` verbatim.
+/// Request payloads for `post_mirror` (main spec §12/§43): owning variants (D-§51.3); streaming variants attach `reqwest::Body` or a boxed item-stream verbatim.
 #[derive(Debug)]
 pub enum PostMirrorRequestBody {
     Json(Payload),

@@ -26,7 +26,7 @@ use crate::normalize::NormalizedDocument;
 
 use super::plan::{
     PlannedApi, PlannedBodyValidation, PlannedContent, PlannedMultipartFieldKind, PlannedOperation,
-    PlannedParameter, PlannedStatus,
+    PlannedParameter, PlannedStatus, StreamFraming,
 };
 use super::Emitter;
 
@@ -83,7 +83,8 @@ pub fn generate_server(doc: &NormalizedDocument, plan: &PlannedApi) -> String {
         || flags.needs_form_decode
         || flags.needs_charset_check
         || flags.needs_cookie_decode
-        || flags.needs_multipart;
+        || flags.needs_multipart
+        || !flags.request_framings.is_empty();
     // Companion §9: the shared 422 constructor exists only with call sites.
     flags.needs_request_schema_violation = plan.server_runtime_validation
         && plan.operations.iter().any(|operation| {
@@ -97,6 +98,25 @@ pub fn generate_server(doc: &NormalizedDocument, plan: &PlannedApi) -> String {
             })
         });
     emit_imports(&mut emitter, &flags);
+    // Shared boxed-stream alias behind every erased streaming payload and
+    // typed request input (§18–§20); kept short so every use site stays on
+    // one line.
+    if !flags.response_framings.is_empty() || !flags.request_framings.is_empty() {
+        emitter.blank();
+        emitter.docs(
+            0,
+            &[
+                "Boxed erased item stream shared by every generated streaming                  wrapper (§18–§20): producers box their producer stream into                  this type."
+                    .to_owned(),
+            ],
+        );
+        emitter.line(0, "#[doc(hidden)]");
+        emitter.line(0, "pub type ErasedItems<T> =");
+        emitter.line(
+            1,
+            "::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = T> + ::std::marker::Send>>;",
+        );
+    }
 
     let mut invalid_status_range_emitted = false;
     for (op_index, operation) in plan.operations.iter().enumerate() {
@@ -110,14 +130,15 @@ pub fn generate_server(doc: &NormalizedDocument, plan: &PlannedApi) -> String {
         );
     }
     emit_trait(&mut emitter, plan, &layout, &api_trait);
-    emit_state(&mut emitter, &api_trait);
+    let has_stream_responses = !flags.response_framings.is_empty();
+    emit_state(&mut emitter, &api_trait, has_stream_responses);
     for (op_index, operation) in plan.operations.iter().enumerate() {
         emit_handler(&mut emitter, op_index, operation, &layout);
         if layout.multipart_input(op_index).is_some() {
             emit_multipart_collector(&mut emitter, op_index, operation, &layout);
         }
     }
-    emit_router(&mut emitter, plan, &api_trait);
+    emit_router(&mut emitter, plan, &api_trait, has_stream_responses);
     emit_module_helpers(&mut emitter, &flags);
     emitter.finish()
 }
@@ -150,6 +171,7 @@ fn reserved_names(
     }
     used.insert(api_trait.to_owned());
     used.insert("InvalidStatusRange".to_owned());
+    used.insert("ErasedItems".to_owned());
     used
 }
 
@@ -188,6 +210,11 @@ enum WrapperShape {
     /// Decodable single-content entry with documented headers (main spec
     /// §15): the wrapper carries the typed header fields beside the body.
     TypedHeaders,
+    /// Record-framed stream entry on an EXPLICIT status with documented
+    /// headers (§15/§40): the wrapper carries the typed header fields beside
+    /// the erased item-stream alias; the encoder commits status,
+    /// Content-Type, and headers before attaching the streaming body.
+    StreamHeaders,
 }
 
 /// Module-level type-name registry for one API: content enums, streaming
@@ -209,6 +236,14 @@ struct ServerLayout {
     /// Operation index → `<Op>TrailingParts` carrier for scalar/JSON parts
     /// decoded BEHIND a live streaming part (wire-arrival-based §17.1).
     multipart_trailing: BTreeMap<usize, String>,
+    /// (operation index, status index, content index) → `<…>Stream` erased
+    /// item-stream alias (§18–§20 Output B): `Pin<Box<dyn Stream<Item =
+    /// Result<Item, ServerStreamError>> + Send>>`.
+    stream_aliases: BTreeMap<(usize, usize, usize), String>,
+    /// (operation index, request content index) → `<Op><Framing>Input`
+    /// streaming request wrapper exposing `next_item`
+    /// (D-impl-request-direction-streams).
+    stream_inputs: BTreeMap<(usize, usize), String>,
     /// Companion §9 policy (D-impl-runtime-validation-timing): when true the
     /// emitted routes run `validate_request`/free validators after decode.
     runtime_validation: bool,
@@ -241,6 +276,33 @@ impl ServerLayout {
                     let base = format!("{}RequestBody", operation.pascal);
                     let name = fresh_name(used, base);
                     layout.wildcard_requests.insert(op_index, name);
+                }
+            }
+            for (content_index, content) in operation.request_contents.iter().enumerate() {
+                if let Some(stream) = &content.stream {
+                    let base = format!("{}{}Input", operation.pascal, stream.framing.as_pascal());
+                    let name = fresh_name(used, base);
+                    layout.stream_inputs.insert((op_index, content_index), name);
+                }
+            }
+            for (status_index, status) in operation.statuses.iter().enumerate() {
+                for (content_index, content) in status.contents.iter().enumerate() {
+                    if !status.is_no_body_status && content.stream.is_some() {
+                        let base = if status.contents.len() >= 2 {
+                            format!(
+                                "{}{}{}Stream",
+                                operation.pascal,
+                                status_name_part(status),
+                                content.variant_name
+                            )
+                        } else {
+                            format!("{}{}Stream", operation.pascal, status_name_part(status))
+                        };
+                        let name = fresh_name(used, base);
+                        layout
+                            .stream_aliases
+                            .insert((op_index, status_index, content_index), name);
+                    }
                 }
             }
             if operation
@@ -304,6 +366,23 @@ impl ServerLayout {
         self.multipart_trailing.get(&op_index).map(String::as_str)
     }
 
+    fn stream_input(&self, op_index: usize, content_index: usize) -> Option<&str> {
+        self.stream_inputs
+            .get(&(op_index, content_index))
+            .map(String::as_str)
+    }
+
+    fn stream_alias(
+        &self,
+        op_index: usize,
+        status_index: usize,
+        content_index: usize,
+    ) -> Option<&str> {
+        self.stream_aliases
+            .get(&(op_index, status_index, content_index))
+            .map(String::as_str)
+    }
+
     fn content_enum(&self, op_index: usize, status_index: usize) -> Option<&str> {
         self.content_enums
             .get(&(op_index, status_index))
@@ -347,6 +426,14 @@ fn wrapper_shape(status: &PlannedStatus) -> Option<WrapperShape> {
             } else {
                 None
             }
+        }
+        // Record-framed streams on explicit statuses with documented
+        // headers: headers ride a wrapper beside the erased item stream.
+        _ if content.stream.is_some()
+            && !struct_variant_status(status)
+            && !status.headers.is_empty() =>
+        {
+            Some(WrapperShape::StreamHeaders)
         }
         _ if !status.headers.is_empty() && !struct_variant_status(status) => {
             Some(WrapperShape::TypedHeaders)
@@ -450,6 +537,13 @@ struct Flags {
     /// Free validator functions referenced from super::models; imported ONLY
     /// when the validation policy is on (the calls disappear otherwise).
     body_validator_fns: BTreeSet<String>,
+    /// Streaming record classes used by RESPONSE statuses somewhere: pulls
+    /// in the erased-alias machinery (§40 encoder, hook, ServerStreamError).
+    response_framings: BTreeSet<StreamFraming>,
+    /// Streaming record classes used by REQUEST bodies somewhere: pulls in
+    /// the per-framing decoder + decode-error pair and the typed input
+    /// wrappers (D-impl-request-direction-streams).
+    request_framings: BTreeSet<StreamFraming>,
 }
 
 impl Flags {
@@ -539,6 +633,18 @@ impl Flags {
                 }
             }
             MediaClass::Binary | MediaClass::RawUnknown => {}
+            // §6 request-direction streams: handlers receive a typed
+            // `<Op><Framing>Input` wrapper decoding one record at a time
+            // under `max_stream_record_bytes`.
+            _ if content.stream.is_some() => {
+                if let Some(framing) = content.stream.as_ref().map(|s| s.framing) {
+                    self.request_framings.insert(framing);
+                }
+                if let Some(stream) = &content.stream {
+                    self.model_types
+                        .extend(model_type_names(&stream.item_model_path));
+                }
+            }
             // Planning rejects SSE/NDJSON/JSON-seq; they are later
             // deliverables and never reach us.
             _ => unreachable!(
@@ -574,6 +680,17 @@ impl Flags {
                 MediaClass::PlainText => self.needs_encode_text = true,
                 MediaClass::Binary | MediaClass::RawUnknown => {
                     self.needs_stream_response = true;
+                }
+                // §18–§20 Output B: erased item-stream aliases encoded
+                // per-item under `max_stream_record_bytes` (§40 contract).
+                _ if content.stream.is_some() => {
+                    if let Some(framing) = content.stream.as_ref().map(|s| s.framing) {
+                        self.response_framings.insert(framing);
+                    }
+                    if let Some(stream) = &content.stream {
+                        self.model_types
+                            .extend(model_type_names(&stream.item_model_path));
+                    }
                 }
                 _ => unreachable!(
                     "planner emitted Phase 2 media class {:?}",
@@ -775,6 +892,14 @@ fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
             0,
             "use ::openapi_support::hooks::{EncodeOverflowHook, NoOpEncodeOverflowHook};",
         );
+        let mut stream_error_imports = Vec::new();
+        if flags.request_framings.contains(&StreamFraming::JsonSeq) {
+            emitter.line(0, "use ::openapi_support::jsonseq::decode_jsonseq;");
+            stream_error_imports.push("JsonSeqDecodeError");
+        }
+        if flags.response_framings.contains(&StreamFraming::JsonSeq) {
+            emitter.line(0, "use ::openapi_support::jsonseq::encode_jsonseq_item;");
+        }
         emitter.line(0, "use ::openapi_support::limits::BodyLimits;");
         if flags.needs_content_type_gate {
             emit_brace_import(
@@ -802,6 +927,13 @@ fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
                 ],
             );
         }
+        if flags.request_framings.contains(&StreamFraming::Ndjson) {
+            emitter.line(0, "use ::openapi_support::ndjson::decode_ndjson;");
+            stream_error_imports.push("NdjsonDecodeError");
+        }
+        if flags.response_framings.contains(&StreamFraming::Ndjson) {
+            emitter.line(0, "use ::openapi_support::ndjson::encode_ndjson_item;");
+        }
         emit_params_import(emitter, flags);
         if flags.needs_peek {
             emitter.line(
@@ -818,6 +950,7 @@ fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
             || flags.needs_collect_stream
             || flags.needs_json_decode
             || flags.needs_multipart
+            || !flags.request_framings.is_empty()
         {
             emitter.line(
                 0,
@@ -827,6 +960,28 @@ fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
             emitter.line(0, "use ::openapi_support::rejection::ProtocolRejection;");
         }
         // rustfmt orders extern imports by crate name (openapi_support < std).
+        if flags.request_framings.contains(&StreamFraming::Sse) {
+            emitter.line(0, "use ::openapi_support::sse::decode_sse_json;");
+            stream_error_imports.push("SseDecodeError");
+        }
+        if flags.response_framings.contains(&StreamFraming::Sse) {
+            emitter.line(0, "use ::openapi_support::sse::encode_sse_event;");
+        }
+        if !stream_error_imports.is_empty() {
+            // Decode-error enums live beside ServerStreamError (§40).
+            stream_error_imports.sort_unstable();
+            emit_brace_import(
+                emitter,
+                "use ::openapi_support::stream_errors::",
+                &stream_error_imports,
+            );
+        }
+        if !flags.response_framings.is_empty() {
+            emitter.line(
+                0,
+                "use ::openapi_support::stream_errors::ServerStreamError;",
+            );
+        }
         if path_extractor {
             emitter.line(0, "use ::std::collections::HashMap;");
         }
@@ -896,19 +1051,58 @@ fn emit_operation_types(
         emit_multipart_types(emitter, op_index, operation, layout, name);
         first = false;
     }
+    for (content_index, content) in operation.request_contents.iter().enumerate() {
+        let Some(name) = layout.stream_input(op_index, content_index) else {
+            continue;
+        };
+        if !first {
+            emitter.blank();
+        }
+        emit_stream_input_struct(emitter, operation, content, name);
+        first = false;
+    }
+    for (status_index, status) in operation.statuses.iter().enumerate() {
+        for (content_index, content) in status.contents.iter().enumerate() {
+            let Some(name) = layout.stream_alias(op_index, status_index, content_index) else {
+                continue;
+            };
+            if !first {
+                emitter.blank();
+            }
+            emit_stream_alias(emitter, operation, status, content, name);
+            first = false;
+        }
+    }
     for (status_index, status) in operation.statuses.iter().enumerate() {
         if let Some(name) = layout.content_enum(op_index, status_index) {
             if !first {
                 emitter.blank();
             }
-            emit_content_enum(emitter, operation, status, name);
+            emit_content_enum(
+                emitter,
+                op_index,
+                status_index,
+                operation,
+                status,
+                layout,
+                name,
+            );
             first = false;
         }
         if let Some((name, shape)) = layout.wrapper(op_index, status_index) {
             if !first {
                 emitter.blank();
             }
-            emit_wrapper(emitter, operation, status, name, *shape);
+            emit_wrapper(
+                emitter,
+                op_index,
+                status_index,
+                operation,
+                status,
+                name,
+                *shape,
+                layout,
+            );
             first = false;
         }
     }
@@ -920,12 +1114,17 @@ fn emit_operation_types(
 
 /// Payload type of one concrete media entry (§6/§7 tables, server side):
 /// bounded models/`String` for structured classes and the raw axum body for
-/// streaming classes (§32).
-fn payload_type(content: &PlannedContent) -> String {
+/// streaming classes (§32); record-framed entries carry their erased
+/// `<…>Stream` item-stream alias (§18–§20 Output B) on responses and the
+/// typed `<Op><Framing>Input` wrapper on requests.
+fn payload_type(content: &PlannedContent, stream_alias: Option<&str>) -> String {
     match content.media_class {
         MediaClass::JsonFamily | MediaClass::UrlEncodedForm => content.model_expr.clone(),
         MediaClass::PlainText => "String".to_owned(),
         MediaClass::Binary | MediaClass::RawUnknown => "::axum::body::Body".to_owned(),
+        _ if content.stream.is_some() && !content.is_wildcard => stream_alias
+            .unwrap_or_else(|| panic!("stream alias registered for every exposed stream entry"))
+            .to_owned(),
         _ => unreachable!(
             "planner emitted Phase 2 media class {:?}",
             content.media_class
@@ -952,14 +1151,18 @@ fn emit_request_body_enum(
     );
     emitter.line(0, "#[derive(Debug)]");
     emitter.line(0, &format!("pub enum {enum_name} {{"));
-    for content in &operation.request_contents {
+    for (content_index, content) in operation.request_contents.iter().enumerate() {
         if content.is_wildcard {
             emit_any_struct_variant(emitter, 1, &content.variant_name);
             continue;
         }
         let payload = match content.media_class {
             MediaClass::Multipart => layout.multipart_input(op_index).unwrap_or("()").to_owned(),
-            _ => payload_type(content),
+            _ if content.stream.is_some() => layout
+                .stream_input(op_index, content_index)
+                .expect("stream input registered")
+                .to_owned(),
+            _ => payload_type(content, None),
         };
         emitter.line(1, &format!("{}({payload}),", content.variant_name));
     }
@@ -994,8 +1197,11 @@ fn emit_any_struct_variant(emitter: &mut Emitter, indent: usize, variant_name: &
 
 fn emit_content_enum(
     emitter: &mut Emitter,
+    op_index: usize,
+    status_index: usize,
     operation: &PlannedOperation,
     status: &PlannedStatus,
+    layout: &ServerLayout,
     name: &str,
 ) {
     emitter.docs(
@@ -1007,27 +1213,41 @@ fn emit_content_enum(
             operation.method
         )],
     );
-    emitter.line(0, "#[derive(Debug)]");
+    if effective_contents(status)
+        .iter()
+        .all(|content| content.stream.is_none())
+    {
+        emitter.line(0, "#[derive(Debug)]");
+    }
     emitter.line(0, &format!("pub enum {name} {{"));
-    for content in effective_contents(status) {
+    for (content_index, content) in effective_contents(status).iter().enumerate() {
         if content.is_wildcard {
             emit_any_struct_variant(emitter, 1, &content.variant_name);
             continue;
         }
+        let alias = layout.stream_alias(op_index, status_index, content_index);
         emitter.line(
             1,
-            &format!("{}({}),", content.variant_name, payload_type(content)),
+            &format!(
+                "{}({}),",
+                content.variant_name,
+                payload_type(content, alias)
+            ),
         );
     }
     emitter.line(0, "}");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_wrapper(
     emitter: &mut Emitter,
+    op_index: usize,
+    status_index: usize,
     operation: &PlannedOperation,
     status: &PlannedStatus,
     name: &str,
     shape: WrapperShape,
+    layout: &ServerLayout,
 ) {
     let payload_doc = match shape {
         WrapperShape::Stream => {
@@ -1043,6 +1263,12 @@ fn emit_wrapper(
             "typed payload (main spec §15 Output B): required documented \
              headers as plain fields, optional ones as `Option<T>`, then the \
              body stored as a domain value for the bounded encoder"
+        }
+        WrapperShape::StreamHeaders => {
+            "stream payload (§15/§40): required documented headers as plain \
+             fields, optional ones as `Option<T>`, beside the erased \
+             item-stream; the encoder commits status, Content-Type, and the \
+             headers before streaming items one at a time"
         }
     };
     if shape == WrapperShape::TypedHeaders {
@@ -1066,7 +1292,10 @@ fn emit_wrapper(
             )],
         );
     }
-    emitter.line(0, "#[derive(Debug)]");
+    if shape != WrapperShape::StreamHeaders {
+        // StreamHeaders stores an erased item stream without `Debug`.
+        emitter.line(0, "#[derive(Debug)]");
+    }
     emitter.line(0, &format!("pub struct {name} {{"));
     emit_header_fields(emitter, status, 1);
     match shape {
@@ -1083,9 +1312,27 @@ fn emit_wrapper(
             1,
             &format!(
                 "pub body: {},",
-                payload_type(effective_contents(status).first().expect("single content"))
+                payload_type(
+                    effective_contents(status).first().expect("single content"),
+                    None
+                )
             ),
         ),
+        // §15/§40: typed documented headers beside the erased item-stream
+        // alias; the encoder commits everything before attaching the body.
+        WrapperShape::StreamHeaders => {
+            let alias = layout.stream_alias(op_index, status_index, 0);
+            emitter.line(
+                1,
+                &format!(
+                    "pub body: {},",
+                    payload_type(
+                        effective_contents(status).first().expect("single content"),
+                        alias
+                    )
+                ),
+            );
+        }
         WrapperShape::Stream => emitter.line(1, "pub body: ::axum::body::Body,"),
     }
     emitter.line(0, "}");
@@ -1130,7 +1377,11 @@ fn emit_response_enum(
             operation.method
         )],
     );
-    emitter.line(0, "#[derive(Debug)]");
+    if !has_stream_payload(operation) {
+        // Erased item streams carry no `Debug`; derive it only when every
+        // variant does.
+        emitter.line(0, "#[derive(Debug)]");
+    }
     emitter.line(0, &format!("pub enum {} {{", operation.response_enum_name));
     for (status_index, status) in operation.statuses.iter().enumerate() {
         emit_variant_doc(emitter, status);
@@ -1153,7 +1404,8 @@ fn emit_response_enum(
                         emitter.line(2, "content_type: ::mime::Mime,");
                         emitter.line(2, "body: ::axum::body::Body,");
                     } else {
-                        emitter.line(2, &format!("body: {},", payload_type(content)));
+                        let alias = layout.stream_alias(op_index, status_index, 0);
+                        emitter.line(2, &format!("body: {},", payload_type(content, alias)));
                     }
                 }
                 _ => {
@@ -1192,9 +1444,14 @@ fn emit_response_enum(
                 emitter.line(1, &format!("{},", status.enum_variant));
             }
             1 => {
+                let alias = layout.stream_alias(op_index, status_index, 0);
                 emitter.line(
                     1,
-                    &format!("{}({}),", status.enum_variant, payload_type(&contents[0])),
+                    &format!(
+                        "{}({}),",
+                        status.enum_variant,
+                        payload_type(&contents[0], alias)
+                    ),
                 );
             }
             _ => {
@@ -1229,6 +1486,53 @@ fn emit_variant_doc(emitter: &mut Emitter, status: &PlannedStatus) {
         ResponseStatusKey::Default => "Any other status (`default`).".to_owned(),
     };
     emitter.docs(1, &[line]);
+}
+
+/// Emits one erased `<Op><Status>[<Variant>]Stream` item-stream alias
+/// (§18–§20 Output B, concrete-erased style): applications box their
+/// producer into the alias and the §40 encoder consumes items one at a
+/// time, so generic spread never leaks into trait signatures.
+fn emit_stream_alias(
+    emitter: &mut Emitter,
+    operation: &PlannedOperation,
+    status: &PlannedStatus,
+    content: &PlannedContent,
+    name: &str,
+) {
+    let stream = content.stream.as_ref().expect("stream entry");
+    let item = &stream.item_model_path;
+    emitter.docs(
+        0,
+        &[format!(
+            "Erased `{}` item stream for status {} of `{}` (main spec §{} \
+             Output B / §40): failures after commit ride \
+             `ServerStreamError` — no fabricated statuses.",
+            stream.framing.as_snake(),
+            crate::normalize::status_label(&status.key),
+            operation.method,
+            match stream.framing {
+                StreamFraming::Sse => "18",
+                StreamFraming::Ndjson => "19",
+                StreamFraming::JsonSeq => "20",
+            }
+        )],
+    );
+    emitter.line(
+        0,
+        &format!("pub type {name} = ErasedItems<Result<{item}, ServerStreamError>>;"),
+    );
+}
+
+/// True when any documented response payload of this operation is an erased
+/// item-stream alias (no `Debug` implementation).
+fn has_stream_payload(operation: &PlannedOperation) -> bool {
+    operation.statuses.iter().any(|status| {
+        !status.is_no_body_status
+            && status
+                .contents
+                .iter()
+                .any(|content| content.stream.is_some())
+    })
 }
 
 // ----------------------------------------------------------------------
@@ -1283,6 +1587,13 @@ fn emit_encoding_impl(
     // Operations whose every arm is a bare status or a pure passthrough
     // (streaming/wildcard bodies without documented headers) never touch
     // the limits/hook pair; underscore names keep `-D warnings` clean.
+    let has_stream_status = operation.statuses.iter().any(|status| {
+        !status.is_no_body_status
+            && status
+                .contents
+                .iter()
+                .any(|content| content.stream.is_some())
+    });
     let arg_uses = operation.statuses.iter().any(|status| {
         !status.headers.is_empty()
             || effective_contents(status).iter().any(|content| {
@@ -1291,6 +1602,7 @@ fn emit_encoding_impl(
                     MediaClass::JsonFamily | MediaClass::PlainText
                 ) && !content.is_wildcard
             })
+            || (!status.is_no_body_status && status.contents.iter().any(|c| c.stream.is_some()))
     });
     let (limits_name, hook_name) = if arg_uses {
         ("limits", "hook")
@@ -1299,6 +1611,14 @@ fn emit_encoding_impl(
     };
     emitter.line(2, &format!("{limits_name}: &BodyLimits,"));
     emitter.line(2, &format!("{hook_name}: &dyn EncodeOverflowHook,"));
+    if has_stream_status {
+        // §40: fired when a committed stream fails mid-production; the
+        // encoder terminates the body abruptly afterward.
+        emitter.line(
+            2,
+            "stream_failure_hook: ::std::sync::Arc<dyn ::openapi_support::hooks::StreamFailureHook>,",
+        );
+    }
     emitter.line(1, ") -> ::axum::response::Response {");
     emitter.line(2, "match self {");
     for status_index in 0..operation.statuses.len() {
@@ -1363,15 +1683,33 @@ fn emit_encoding_impl(
         &format!("impl ::axum::response::IntoResponse for {enum_name} {{"),
     );
     emitter.line(1, "fn into_response(self) -> ::axum::response::Response {");
-    let delegate =
-        "self.into_response_with_limits(&BodyLimits::process_default(), &NoOpEncodeOverflowHook)";
-    if fits(2, delegate) {
-        emitter.line(2, delegate);
-    } else {
+    let has_stream_status = operation.statuses.iter().any(|status| {
+        !status.is_no_body_status
+            && status
+                .contents
+                .iter()
+                .any(|content| content.stream.is_some())
+    });
+    if has_stream_status {
         emitter.line(2, "self.into_response_with_limits(");
         emitter.line(3, "&BodyLimits::process_default(),");
         emitter.line(3, "&NoOpEncodeOverflowHook,");
+        emitter.line(
+            3,
+            "::std::sync::Arc::new(::openapi_support::hooks::NoOpStreamFailureHook),",
+        );
         emitter.line(2, ")");
+    } else {
+        let delegate =
+            "self.into_response_with_limits(&BodyLimits::process_default(), &NoOpEncodeOverflowHook)";
+        if fits(2, delegate) {
+            emitter.line(2, delegate);
+        } else {
+            emitter.line(2, "self.into_response_with_limits(");
+            emitter.line(3, "&BodyLimits::process_default(),");
+            emitter.line(3, "&NoOpEncodeOverflowHook,");
+            emitter.line(2, ")");
+        }
     }
     emitter.line(1, "}");
     emitter.line(0, "}");
@@ -1470,6 +1808,42 @@ fn structured_call(
     }
 }
 
+/// Emits the [`StreamBodyEncoder`] constructor shared by every committed-
+/// stream encoder arm (§40).
+fn emit_stream_body_encoder_ctor(emitter: &mut Emitter) {
+    emitter.docs(
+        0,
+        &[
+            "Builds one [`StreamBodyEncoder`] over an application producer \
+             (§40)."
+                .to_owned(),
+        ],
+    );
+    emitter.line(0, "#[allow(clippy::too_many_arguments)]");
+    emitter.line(0, "fn stream_body_encoder<T>(");
+    emitter.line(1, "items: ErasedItems<Result<T, ServerStreamError>>,");
+    emitter.line(1, "limit: usize,");
+    emitter.line(
+        1,
+        "hook: ::std::sync::Arc<dyn ::openapi_support::hooks::StreamFailureHook>,",
+    );
+    emitter.line(1, "operation_id: &'static str,");
+    emitter.line(
+        1,
+        "encode: fn(&T, usize) -> Result<::bytes::Bytes, ::openapi_support::encode::EncodeTooLarge>,",
+    );
+    emitter.line(0, ") -> StreamBodyEncoder<T> {");
+    emitter.line(1, "StreamBodyEncoder {");
+    emitter.line(2, "items,");
+    emitter.line(2, "limit,");
+    emitter.line(2, "hook,");
+    emitter.line(2, "operation_id,");
+    emitter.line(2, "encode,");
+    emitter.line(2, "finished: false,");
+    emitter.line(1, "}");
+    emitter.line(0, "}");
+}
+
 fn any_call(status_arg: &str) -> EncodeCall {
     EncodeCall {
         callee: "any_response",
@@ -1479,6 +1853,155 @@ fn any_call(status_arg: &str) -> EncodeCall {
             "body".to_owned(),
         ],
     }
+}
+
+/// Emits the §40 committed-stream body block: status + Content-Type literal
+/// (+ typed documented headers when present) commit FIRST, then the body
+/// pulls items one at a time, encoding each through the bounded per-item
+/// encoder (`max_stream_record_bytes`). An item encode overflow or an
+/// application error fires the stream-failure hook and TERMINATES the body
+/// abruptly — no fabricated statuses, no in-band error frames, never partial
+/// item bytes. `typed_headers` selects the §15 header-write step between the
+/// Content-Type commit and the body attachment.
+#[allow(clippy::too_many_arguments)]
+fn emit_stream_body_block(
+    emitter: &mut Emitter,
+    indent: usize,
+    status_expr: &str,
+    items_expr: &str,
+    content: &PlannedContent,
+    op_id: &str,
+    variant: &str,
+    limits_arg: &str,
+    typed_headers: bool,
+) {
+    let stream = content.stream.as_ref().expect("stream entry");
+    let ct_literal = rust_string_literal(&content.media_type_literal);
+    let encode_fn = match stream.framing {
+        StreamFraming::Sse => "encode_sse_event",
+        StreamFraming::Ndjson => "encode_ndjson_item",
+        StreamFraming::JsonSeq => "encode_jsonseq_item",
+    };
+    let item = &stream.item_model_path;
+    emitter.line(
+        indent,
+        &format!("let mut encoded = {status_expr}.into_response();"),
+    );
+    emitter.line(indent, "encoded.headers_mut().insert(");
+    emitter.line(indent + 1, "::http::header::CONTENT_TYPE,");
+    emitter.line(
+        indent + 1,
+        &format!("::http::HeaderValue::from_static({ct_literal}),"),
+    );
+    emitter.line(indent, ");");
+    if typed_headers {
+        emitter.line(indent, "let encoded = write_typed_headers(");
+        emitter.line(indent + 1, "encoded,");
+        emitter.line(indent + 1, "hook,");
+        emitter.line(indent + 1, &format!("{},", rust_string_literal(op_id)));
+        emitter.line(indent + 1, &format!("{},", rust_string_literal(variant)));
+        emitter.line(indent + 1, "&typed_headers,");
+        emitter.line(indent, ");");
+    }
+    // §40 step 2–3: pull, encode per-item, fire hook, terminate abruptly.
+    emitter.line(
+        indent,
+        "*encoded.body_mut() = ::axum::body::Body::from_stream(stream_body_encoder(",
+    );
+    emitter.line(indent + 1, &format!("{items_expr},"));
+    emitter.line(
+        indent + 1,
+        &format!("{limits_arg}.max_stream_record_bytes,"),
+    );
+    emitter.line(indent + 1, "::std::sync::Arc::clone(&stream_failure_hook),");
+    emitter.line(indent + 1, &format!("{},", rust_string_literal(op_id)));
+    emitter.line(indent + 1, &format!("{encode_fn}::<{item}>,"));
+    emitter.line(indent, "));");
+    emitter.line(indent, "encoded");
+}
+
+/// The erased item-stream encoder shared by every generated route (§40):
+/// yields one encoded chunk per item; on `EncodeTooLarge` or an application
+/// [`ServerStreamError`] it fires the configured
+/// [`StreamFailureHook`](::openapi_support::hooks::StreamFailureHook) with
+/// the operation id and returns the failure as a terminal body error so the
+/// connection aborts (clients observe truncation distinct from clean EOF).
+fn emit_stream_body_encoder(emitter: &mut Emitter) {
+    emitter.docs(
+        0,
+        &[String::from(
+            "Per-item encoder over one erased item-stream (main spec §40): \
+             each item serializes under `max_stream_record_bytes`; overflow \
+             or an application error fires the stream-failure hook and ends \
+             the body abnormally — the committed status can never change.",
+        )],
+    );
+    emitter.line(0, "struct StreamBodyEncoder<T> {");
+    emitter.line(1, "items: ErasedItems<Result<T, ServerStreamError>>,");
+    emitter.line(1, "limit: usize,");
+    emitter.line(
+        1,
+        "hook: ::std::sync::Arc<dyn ::openapi_support::hooks::StreamFailureHook>,",
+    );
+    emitter.line(1, "operation_id: &'static str,");
+    emitter.line(
+        1,
+        "encode: fn(&T, usize) -> Result<::bytes::Bytes, ::openapi_support::encode::EncodeTooLarge>,",
+    );
+    emitter.line(1, "finished: bool,");
+    emitter.line(0, "}");
+    emitter.blank();
+    emitter.line(
+        0,
+        "impl<T: serde::Serialize> ::futures_core::Stream for StreamBodyEncoder<T> {",
+    );
+    emitter.line(1, "type Item = Result<::bytes::Bytes, ServerStreamError>;");
+    emitter.blank();
+    emitter.line(1, "fn poll_next(");
+    emitter.line(2, "self: ::std::pin::Pin<&mut Self>,");
+    emitter.line(2, "cx: &mut ::core::task::Context<'_>,");
+    emitter.line(1, ") -> ::core::task::Poll<Option<Self::Item>> {");
+    emitter.line(2, "let this = self.get_mut();");
+    emitter.line(2, "if this.finished {");
+    emitter.line(3, "::core::task::Poll::Ready(None)");
+    emitter.line(2, "} else {");
+    emitter.line(
+        3,
+        "match ::futures_core::Stream::poll_next(this.items.as_mut(), cx) {",
+    );
+    emitter.line(
+        4,
+        "::core::task::Poll::Pending => ::core::task::Poll::Pending,",
+    );
+    emitter.line(4, "::core::task::Poll::Ready(None) => {");
+    emitter.line(5, "this.finished = true;");
+    emitter.line(5, "::core::task::Poll::Ready(None)");
+    emitter.line(4, "}");
+    // A block arm with STATEMENTS stays block form under rustfmt.
+    emitter.line(4, "::core::task::Poll::Ready(Some(Ok(item))) => {");
+    emitter.line(5, "let encoded = (this.encode)(&item, this.limit);");
+    emitter.line(5, "match encoded {");
+    emitter.line(
+        6,
+        "Ok(bytes) => ::core::task::Poll::Ready(Some(Ok(bytes))),",
+    );
+    emitter.line(6, "Err(error) => {");
+    emitter.line(7, "this.finished = true;");
+    emitter.line(7, "this.hook.on_stream_failure(this.operation_id, &error);");
+    emitter.line(7, "let failure = ServerStreamError::new(error);");
+    emitter.line(7, "::core::task::Poll::Ready(Some(Err(failure)))");
+    emitter.line(6, "}");
+    emitter.line(5, "}");
+    emitter.line(4, "}");
+    emitter.line(4, "::core::task::Poll::Ready(Some(Err(error))) => {");
+    emitter.line(5, "this.finished = true;");
+    emitter.line(5, "this.hook.on_stream_failure(this.operation_id, &error);");
+    emitter.line(5, "::core::task::Poll::Ready(Some(Err(error)))");
+    emitter.line(4, "}");
+    emitter.line(3, "}");
+    emitter.line(2, "}");
+    emitter.line(1, "}");
+    emitter.line(0, "}");
 }
 
 /// Emits `PATTERN => callee(args),` following rustfmt's preference order:
@@ -1575,6 +2098,25 @@ fn emit_encode_arm(
                 op_id,
                 variant,
             ),
+            // §15/§40: commit status, Content-Type, typed headers, then the
+            // per-item encoded stream over the erased alias.
+            WrapperShape::StreamHeaders => {
+                emitter.line(3, &format!("Self::{variant}(wrapper) => {{"));
+                emit_typed_pushes(emitter, 4, status, HeaderSource::Wrapper);
+                emit_stream_body_block(
+                    emitter,
+                    4,
+                    &constant,
+                    "wrapper.body",
+                    &contents[0],
+                    op_id,
+                    variant,
+                    "limits",
+                    true,
+                );
+                emitter.line(3, "}");
+                return;
+            }
         };
         if !status.headers.is_empty() {
             // §15 with the §48 recorded decision: IntoResponse converts the
@@ -1622,7 +2164,25 @@ fn emit_encode_arm(
             }
         }
         1 => {
-            // Single-content streaming statuses are wrapper statuses handled
+            // Record-framed stream payloads (§18–§20 Output B) commit per §40
+            // and encode items one at a time.
+            if contents[0].stream.is_some() {
+                emitter.line(3, &format!("Self::{variant}(items) => {{"));
+                emit_stream_body_block(
+                    emitter,
+                    4,
+                    &constant,
+                    "items",
+                    &contents[0],
+                    op_id,
+                    variant,
+                    "limits",
+                    false,
+                );
+                emitter.line(3, "}");
+                return;
+            }
+            // Remaining single-content statuses are wrapper statuses handled
             // above, so `value` here is either a model or the raw axum body
             // itself; no extra field access applies.
             let access = "value";
@@ -1824,6 +2384,24 @@ fn emit_nested_content_arms(
         }
         // The arm binds the variant payload as `value`; streaming payloads
         // ARE the raw axum body, so `value` is passed through unchanged.
+        // Record-framed streams commit per §40 and encode items lazily.
+        if !content.is_wildcard && content.stream.is_some() {
+            let pattern = format!("{content_enum}::{}(items)", content.variant_name);
+            emitter.line(indent, &format!("{pattern} => {{"));
+            emit_stream_body_block(
+                emitter,
+                indent + 1,
+                status_arg,
+                "items",
+                content,
+                op_id,
+                variant,
+                limits_arg,
+                with_headers,
+            );
+            emitter.line(indent, "}");
+            continue;
+        }
         let call = structured_call(content, status_arg, "value", limits_arg, op_id, variant);
         let pattern = format!("{content_enum}::{}(value)", content.variant_name);
         if with_headers {
@@ -1930,16 +2508,31 @@ fn emit_range_default_arm(
         }
         1 => {
             let content = &contents[0];
-            let call = if content.is_wildcard {
-                any_call("status")
+            if !content.is_wildcard && content.stream.is_some() {
+                // §40 committed-stream contract on range/default payloads.
+                emit_stream_body_block(
+                    emitter,
+                    4,
+                    "status",
+                    "body",
+                    content,
+                    op_id,
+                    variant,
+                    "limits",
+                    has_headers,
+                );
             } else {
-                structured_call(content, "status", "body", "limits", op_id, variant)
-            };
-            if has_headers {
-                emit_let_call(emitter, 4, "encoded", &call);
-                emit_header_write(emitter, 4, op_id, variant);
-            } else {
-                emit_call_at(emitter, 4, &call);
+                let call = if content.is_wildcard {
+                    any_call("status")
+                } else {
+                    structured_call(content, "status", "body", "limits", op_id, variant)
+                };
+                if has_headers {
+                    emit_let_call(emitter, 4, "encoded", &call);
+                    emit_header_write(emitter, 4, op_id, variant);
+                } else {
+                    emit_call_at(emitter, 4, &call);
+                }
             }
         }
         _ => {
@@ -2100,7 +2693,8 @@ fn ctor_body_type(
             if content.is_wildcard {
                 "::mime::Mime".to_owned()
             } else {
-                payload_type(content)
+                let alias = layout.stream_alias(op_index, status_index, 0);
+                payload_type(content, alias)
             }
         }
         _ => layout
@@ -2138,7 +2732,7 @@ fn emit_wrapper_checked_ctor(
     params.push(format!(
         "body: {}",
         match contents.len() {
-            1 => payload_type(&contents[0]),
+            1 => payload_type(&contents[0], None),
             _ => layout
                 .content_enum(op_index, status_index)
                 .expect("registered")
@@ -2423,10 +3017,15 @@ fn trait_body_type(operation: &PlannedOperation, layout: &ServerLayout, op_index
         let name = layout.multipart_input(op_index).expect("registered");
         return wrap(name.to_owned());
     }
-    wrap(payload_type(content))
+    if let Some(name) = layout.stream_input(op_index, 0) {
+        // §6 request-direction streams: handlers drain a typed item-stream
+        // wrapper (D-impl-request-direction-streams).
+        return wrap(name.to_owned());
+    }
+    wrap(payload_type(content, None))
 }
 
-fn emit_state(emitter: &mut Emitter, api_trait: &str) {
+fn emit_state(emitter: &mut Emitter, api_trait: &str, has_streams: bool) {
     emitter.blank();
     emitter.docs(
         0,
@@ -2440,6 +3039,123 @@ fn emit_state(emitter: &mut Emitter, api_trait: &str) {
         1,
         "encode_overflow_hook: ::std::sync::Arc<dyn EncodeOverflowHook>,",
     );
+    if has_streams {
+        // Read only by committed-stream encoders (§40); present only when
+        // some operation streams a record-framed response.
+        emitter.line(
+            1,
+            "stream_failure_hook: ::std::sync::Arc<dyn ::openapi_support::hooks::StreamFailureHook>,",
+        );
+    }
+    emitter.line(0, "}");
+}
+
+/// Emits one typed `<Op><Framing>Input` streaming request wrapper
+/// (§6 request-direction streams; D-impl-request-direction-streams):
+/// `next_item` decodes ONE record at a time under `max_stream_record_bytes`
+/// and maps per-record decode failures onto the §39 table — oversized
+/// records → 413 BodyTooLarge; malformed JSON, non-UTF-8 bytes, truncation
+/// (the client aborting mid-record), transport failures, and a missing
+/// record separator → 400 MalformedBody. Nothing aggregates the body.
+fn emit_stream_input_struct(
+    emitter: &mut Emitter,
+    operation: &PlannedOperation,
+    content: &PlannedContent,
+    name: &str,
+) {
+    let stream = content.stream.as_ref().expect("stream entry");
+    let item = &stream.item_model_path;
+    let error_type = match stream.framing {
+        StreamFraming::Sse => "SseDecodeError",
+        StreamFraming::Ndjson => "NdjsonDecodeError",
+        StreamFraming::JsonSeq => "JsonSeqDecodeError",
+    };
+    let decode_call = match stream.framing {
+        StreamFraming::Sse => "decode_sse_json",
+        StreamFraming::Ndjson => "decode_ndjson",
+        StreamFraming::JsonSeq => "decode_jsonseq",
+    };
+    let framing_label = stream.framing.as_snake();
+    emitter.docs(
+        0,
+        &[format!(
+            "Streaming {framing_label} request input for `{}` (main spec §6): \
+             `next_item` decodes one record at a time bounded by \
+             `max_stream_record_bytes`; decode failures reject per §39 \
+             (oversized → 413, malformed/truncated/non-UTF-8/aborted → 400) \
+             and nothing aggregates the body.",
+            operation.method
+        )],
+    );
+    emitter.line(0, &format!("pub struct {name} {{"));
+    emitter.line(
+        1,
+        &format!("stream: ErasedItems<Result<{item}, {error_type}>>,"),
+    );
+    emitter.line(0, "}");
+    emitter.blank();
+    emitter.line(0, &format!("impl {name} {{"));
+    emitter.docs(
+        1,
+        &["Wraps the raw body chunk stream behind the incremental decoder.".to_owned()],
+    );
+    let new_head =
+        "fn new(chunks: ::axum::body::BodyDataStream, limit: usize) -> Self {".to_owned();
+    if fits(1, &new_head) {
+        emitter.line(1, &new_head);
+    } else {
+        emitter.line(1, "fn new(");
+        emitter.line(2, "chunks: ::axum::body::BodyDataStream,");
+        emitter.line(2, "limit: usize,");
+        emitter.line(1, ") -> Self {");
+    }
+    emitter.line(2, "Self {");
+    emitter.line(
+        3,
+        &format!("stream: Box::pin({decode_call}::<{item}, _, _>(chunks, limit)),"),
+    );
+    emitter.line(2, "}");
+    emitter.line(1, "}");
+    emitter.blank();
+    emitter.docs(
+        1,
+        &["Next decoded item (`None` at the clean end-of-stream).".to_owned()],
+    );
+    emitter.line(1, "#[allow(clippy::missing_errors_doc)]");
+    let signature = format!(
+        "pub async fn next_item(&mut self) -> Result<Option<{item}>, ProtocolRejection> {{"
+    );
+    if fits(1, &signature) {
+        emitter.line(1, &signature);
+    } else {
+        emitter.line(1, "pub async fn next_item(");
+        emitter.line(2, "&mut self,");
+        emitter.line(
+            1,
+            &format!(") -> Result<Option<{item}>, ProtocolRejection> {{"),
+        );
+    }
+    emitter.line(2, "let next = ::std::future::poll_fn(|cx| {");
+    emitter.line(
+        3,
+        "::futures_core::Stream::poll_next(self.stream.as_mut(), cx)",
+    );
+    emitter.line(2, "})");
+    emitter.line(2, ".await;");
+    emitter.line(2, "match next {");
+    emitter.line(3, "Some(Ok(item)) => Ok(Some(item)),");
+    emitter.line(3, "Some(Err(error)) => Err(match error {");
+    emitter.line(4, &format!("{error_type}::RecordTooLarge {{ .. }} => {{"));
+    emitter.line(5, "ProtocolRejection::new(RejectionKind::BodyTooLarge)");
+    emitter.line(4, "}");
+    emitter.line(
+        4,
+        &format!("_ => malformed_body(\"{framing_label} record failed to decode\"),"),
+    );
+    emitter.line(3, "}),");
+    emitter.line(3, "None => Ok(None),");
+    emitter.line(2, "}");
+    emitter.line(1, "}");
     emitter.line(0, "}");
 }
 
@@ -2533,7 +3249,25 @@ fn emit_handler(
         emitter.line(2, ")");
         emitter.line(2, ".await;");
     }
-    emitter.line(1, "Ok(response.into_response_with_limits(&limits, hook))");
+    // §40: committed-stream operations thread the router's stream-failure
+    // hook into their encoder so mid-production failures are observable
+    // before the body terminates abruptly.
+    let has_stream_status = operation.statuses.iter().any(|status| {
+        !status.is_no_body_status
+            && status
+                .contents
+                .iter()
+                .any(|content| content.stream.is_some())
+    });
+    if has_stream_status {
+        emitter.line(1, "Ok(response.into_response_with_limits(");
+        emitter.line(2, "&limits,");
+        emitter.line(2, "hook,");
+        emitter.line(2, "::std::sync::Arc::clone(&__state.stream_failure_hook),");
+        emitter.line(1, "))");
+    } else {
+        emitter.line(1, "Ok(response.into_response_with_limits(&limits, hook))");
+    }
     emitter.line(0, "}");
 }
 
@@ -2932,6 +3666,14 @@ enum EntryPayload {
         collector: String,
         enum_variant: Option<(String, String)>,
     },
+    /// Single-content record-framed stream (§6 request-direction streams):
+    /// the router wraps the raw body in a typed `<Op><Framing>Input` whose
+    /// `next_item` decodes one record at a time; decode failures reject per
+    /// §39 during consumption (wire-arrival philosophy).
+    Stream {
+        input_name: String,
+        enum_variant: Option<(String, String)>,
+    },
 }
 
 impl EntryPayload {
@@ -3037,6 +3779,13 @@ fn entry_payload(
         },
         MediaClass::Multipart => EntryPayload::Multipart {
             collector: format!("collect_{}_multipart", operation.method),
+            enum_variant: enum_name.map(|enum_name| (enum_name, content.variant_name.clone())),
+        },
+        _ if content.stream.is_some() => EntryPayload::Stream {
+            input_name: layout
+                .stream_input(op_index, index)
+                .expect("stream input registered")
+                .to_owned(),
             enum_variant: enum_name.map(|enum_name| (enum_name, content.variant_name.clone())),
         },
         other => unreachable!("Phase 2 media class {other:?}"),
@@ -3286,6 +4035,58 @@ fn emit_entry_arm(
         emitter.line(indent, "}");
         return;
     }
+    if let EntryPayload::Stream {
+        input_name,
+        enum_variant,
+    } = payload
+    {
+        emitter.line(indent, &format!("RequestEntryMatch::Entry({index}) => {{"));
+        // The typed input wrapper decodes lazily; its `next_item` maps
+        // per-record failures onto §39 rejections during consumption.
+        // rustfmt keeps the constructor argument list vertical (the one-line
+        // form exceeds fn_call_width).
+        let direct_tail = enum_variant.is_none() && required;
+        let chunks = if required {
+            "body.into_data_stream()"
+        } else {
+            // §28.2 peek-and-preserve: the peeked prefix decodes exactly once.
+            "::axum::body::Body::from_stream(replay).into_data_stream()"
+        };
+        let inline = format!("{input_name}::new({chunks}, limits.max_stream_record_bytes)");
+        if !direct_tail {
+            emitter.line(indent + 1, "let value =");
+        }
+        if direct_tail && fits(indent + 1, &inline) {
+            // Tail expression on one line, no semicolon.
+            emitter.line(indent + 1, &inline);
+        } else if direct_tail {
+            emitter.line(indent + 1, &format!("{input_name}::new("));
+            emitter.line(indent + 2, &format!("{chunks},"));
+            emitter.line(indent + 2, "limits.max_stream_record_bytes,");
+            emitter.line(indent + 1, ")");
+        } else {
+            emitter.line(indent + 1, &format!("{input_name}::new("));
+            emitter.line(indent + 2, &format!("{chunks},"));
+            emitter.line(indent + 2, "limits.max_stream_record_bytes,");
+            emitter.line(indent + 1, ");");
+        }
+        match enum_variant {
+            Some((enum_name, variant)) => {
+                if required {
+                    emitter.line(indent + 1, &format!("{enum_name}::{variant}(value)"));
+                } else {
+                    emitter.line(indent + 1, &format!("Some({enum_name}::{variant}(value))"));
+                }
+            }
+            None if !required => {
+                emitter.line(indent + 1, "Some(value)");
+            }
+            // Required single-content: the constructor IS the arm value.
+            None => {}
+        }
+        emitter.line(indent, "}");
+        return;
+    }
     // Streaming/wildcard arms carry no statements, so rustfmt renders them
     // as expression arms; structured arms keep block form around their
     // charset check, bounded collection, and decode.
@@ -3431,8 +4232,8 @@ fn emit_entry_yield_expr(
                 emit_inline(emitter, format!("Some({replay_body})"));
             }
         }
-        EntryPayload::Multipart { .. } => {
-            unreachable!("multipart payloads are handled in emit_entry_arm")
+        EntryPayload::Multipart { .. } | EntryPayload::Stream { .. } => {
+            unreachable!("multipart/stream payloads are handled in emit_entry_arm")
         }
         EntryPayload::WildcardStruct { struct_name } => {
             let head_line = if required {
@@ -3538,8 +4339,8 @@ fn emit_entry_yield(emitter: &mut Emitter, indent: usize, payload: &EntryPayload
                 emitter.line(indent, &format!("Some({replay_body})"));
             }
         }
-        EntryPayload::Multipart { .. } => {
-            unreachable!("multipart payloads are handled in emit_entry_arm")
+        EntryPayload::Multipart { .. } | EntryPayload::Stream { .. } => {
+            unreachable!("multipart/stream payloads are handled in emit_entry_arm")
         }
         EntryPayload::WildcardStruct { struct_name } => {
             wrap(
@@ -4733,7 +5534,12 @@ fn emit_collector_decode_arm(
 // Router registration (axum 0.8 keeps `{param}` placeholders verbatim)
 // ----------------------------------------------------------------------
 
-fn emit_router(emitter: &mut Emitter, plan: &PlannedApi, api_trait: &str) {
+fn emit_router(
+    emitter: &mut Emitter,
+    plan: &PlannedApi,
+    api_trait: &str,
+    has_stream_responses: bool,
+) {
     emitter.blank();
     emitter.docs(
         0,
@@ -4752,11 +5558,28 @@ fn emit_router(emitter: &mut Emitter, plan: &PlannedApi, api_trait: &str) {
         1,
         "encode_overflow_hook: ::std::sync::Arc<dyn EncodeOverflowHook>,",
     );
+    if has_stream_responses {
+        // §40: fired when a committed stream fails mid-production.
+        emitter.line(
+            1,
+            "stream_failure_hook: ::std::sync::Arc<dyn ::openapi_support::hooks::StreamFailureHook>,",
+        );
+    } else {
+        // Accepted for API uniformity across generated crates; unused when
+        // no operation streams a record-framed response.
+        emitter.line(
+            1,
+            "_stream_failure_hook: ::std::sync::Arc<dyn ::openapi_support::hooks::StreamFailureHook>,",
+        );
+    }
     emitter.line(0, ") -> ::axum::Router {");
     emitter.line(1, "let state = ServerState {");
     emitter.line(2, "api,");
     emitter.line(2, "limits,");
     emitter.line(2, "encode_overflow_hook,");
+    if has_stream_responses {
+        emitter.line(2, "stream_failure_hook,");
+    }
     emitter.line(1, "};");
     if plan.operations.is_empty() {
         emitter.line(1, "::axum::Router::new().with_state(state)");
@@ -4941,6 +5764,12 @@ fn emit_module_helpers(emitter: &mut Emitter, flags: &Flags) {
     if flags.needs_stream_response {
         emitter.blank();
         emit_stream_response(emitter);
+    }
+    if !flags.response_framings.is_empty() {
+        emitter.blank();
+        emit_stream_body_encoder(emitter);
+        emitter.blank();
+        emit_stream_body_encoder_ctor(emitter);
     }
     if flags.needs_any_response {
         emitter.blank();

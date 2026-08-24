@@ -26,8 +26,11 @@
 //!   and both terminate the stream — never skip-and-continue.
 //! - Transport failures surface as
 //!   [`NdjsonDecodeError::Source`](crate::stream_errors::NdjsonDecodeError::Source),
-//!   preserving the underlying error instead of masquerading as truncation.
-//!   Dropping the stream after any terminal item cancels the producer.
+//!   preserving the underlying error — EXCEPT hyper READ-side premature body
+//!   ends (§40), which [`crate::transport_classify`] remaps to
+//!   [`NdjsonDecodeError::Truncated`](crate::stream_errors::NdjsonDecodeError::Truncated)
+//!   in the generated adapters. Dropping the stream after any terminal item
+//!   cancels the producer.
 //!
 //! # Memory bounds
 //!

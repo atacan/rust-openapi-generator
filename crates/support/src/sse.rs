@@ -41,7 +41,10 @@
 //!   is a clean end.
 //! - Transport failures surface as
 //!   [`SseDecodeError::Source`](crate::stream_errors::SseDecodeError::Source),
-//!   preserving the underlying error. Dropping the stream after any terminal
+//!   preserving the underlying error — EXCEPT hyper READ-side premature body
+//!   ends (§40), which [`crate::transport_classify`] remaps to
+//!   [`SseDecodeError::Truncated`](crate::stream_errors::SseDecodeError::Truncated)
+//!   in the generated adapters. Dropping the stream after any terminal
 //!   item cancels the producer.
 //!
 //! # Memory bounds

@@ -26,6 +26,8 @@ pub mod percent;
 pub mod rejection;
 pub mod sse;
 pub mod stream_errors;
+#[cfg(feature = "client")]
+pub mod transport_classify;
 pub mod validation;
 
 #[cfg(feature = "client")]

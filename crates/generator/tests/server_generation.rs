@@ -34,6 +34,7 @@ const SNAPSHOT_FIXTURES: &[&str] = &[
     "12_multipart_order.yaml",
     "13_validation.yaml",
     "14_negotiation.yaml",
+    "15_streams.yaml",
 ];
 
 /// Every fixture must plan + render without diagnostics.
@@ -52,6 +53,7 @@ const ALL_FIXTURES: &[&str] = &[
     "12_multipart_order.yaml",
     "13_validation.yaml",
     "14_negotiation.yaml",
+    "15_streams.yaml",
 ];
 
 fn fixtures_dir() -> PathBuf {
@@ -1105,4 +1107,130 @@ fn server_runtime_validation_off_skips_calls_but_keeps_model_validators() {
     // Validators themselves stay emitted: the flag gates calls only.
     let models = generate_models(&doc);
     assert!(models.contains("pub fn validate_request("));
+}
+
+// ----------------------------------------------------------------------
+// Fixture 15 — streaming record formats (§18–§20 Output B, §40 wiring)
+// ----------------------------------------------------------------------
+
+#[test]
+fn fixture_15_server_aliases_are_erased_pin_box_streams() {
+    let output = generate_fixture("15_streams.yaml");
+
+    // §18/§19/§20 Output B concrete-erased aliases over ServerStreamError.
+    for (alias, item) in [
+        ("ExportRecords200Stream", "Record"),
+        ("StreamEvents200Stream", "Event"),
+        ("StreamEnvelopeEvents200Stream", "EventPayload"),
+    ] {
+        assert!(
+            output.contains(&format!(
+                "pub type {alias} = ErasedItems<Result<{item}, ServerStreamError>>;"
+            )),
+            "{alias} alias missing:\n{output}"
+        );
+    }
+    assert!(
+        output.contains("pub type ErasedItems<T> ="),
+        "shared boxed-stream alias emitted"
+    );
+    assert!(
+        output.contains(
+            "::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = T> + ::std::marker::Send>>;"
+        ),
+        "alias is Pin<Box<dyn Stream + Send>>"
+    );
+}
+
+#[test]
+fn fixture_15_encoder_arms_fire_hook_then_terminate_per_section_40() {
+    let output = generate_fixture("15_streams.yaml");
+
+    // Status + Content-Type commit BEFORE the body attaches (§40 order).
+    let ndjson_arm = output
+        .find("Self::Ok200(items) => {")
+        .map(|index| &output[index..index + 2_000])
+        .expect("ndjson arm");
+    assert!(
+        ndjson_arm.contains("let mut encoded = ::http::StatusCode::OK.into_response();"),
+        "status commits first:\n{ndjson_arm}"
+    );
+    assert!(
+        ndjson_arm.contains("\"application/x-ndjson\""),
+        "literal Content-Type commits beside the status"
+    );
+    assert!(
+        ndjson_arm.find("*encoded.body_mut()").unwrap()
+            > ndjson_arm.find("headers_mut().insert(").unwrap(),
+        "body attaches AFTER status + Content-Type + headers"
+    );
+
+    // Per-item encoding under max_stream_record_bytes, hook before abort.
+    assert!(
+        output.contains("limits.max_stream_record_bytes,"),
+        "per-item encode bound"
+    );
+    assert!(
+        output.contains("this.hook.on_stream_failure(this.operation_id, &error);"),
+        "hook fires with the operation id before termination"
+    );
+    assert!(
+        output.contains("::std::sync::Arc::clone(&stream_failure_hook),"),
+        "router-supplied stream hook threads into the encoder"
+    );
+    assert!(
+        output.contains("ServerStreamError::new("),
+        "encode overflow surfaces as a terminal body error (abrupt)"
+    );
+
+    // Router signature carries the stream-failure hook beside the encode
+    // hook; state stores it only when needed.
+    assert!(
+        output.contains(
+            "stream_failure_hook: ::std::sync::Arc<dyn ::openapi_support::hooks::StreamFailureHook>,"
+        ),
+        "router gains the stream_failure_hook parameter"
+    );
+    assert!(
+        output.contains("async fn push_metrics(&self, body: PushMetricsJsonSeqInput)")
+            && output.contains("next_item(&mut self)"),
+        "request-direction input wrapper drains via next_item"
+    );
+    assert!(
+        output.contains("ProtocolRejection::new(RejectionKind::BodyTooLarge)"),
+        "oversized streamed request records reject 413"
+    );
+}
+
+/// Extended §49 greps for the streaming server snapshot: no aggregation, no
+/// fabricated statuses after commit.
+#[test]
+fn no_aggregation_or_fabricated_statuses_in_streaming_snapshot() {
+    let text = std::fs::read_to_string(snapshots_dir().join("15_streams.server.rs"))
+        .expect("snapshot readable");
+    for forbidden in [
+        ".bytes()",
+        "to_vec()",
+        "serde_json::to_vec",
+        "serde_urlencoded",
+    ] {
+        assert!(
+            !text.contains(forbidden),
+            "streaming snapshot aggregates via `{forbidden}` (§49)"
+        );
+    }
+    // No INTERNAL_SERVER_ERROR fallback may appear inside the committed-
+    // stream encoder arms: §40 forbids upgrading a committed response.
+    let arm_start = output_probe(&text);
+    if let Some(start) = arm_start {
+        let window = &text[start..start + 3_000];
+        assert!(
+            !window.contains("INTERNAL_SERVER_ERROR"),
+            "committed-stream arms must never fabricate statuses (§40)"
+        );
+    }
+}
+
+fn output_probe(text: &str) -> Option<usize> {
+    text.find("Self::Ok200(items) => {")
 }

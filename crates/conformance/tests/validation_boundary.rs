@@ -28,8 +28,8 @@ use tower::ServiceExt;
 const BOUNDARY: &str = "XvAlIdBoUnDaRyX";
 
 fn router13(api: Arc<dyn fx13::server::Api>) -> axum::Router {
-    let (limits, hook) = common::router_args();
-    fx13::server::router(api, limits, hook)
+    let (limits, hook, stream_hook) = common::router_args();
+    fx13::server::router(api, limits, hook, stream_hook)
 }
 
 fn json_request(uri: &str, body: serde_json::Value) -> http::Request<axum::body::Body> {

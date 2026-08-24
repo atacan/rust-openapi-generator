@@ -17,7 +17,7 @@ use openapi_conformance::fixtures::fixture_02_streaming_binary as fx02;
 use openapi_conformance::fixtures::fixture_03_nested_content as fx03;
 use openapi_conformance::fixtures::fixture_04_status_ranges as fx04;
 use openapi_conformance::fixtures::fixture_10_forms_headers as fx10;
-use openapi_support::hooks::EncodeOverflowHook;
+use openapi_support::hooks::{EncodeOverflowHook, StreamFailureHook};
 use openapi_support::limits::BodyLimits;
 use openapi_support::optional::OptionalField;
 
@@ -56,8 +56,9 @@ async fn fixture_01_create_widget_round_trips_both_directions() {
     let app = Arc::new(WidgetApp {
         problem_mode: AtomicBool::new(false),
     });
-    let (limits, hook) = common::router_args();
-    let address = common::spawn_router(fx01::server::router(app.clone(), limits, hook));
+    let (limits, hook, stream_hook) = common::router_args();
+    let address =
+        common::spawn_router(fx01::server::router(app.clone(), limits, hook, stream_hook));
 
     let client = fx01::client::ClientBuilder::new()
         .base_url(common::base_url(address))
@@ -87,8 +88,9 @@ async fn fixture_01_bad_request_path_carries_problem_details() {
     let app = Arc::new(WidgetApp {
         problem_mode: AtomicBool::new(true),
     });
-    let (limits, hook) = common::router_args();
-    let address = common::spawn_router(fx01::server::router(app.clone(), limits, hook));
+    let (limits, hook, stream_hook) = common::router_args();
+    let address =
+        common::spawn_router(fx01::server::router(app.clone(), limits, hook, stream_hook));
 
     let client = fx01::client::ClientBuilder::new()
         .base_url(common::base_url(address))
@@ -175,13 +177,18 @@ async fn fixture_02_streaming_round_trip_stays_chunked_and_hits_both_bases() {
         stored: Mutex::new(Vec::new()),
         received_chunks: AtomicUsize::new(0),
     });
-    let (limits, hook): (BodyLimits, Arc<dyn EncodeOverflowHook>) = common::router_args();
+    let (limits, hook, stream_hook): (
+        BodyLimits,
+        Arc<dyn EncodeOverflowHook>,
+        Arc<dyn StreamFailureHook>,
+    ) = common::router_args();
     let address = common::spawn_router(fx02::server::router(
         Arc::new(StorageApp {
             shared: shared.clone(),
         }),
         limits,
         hook,
+        stream_hook,
     ));
 
     // Both bases point at the SAME test server; the assertion is that the
@@ -277,8 +284,9 @@ async fn fixture_03_negotiates_json_and_octet_stream_variants() {
     let app = Arc::new(ArtifactApp {
         octet_mode: AtomicBool::new(false),
     });
-    let (limits, hook) = common::router_args();
-    let address = common::spawn_router(fx03::server::router(app.clone(), limits, hook));
+    let (limits, hook, stream_hook) = common::router_args();
+    let address =
+        common::spawn_router(fx03::server::router(app.clone(), limits, hook, stream_hook));
 
     let client = fx03::client::ClientBuilder::new()
         .base_url(common::base_url(address))
@@ -386,8 +394,9 @@ async fn fixture_04_status_precedence_and_range_carry() {
     let app = Arc::new(StatusScriptApp {
         script: Mutex::new(VecDeque::new()),
     });
-    let (limits, hook) = common::router_args();
-    let address = common::spawn_router(fx04::server::router(app.clone(), limits, hook));
+    let (limits, hook, stream_hook) = common::router_args();
+    let address =
+        common::spawn_router(fx04::server::router(app.clone(), limits, hook, stream_hook));
 
     // Explicit 200 beats the 2XX range: Ok200, not Success2xx.
     let client = status_client(address, &app, &[200]);
@@ -475,8 +484,8 @@ impl fx10::server::Api for SessionApp {
 }
 
 fn spawn_sessions(app: Arc<SessionApp>) -> std::net::SocketAddr {
-    let (limits, hook) = common::router_args();
-    common::spawn_router(fx10::server::router(app, limits, hook))
+    let (limits, hook, stream_hook) = common::router_args();
+    common::spawn_router(fx10::server::router(app, limits, hook, stream_hook))
 }
 
 fn sessions_client(address: std::net::SocketAddr) -> fx10::client::Client {

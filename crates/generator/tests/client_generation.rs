@@ -28,6 +28,7 @@ const SNAPSHOT_FIXTURES: &[&str] = &[
     "12_multipart_order.yaml",
     "13_validation.yaml",
     "14_negotiation.yaml",
+    "15_streams.yaml",
 ];
 
 /// Every fixture must plan + render without diagnostics (07/08 included).
@@ -46,6 +47,7 @@ const ALL_FIXTURES: &[&str] = &[
     "12_multipart_order.yaml",
     "13_validation.yaml",
     "14_negotiation.yaml",
+    "15_streams.yaml",
 ];
 
 fn fixtures_dir() -> PathBuf {
@@ -794,4 +796,104 @@ fn fixture_11_multipart_request_struct_streams_files_and_has_from_file() {
         !method.contains("CONTENT_TYPE"),
         "static Content-Type headers would drop the multipart boundary:\n{method}"
     );
+}
+
+// ----------------------------------------------------------------------
+// Fixture 15 — streaming record formats (§5.6–§5.8, §18–§20 Output A)
+// ----------------------------------------------------------------------
+
+#[test]
+fn fixture_15_client_wrappers_expose_incremental_stream_decoders() {
+    let output = generate_fixture("15_streams.yaml");
+
+    // Each record-framed entry owns a `<Op><Status>Stream` wrapper carrying
+    // the raw response plus the stored limits, and exposes the per-framing
+    // incremental decoder.
+    for (wrapper, method, item, error) in [
+        (
+            "ExportRecords200Stream",
+            "into_ndjson_stream",
+            "Record",
+            "NdjsonDecodeError",
+        ),
+        (
+            "StreamEvents200Stream",
+            "into_sse_stream",
+            "Event",
+            "SseDecodeError",
+        ),
+        (
+            "StreamEnvelopeEvents200Stream",
+            "into_sse_stream",
+            "EventPayload",
+            "SseDecodeError",
+        ),
+    ] {
+        let block = struct_block(&output, wrapper);
+        assert!(
+            block.contains("pub response: ::reqwest::Response,"),
+            "{block}"
+        );
+        assert!(block.contains("pub limits: BodyLimits,"), "{block}");
+        let method_sig = format!("pub fn {method}(");
+        assert!(output.contains(&method_sig), "{method} missing:\n{output}");
+        assert!(
+            output.contains(&format!(
+                "impl ::futures_core::Stream<Item = Result<{item}, {error}>>"
+            )),
+            "{wrapper} decode signature"
+        );
+        assert!(
+            output.contains("self.limits.max_stream_record_bytes"),
+            "per-record bound comes from the stored limits"
+        );
+    }
+
+    // §18.1 override wins: the envelope schema never appears as the item
+    // type of the SSE stream.
+    let envelope_wrapper = struct_block(&output, "StreamEnvelopeEvents200Stream");
+    assert!(
+        !envelope_wrapper.contains("EventEnvelope"),
+        "x-rust-stream-item must replace the envelope schema:\n{envelope_wrapper}"
+    );
+
+    // Request direction: boxed erased item-stream alias (documented shape).
+    assert!(
+        output.contains(
+            "pub type PushMetricsJsonSeqBody =\n             \u{0020}   ::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = Metric> \
+             + ::std::marker::Send>>;"
+        ) || output.contains("pub type PushMetricsJsonSeqBody ="),
+        "boxed alias shape documented on the type"
+    );
+    let push = method_block(&output, "push_metrics");
+    assert!(
+        push.contains("stream_request_encoder(") && push.contains(".await?"),
+        "eager head encode precedes the send:\n{push}"
+    );
+    assert!(
+        push.contains("::reqwest::Body::wrap_stream(encoder)"),
+        "items stream lazily mid-send:\n{push}"
+    );
+
+    // Accept union keeps the streaming literals verbatim (§29).
+    assert!(
+        method_block(&output, "export_records")
+            .contains("\"application/x-ndjson, application/problem+json\""),
+        "\n{}",
+        method_block(&output, "export_records")
+    );
+}
+
+/// Extended §49 greps: the streaming snapshots must never aggregate a body
+/// and must never collect through the bounded collectors either.
+#[test]
+fn no_aggregation_in_streaming_snapshots() {
+    let text = std::fs::read_to_string(snapshots_dir().join("15_streams.client.rs"))
+        .expect("snapshot readable");
+    for forbidden in [".bytes()", ".text()", "to_vec()", "serde_json::to_vec"] {
+        assert!(
+            !text.contains(forbidden),
+            "streaming snapshot aggregates via `{forbidden}` (§49)"
+        );
+    }
 }

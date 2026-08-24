@@ -9,7 +9,7 @@ unsafe_code = "forbid"
 
 [features]
 default = []
-client = ["dep:reqwest", "dep:tokio", "dep:tokio-util", "dep:futures-util"]
+client = ["dep:reqwest", "dep:hyper", "dep:tokio", "dep:tokio-util", "dep:futures-util"]
 server = ["dep:axum", "dep:tokio", "dep:tokio-util", "dep:futures-util"]
 
 [dependencies]
@@ -22,6 +22,7 @@ thiserror = "2"
 futures-core = { workspace = true }
 
 reqwest = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }

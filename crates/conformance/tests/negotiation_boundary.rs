@@ -15,7 +15,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use openapi_conformance::fixtures::fixture_14_negotiation as fx14;
-use openapi_support::hooks::{EncodeOverflowHook, NoOpEncodeOverflowHook};
+use openapi_support::hooks::{
+    EncodeOverflowHook, NoOpEncodeOverflowHook, NoOpStreamFailureHook, StreamFailureHook,
+};
 use openapi_support::limits::BodyLimits;
 use tower::ServiceExt;
 
@@ -164,7 +166,8 @@ fn client(address: std::net::SocketAddr) -> fx14::client::Client {
 fn spawn(app: Arc<NegotiationApp>) -> std::net::SocketAddr {
     let limits = BodyLimits::process_default();
     let hook: Arc<dyn EncodeOverflowHook> = Arc::new(NoOpEncodeOverflowHook);
-    common::spawn_router(fx14::server::router(app, limits, hook))
+    let stream_hook: Arc<dyn StreamFailureHook> = Arc::new(NoOpStreamFailureHook);
+    common::spawn_router(fx14::server::router(app, limits, hook, stream_hook))
 }
 
 // ----------------------------------------------------------------------
@@ -319,7 +322,9 @@ async fn trio_variants_reach_the_client_in_declaration_order() {
     });
     let limits = BodyLimits::process_default();
     let hook: Arc<dyn EncodeOverflowHook> = Arc::new(NoOpEncodeOverflowHook);
-    let address = common::spawn_router(fx14::server::router(app.clone(), limits, hook));
+    let stream_hook: Arc<dyn StreamFailureHook> = Arc::new(NoOpStreamFailureHook);
+    let address =
+        common::spawn_router(fx14::server::router(app.clone(), limits, hook, stream_hook));
     let client = client(address);
 
     for expected in ["problem-json", "legacy-json", "plain"] {
@@ -381,6 +386,7 @@ async fn request_wildcard_entry_accepts_arbitrary_content_type_as_stream() {
         app.clone(),
         BodyLimits::process_default(),
         Arc::new(NoOpEncodeOverflowHook),
+        Arc::new(NoOpStreamFailureHook),
     )
     .oneshot(
         ::http::Request::builder()
@@ -410,6 +416,7 @@ async fn request_wildcard_entry_accepts_arbitrary_content_type_as_stream() {
         app.clone(),
         BodyLimits::process_default(),
         Arc::new(NoOpEncodeOverflowHook),
+        Arc::new(NoOpStreamFailureHook),
     )
     .oneshot(
         ::http::Request::builder()
@@ -476,6 +483,7 @@ async fn latin1_charset_is_rejected_by_client_and_server() {
         app.clone(),
         BodyLimits::process_default(),
         Arc::new(NoOpEncodeOverflowHook),
+        Arc::new(NoOpStreamFailureHook),
     );
     let response = router
         .oneshot(

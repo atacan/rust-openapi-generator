@@ -547,6 +547,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "http",
+ "hyper",
  "mime",
  "reqwest",
  "serde",

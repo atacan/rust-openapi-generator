@@ -134,7 +134,7 @@ pub struct PlannedContent {
     pub media_type_literal: String,
     /// Rust type path into `super::models` for JsonFamily; `String` for
     /// PlainText; empty for streaming classes (each emitter renders its own
-    /// payload type from [`MediaClass`]).
+    /// payload type from [`MediaClass`] or [`Self::stream`]).
     pub model_expr: String,
     pub is_wildcard: bool,
     /// Typed field plan for `multipart/form-data` request entries (§17):
@@ -142,12 +142,71 @@ pub struct PlannedContent {
     /// always `None` elsewhere (response-side multipart still
     /// stop-and-reports).
     pub multipart_spec: Option<PlannedMultipart>,
+    /// Record-framing plan for SSE/NDJSON/JSON-sequence entries (§5.6–§5.8,
+    /// §18): populated when [`MediaClass`] is one of the three streaming
+    /// record classes; `None` elsewhere.
+    pub stream: Option<PlannedStream>,
     /// How the decoded body validates (companion §9); `None` when nothing
     /// bucket-2 survives normalization for this entry. The router runs the
     /// check after a successful decode and maps failures onto
     /// SchemaViolation 422 — only when [`PlanConfig::server_runtime_validation`]
     /// is on (the default).
     pub body_validation: Option<PlannedBodyValidation>,
+}
+
+/// Wire framing of one streaming record entry (main spec §5.6–§5.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum StreamFraming {
+    /// `text/event-stream` (§5.6/§18.2).
+    Sse,
+    /// NDJSON aliases (§5.7/§19).
+    Ndjson,
+    /// `application/json-seq` (§5.8/§20).
+    JsonSeq,
+}
+
+impl StreamFraming {
+    /// snake_case token used in generated method names
+    /// (`into_ndjson_stream`) and module paths.
+    #[must_use]
+    pub fn as_snake(self) -> &'static str {
+        match self {
+            Self::Sse => "sse",
+            Self::Ndjson => "ndjson",
+            Self::JsonSeq => "jsonseq",
+        }
+    }
+
+    /// PascalCase token used in generated type names
+    /// (`<Op>JsonSeqBody`).
+    #[must_use]
+    pub fn as_pascal(self) -> &'static str {
+        match self {
+            Self::Sse => "Sse",
+            Self::Ndjson => "Ndjson",
+            Self::JsonSeq => "JsonSeq",
+        }
+    }
+}
+
+/// Resolved item typing of one streaming record entry (main spec §18.1):
+/// the item schema is the entry's schema UNLESS `x-rust-stream-item`
+/// overrides it (the override wins), resolved to a models.rs type path like
+/// JsonPart mapping does.
+#[derive(Debug, Clone)]
+pub struct PlannedStream {
+    pub framing: StreamFraming,
+    /// Rust type path into `super::models` of ONE streamed item.
+    pub item_model_path: String,
+}
+
+impl PlannedContent {
+    /// Wire framing when this entry is one of the three streaming record
+    /// classes (§5.6–§5.8).
+    #[must_use]
+    pub fn framing(&self) -> Option<StreamFraming> {
+        self.stream.as_ref().map(|stream| stream.framing)
+    }
 }
 
 /// How one decoded request body validates (companion §9).
@@ -494,9 +553,10 @@ enum ContentSide {
 }
 
 /// Plans one content list: Phase 1 media classes plus request-side
-/// UrlEncodedForm and Multipart; everything else stop-and-reports
-/// (EventStream/Ndjson/JsonSeq and response-side forms/multipart are
-/// later-phase deliverables, main spec §52).
+/// UrlEncodedForm and Multipart plus the three streaming record classes
+/// (SSE/NDJSON/JSON-seq, §5.6–§5.8) in BOTH directions; everything else
+/// stop-and-reports (response-side forms/multipart are later-phase
+/// deliverables, main spec §52).
 fn plan_contents(
     doc: &NormalizedDocument,
     location: &DocumentPath,
@@ -530,28 +590,12 @@ fn plan_contents(
                     format!(
                         "this phase does not generate media class {:?} for `{}` \
                          here; multipart generates on requests with a concrete \
-                         media type only, and SSE/NDJSON/JSON sequences remain \
-                         later phases",
+                         media type only",
                         entry.media_class, entry.media_type
                     ),
                 );
             }
             continue;
-        }
-        match entry.media_class {
-            MediaClass::EventStream | MediaClass::Ndjson | MediaClass::JsonSeq => {
-                diags.error(
-                    location.key("content").key(entry.media_type.clone()),
-                    "client_media_class_phase1",
-                    format!(
-                        "this phase does not generate media class {:?} for `{}` \
-                         here; streaming record formats remain later phases",
-                        entry.media_class, entry.media_type
-                    ),
-                );
-                continue;
-            }
-            _ => {}
         }
         // §44 override (D-impl-x-rust-body-stream): `x-rust-body: stream`
         // turns a bounded plain-text entry into the raw streaming family for
@@ -567,6 +611,23 @@ fn plan_contents(
         let variant_base = content_variant_base(&base_literal, entry.is_wildcard);
         let variant = unique_variant(&variant_base, &mut used_variants);
         let mut multipart_spec = None;
+        // §18.1: the item schema is the entry schema UNLESS the
+        // `x-rust-stream-item` override is present (the override wins).
+        // Resolution mirrors JsonPart mapping: named components use their
+        // models.rs names; anonymous composites stop with an Error.
+        let mut stream = None;
+        if let Some(framing) = match effective_class {
+            MediaClass::EventStream => Some(StreamFraming::Sse),
+            MediaClass::Ndjson => Some(StreamFraming::Ndjson),
+            MediaClass::JsonSeq => Some(StreamFraming::JsonSeq),
+            _ => None,
+        } {
+            let item_schema = entry.stream_item_override.unwrap_or(entry.schema);
+            stream = Some(PlannedStream {
+                framing,
+                item_model_path: json_model_expr(doc, item_schema, location, diags),
+            });
+        }
         let model_expr = match effective_class {
             MediaClass::JsonFamily => json_model_expr(doc, entry.schema, location, diags),
             MediaClass::UrlEncodedForm => json_model_expr(doc, entry.schema, location, diags),
@@ -575,7 +636,8 @@ fn plan_contents(
                 multipart_spec = plan_multipart_spec(doc, entry, location, diags, analysis);
                 String::new()
             }
-            // Binary/RawUnknown stream; each emitter renders its own payload.
+            // Binary/RawUnknown/stream classes; each emitter renders its own
+            // payload type from [`MediaClass`] or [`PlannedContent::stream`].
             _ => String::new(),
         };
         // Constrained scalar aliases carry their models.rs free validator
@@ -608,6 +670,7 @@ fn plan_contents(
             model_expr,
             is_wildcard: entry.is_wildcard,
             multipart_spec,
+            stream,
             body_validation,
         });
     }

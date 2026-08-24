@@ -27,7 +27,11 @@
 //!   terminate the stream fail-fast.
 //! - Transport failures surface as
 //!   [`JsonSeqDecodeError::Source`](crate::stream_errors::JsonSeqDecodeError::Source),
-//!   preserving the underlying error. Dropping the stream after any terminal
+//!   preserving the underlying error — EXCEPT hyper READ-side premature body
+//!   ends (§40), which
+//!   [`crate::transport_classify`] remaps to
+//!   [`JsonSeqDecodeError::Truncated`](crate::stream_errors::JsonSeqDecodeError::Truncated)
+//!   in the generated adapters. Dropping the stream after any terminal
 //!   item cancels the producer.
 //!
 //! # Memory bounds

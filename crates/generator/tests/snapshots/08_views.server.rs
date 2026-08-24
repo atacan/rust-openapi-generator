@@ -241,6 +241,7 @@ pub fn router(
     api: ::std::sync::Arc<dyn Api>,
     limits: BodyLimits,
     encode_overflow_hook: ::std::sync::Arc<dyn EncodeOverflowHook>,
+    _stream_failure_hook: ::std::sync::Arc<dyn ::openapi_support::hooks::StreamFailureHook>,
 ) -> ::axum::Router {
     let state = ServerState {
         api,

@@ -6,7 +6,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use openapi_support::hooks::{EncodeOverflowHook, NoOpEncodeOverflowHook};
+use openapi_support::hooks::{
+    EncodeOverflowHook, NoOpEncodeOverflowHook, NoOpStreamFailureHook, StreamFailureHook,
+};
 use openapi_support::limits::BodyLimits;
 
 /// Spawns an axum server on an OS-assigned loopback port serving `router`.
@@ -32,11 +34,17 @@ pub fn base_url(address: SocketAddr) -> String {
     format!("http://{address}")
 }
 
-/// Convenience: default limits + silent hook pair used by every router.
-pub fn router_args() -> (BodyLimits, Arc<dyn EncodeOverflowHook>) {
+/// Convenience: default limits + silent hook trio used by every router
+/// (encode overflow §34.1, stream failure §40).
+pub fn router_args() -> (
+    BodyLimits,
+    Arc<dyn EncodeOverflowHook>,
+    Arc<dyn StreamFailureHook>,
+) {
     (
         BodyLimits::process_default(),
         Arc::new(NoOpEncodeOverflowHook),
+        Arc::new(NoOpStreamFailureHook),
     )
 }
 

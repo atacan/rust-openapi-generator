@@ -33,7 +33,7 @@ use crate::normalize::NormalizedDocument;
 
 use super::plan::{
     PlannedApi, PlannedContent, PlannedMultipart, PlannedMultipartField, PlannedMultipartFieldKind,
-    PlannedOperation, PlannedParameter, PlannedStatus,
+    PlannedOperation, PlannedParameter, PlannedStatus, StreamFraming,
 };
 use super::Emitter;
 
@@ -94,12 +94,20 @@ fn fresh_name(used: &mut BTreeSet<String>, base: String) -> String {
 /// Module-level type-name registry for one API: content enums and streaming
 /// wrappers get `<Op><Status>[Content]` names with numeric collision
 /// suffixes ordered by document position (companion §10). Multipart request
-/// bodies register their `<Op>Request` input struct (§17 Output A).
+/// bodies register their `<Op>Request` input struct (§17 Output A); stream
+/// request bodies register their `<Op><Framing>Body` boxed item-stream
+/// aliases (§6 request-direction streams, D-impl-request-direction-streams).
 #[derive(Debug, Default)]
 struct Layout {
     /// (operation document index, status index) → generated type name.
     content_enums: BTreeMap<(usize, usize), String>,
     wrappers: BTreeMap<(usize, usize), String>,
+    /// (operation index, status index, content index) → `<…>Stream`
+    /// response wrapper for one stream-class content entry (§18/§19/§20
+    /// Output A): owns the raw response plus the stored `BodyLimits`.
+    stream_wrappers: BTreeMap<(usize, usize, usize), String>,
+    /// (operation index, content index) → `<Op><Framing>Body` alias name.
+    request_stream_bodies: BTreeMap<(usize, usize), String>,
     /// Operation document index → `<Op>Request` multipart input struct.
     request_structs: BTreeMap<usize, String>,
 }
@@ -117,11 +125,42 @@ impl Layout {
                 let name = fresh_name(used, base);
                 layout.request_structs.insert(op_index, name);
             }
+            for (content_index, content) in operation.request_contents.iter().enumerate() {
+                if let Some(stream) = &content.stream {
+                    let base = format!("{}{}Body", operation.pascal, stream.framing.as_pascal());
+                    let name = fresh_name(used, base);
+                    layout
+                        .request_stream_bodies
+                        .insert((op_index, content_index), name);
+                }
+            }
             for (status_index, status) in operation.statuses.iter().enumerate() {
                 if status.contents.len() >= 2 {
                     let base = format!("{}{}Content", operation.pascal, status_name_part(status));
                     let name = fresh_name(used, base);
                     layout.content_enums.insert((op_index, status_index), name);
+                }
+                for (content_index, content) in status.contents.iter().enumerate() {
+                    if !is_stream_content(content) {
+                        continue;
+                    }
+                    // Every exposed stream entry owns a decoding wrapper
+                    // (§18–§20 Output A); multi-content statuses qualify the
+                    // name with the variant so entries never collide.
+                    let base = if status.contents.len() >= 2 {
+                        format!(
+                            "{}{}{}Stream",
+                            operation.pascal,
+                            status_name_part(status),
+                            content.variant_name
+                        )
+                    } else {
+                        format!("{}{}Stream", operation.pascal, status_name_part(status))
+                    };
+                    let name = fresh_name(used, base);
+                    layout
+                        .stream_wrappers
+                        .insert((op_index, status_index, content_index), name);
                 }
                 if let Some(name) = wrapper_name(status) {
                     let name = fresh_name(used, format!("{}{}", operation.pascal, name));
@@ -135,6 +174,29 @@ impl Layout {
     fn request_struct(&self, op_index: usize) -> Option<&str> {
         self.request_structs.get(&op_index).map(String::as_str)
     }
+
+    fn request_stream_body(&self, op_index: usize, content_index: usize) -> Option<&str> {
+        self.request_stream_bodies
+            .get(&(op_index, content_index))
+            .map(String::as_str)
+    }
+
+    fn stream_wrapper(
+        &self,
+        op_index: usize,
+        status_index: usize,
+        content_index: usize,
+    ) -> Option<&str> {
+        self.stream_wrappers
+            .get(&(op_index, status_index, content_index))
+            .map(String::as_str)
+    }
+}
+
+/// True when this entry is one of the three streaming record classes
+/// (§5.6–§5.8).
+fn is_stream_content(content: &PlannedContent) -> bool {
+    content.stream.is_some()
 }
 
 /// Statuses whose payload owns a wrapper struct named `<Op><Status>`
@@ -216,6 +278,12 @@ struct Flags {
     /// A multipart request body exists somewhere (main spec §17): pulls in
     /// the `reqwest::multipart` form builder plus the per-part mime helper.
     needs_multipart: bool,
+    /// Streaming record classes used by RESPONSE entries somewhere: pulls in
+    /// the per-framing support decoder + decode-error import pair.
+    response_framings: BTreeSet<StreamFraming>,
+    /// Streaming record classes used by REQUEST entries somewhere: pulls in
+    /// the per-framing bounded item encoder plus the lazy send adapter.
+    request_framings: BTreeSet<StreamFraming>,
 }
 
 impl Flags {
@@ -277,6 +345,16 @@ impl Flags {
             }
             MediaClass::PlainText => self.needs_body_limit_direction = true,
             MediaClass::Binary | MediaClass::RawUnknown => {}
+            // §6 request-direction streams (D-impl-request-direction-streams):
+            // items encode lazily through the per-framing bounded encoder.
+            _ if content.stream.is_some() => {
+                if let Some(stream) = &content.stream {
+                    self.request_framings.insert(stream.framing);
+                    self.model_types
+                        .extend(model_type_names(&stream.item_model_path));
+                }
+                self.needs_body_limit_direction = true;
+            }
             // Planning rejects the rest; unreachable here.
             _ => {}
         }
@@ -320,6 +398,15 @@ impl Flags {
                 }
                 MediaClass::PlainText => self.needs_collect = true,
                 MediaClass::Binary | MediaClass::RawUnknown => {}
+                // §18/§19/§20 Output A: response-backed incremental decoders
+                // behind the `<Op><Status>Stream` wrappers.
+                _ if content.stream.is_some() => {
+                    if let Some(stream) = &content.stream {
+                        self.response_framings.insert(stream.framing);
+                        self.model_types
+                            .extend(model_type_names(&stream.item_model_path));
+                    }
+                }
                 _ => {}
             }
         }
@@ -420,11 +507,21 @@ fn emit_header(emitter: &mut Emitter, doc: &NormalizedDocument, flags: &Flags) {
     if flags.needs_collect {
         imports.push("use ::openapi_support::collect::collect_reqwest_limited;".to_owned());
     }
+    // rustfmt orders these use items alphabetically by canonical path;
+    // each insertion below keeps that total order stable.
     if flags.needs_serialize_form {
         imports.push("use ::openapi_support::encode::serialize_form_limited;".to_owned());
     }
     if flags.needs_serialize_json {
         imports.push("use ::openapi_support::encode::serialize_json_limited;".to_owned());
+    }
+    let mut stream_error_imports = Vec::new();
+    if flags.response_framings.contains(&StreamFraming::JsonSeq) {
+        imports.push("use ::openapi_support::jsonseq::decode_jsonseq;".to_owned());
+        stream_error_imports.push("JsonSeqDecodeError");
+    }
+    if flags.request_framings.contains(&StreamFraming::JsonSeq) {
+        imports.push("use ::openapi_support::jsonseq::encode_jsonseq_item;".to_owned());
     }
     imports.push("use ::openapi_support::limits::BodyLimits;".to_owned());
     if flags.needs_content_type_helpers {
@@ -435,6 +532,27 @@ fn emit_header(emitter: &mut Emitter, doc: &NormalizedDocument, flags: &Flags) {
         } else {
             imports.push("use ::openapi_support::mediatype::ParsedMediaType;".to_owned());
         }
+    }
+    if flags.response_framings.contains(&StreamFraming::Ndjson) {
+        imports.push("use ::openapi_support::ndjson::decode_ndjson;".to_owned());
+        stream_error_imports.push("NdjsonDecodeError");
+    }
+    if flags.request_framings.contains(&StreamFraming::Ndjson) {
+        imports.push("use ::openapi_support::ndjson::encode_ndjson_item;".to_owned());
+    }
+    if flags.response_framings.contains(&StreamFraming::Sse) {
+        imports.push("use ::openapi_support::sse::decode_sse_json;".to_owned());
+        stream_error_imports.push("SseDecodeError");
+    }
+    if flags.request_framings.contains(&StreamFraming::Sse) {
+        imports.push("use ::openapi_support::sse::encode_sse_event;".to_owned());
+    }
+    if !stream_error_imports.is_empty() {
+        // Decode-error enums live beside ServerStreamError (§40).
+        imports.push(format!(
+            "use ::openapi_support::stream_errors::{{{}}};",
+            stream_error_imports.join(", ")
+        ));
     }
 
     let mut params: Vec<String> = Vec::new();
@@ -1073,7 +1191,23 @@ fn emit_operation_definitions(
 ) {
     emitter.blank();
     let mut first = true;
+    for (content_index, content) in operation.request_contents.iter().enumerate() {
+        if let Some(stream) = &content.stream {
+            let alias = layout
+                .request_stream_body(op_index, content_index)
+                .expect("stream request body registered")
+                .to_owned();
+            if !first {
+                emitter.blank();
+            }
+            emit_request_stream_alias(emitter, operation, stream, &alias);
+            first = false;
+        }
+    }
     if operation.request_body_enum_name.is_some() {
+        if !first {
+            emitter.blank();
+        }
         emit_request_body_enum(emitter, op_index, operation, layout);
         first = false;
     }
@@ -1094,7 +1228,15 @@ fn emit_operation_definitions(
             if !first {
                 emitter.blank();
             }
-            emit_content_enum(emitter, operation, status, name);
+            emit_content_enum(
+                emitter,
+                op_index,
+                status_index,
+                operation,
+                status,
+                layout,
+                name,
+            );
             first = false;
         }
         if let Some(name) = layout.wrappers.get(&(op_index, status_index)) {
@@ -1104,11 +1246,78 @@ fn emit_operation_definitions(
             emit_wrapper(emitter, operation, status, name);
             first = false;
         }
+        for (content_index, content) in status.contents.iter().enumerate() {
+            let Some(name) = layout.stream_wrapper(op_index, status_index, content_index) else {
+                continue;
+            };
+            if !first {
+                emitter.blank();
+            }
+            emit_stream_wrapper(emitter, operation, status, name, content);
+            first = false;
+        }
     }
     if !first {
         emitter.blank();
     }
     emit_response_enum(emitter, op_index, operation, layout);
+}
+
+/// The `<Op><Framing>Body` boxed item-stream alias (§6 request-direction
+/// streams; D-impl-request-direction-streams). Recorded shape decision: the
+/// ERASED boxed form — `Pin<Box<dyn Stream<Item = ItemType> + Send>>` —
+/// rather than a generic `<S>` parameter, so operation signatures (and any
+/// request-body enum) stay non-generic and the lazy per-item encoder can
+/// rely on the pinned stream being `Unpin`. Producers wrap their stream in
+/// `Box::pin(...)`; bounds mirror `::reqwest::Body::wrap_stream` (`Send` +
+/// `'static`, no `Sync`). Items encode lazily per send through the bounded
+/// per-item encoder: the FIRST item serializes before any wire traffic
+/// (overflow → `ClientError::BodyTooLarge{Encode}` without sending, §34.2),
+/// later items encode mid-send where overflow aborts the body after prior
+/// chunks.
+fn emit_request_stream_alias(
+    emitter: &mut Emitter,
+    operation: &PlannedOperation,
+    stream: &super::plan::PlannedStream,
+    alias: &str,
+) {
+    emitter.docs(
+        0,
+        &[format!(
+            "Streamed `{}` request items for `{}` (main spec §6/§18.1): \
+                 boxed erased item stream handed to the generated method. \
+                 Items encode lazily with a per-item bound of \
+                 `max_stream_record_bytes` (§34.2 pre-send head check, then \
+                 mid-send lazy encode).",
+            stream.framing.as_snake(),
+            operation.method
+        )],
+    );
+    let item = &stream.item_model_path;
+    let one_line = format!(
+        "pub type {alias} = ::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = {item}> \
+         + ::std::marker::Send>>;"
+    )
+    .replace(" \\", "");
+    if fits(0, &one_line) {
+        emitter.line(0, &one_line);
+    } else {
+        let tail =
+            format!("::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = {item}> + ::std::marker::Send>>;");
+        emitter.line(0, &format!("pub type {alias} ="));
+        if fits(1, &tail) {
+            emitter.line(1, &tail);
+        } else {
+            emitter.line(1, "::std::pin::Pin<");
+            emitter.line(2, "Box<");
+            emitter.line(
+                3,
+                &format!("dyn ::futures_core::Stream<Item = {item}> + ::std::marker::Send,"),
+            );
+            emitter.line(2, ">,");
+            emitter.line(1, ">;");
+        }
+    }
 }
 
 fn emit_request_body_enum(
@@ -1124,16 +1333,25 @@ fn emit_request_body_enum(
         0,
         &[format!(
             "Request payloads for `{}` (main spec §12/§43): owning variants \
-                 (D-§51.3); streaming variants attach `reqwest::Body` verbatim.",
+                 (D-§51.3); streaming variants attach `reqwest::Body` or a \
+                 boxed item-stream verbatim.",
             operation.method
         )],
     );
-    emitter.line(0, "#[derive(Debug)]");
+    // Streamed item-stream aliases carry no `Debug` implementation, so the
+    // enum derives `Debug` only when every variant does.
+    if operation
+        .request_contents
+        .iter()
+        .all(|content| content.stream.is_none())
+    {
+        emitter.line(0, "#[derive(Debug)]");
+    }
     emitter.line(0, &format!("pub enum {enum_name} {{"));
-    for content in &operation.request_contents {
+    for (content_index, content) in operation.request_contents.iter().enumerate() {
         let payload = match content.media_class {
             MediaClass::Multipart => layout.request_struct(op_index).unwrap_or("()").to_owned(),
-            _ => request_payload_type(content),
+            _ => request_payload_type(content, layout, op_index, content_index),
         };
         emitter.line(1, &format!("{}({}),", content.variant_name, payload));
     }
@@ -1141,13 +1359,20 @@ fn emit_request_body_enum(
 }
 
 /// Client-side payload type of one request media entry (§6 summary table).
-fn request_payload_type(content: &PlannedContent) -> String {
+fn request_payload_type(
+    content: &PlannedContent,
+    layout: &Layout,
+    op_index: usize,
+    content_index: usize,
+) -> String {
     match content.media_class {
         MediaClass::JsonFamily | MediaClass::UrlEncodedForm => content.model_expr.clone(),
         MediaClass::PlainText => "String".to_owned(),
         MediaClass::Binary | MediaClass::RawUnknown => "::reqwest::Body".to_owned(),
-        // Planning rejects the rest before emission.
-        _ => "()".to_owned(),
+        _ => layout
+            .request_stream_body(op_index, content_index)
+            .expect("stream request body registered")
+            .to_owned(),
     }
 }
 
@@ -1375,8 +1600,11 @@ fn emit_from_file_ctor(
 
 fn emit_content_enum(
     emitter: &mut Emitter,
+    op_index: usize,
+    status_index: usize,
     operation: &PlannedOperation,
     status: &PlannedStatus,
+    layout: &Layout,
     name: &str,
 ) {
     emitter.docs(
@@ -1388,15 +1616,24 @@ fn emit_content_enum(
             operation.method
         )],
     );
-    emitter.line(0, "#[derive(Debug)]");
+    // Streamed item-stream wrappers carry no `Debug` implementation, so the
+    // enum derives `Debug` only when every variant does.
+    if status
+        .contents
+        .iter()
+        .all(|content| content.stream.is_none())
+    {
+        emitter.line(0, "#[derive(Debug)]");
+    }
     emitter.line(0, &format!("pub enum {name} {{"));
-    for content in &status.contents {
+    for (content_index, content) in status.contents.iter().enumerate() {
+        let wrapper = layout.stream_wrapper(op_index, status_index, content_index);
         emitter.line(
             1,
             &format!(
                 "{}({}),",
                 content.variant_name,
-                response_payload_type(content)
+                response_payload_type(content, wrapper)
             ),
         );
     }
@@ -1405,14 +1642,292 @@ fn emit_content_enum(
 
 /// Client-side payload type of one response media entry (§7 summary table):
 /// bounded models/`String` for structured classes, owned raw
-/// `reqwest::Response` for streaming classes (§32).
-fn response_payload_type(content: &PlannedContent) -> String {
+/// `reqwest::Response` for streaming classes (§32), and the decoding
+/// `<…>Stream` wrapper for the record-framed classes (§18–§20 Output A).
+fn response_payload_type(content: &PlannedContent, stream_wrapper: Option<&str>) -> String {
     match content.media_class {
         MediaClass::JsonFamily => content.model_expr.clone(),
         MediaClass::PlainText => "String".to_owned(),
         MediaClass::Binary | MediaClass::RawUnknown => "::reqwest::Response".to_owned(),
-        _ => "()".to_owned(),
+        _ => stream_wrapper
+            .expect("stream wrapper registered for every exposed stream entry")
+            .to_owned(),
     }
+}
+
+/// Emits the rustfmt-canonical EXPRESSION arm constructing a `<…>Stream`
+/// wrapper (rustfmt collapses single-expression block arms, so these never
+/// take block form). Two layouts, chosen by width: keep the enum path on the
+/// arm line with the struct literal fields broken vertically; only when that
+/// head exceeds the budget does the enum path break after `Ok(`.
+#[allow(clippy::too_many_arguments)]
+fn emit_stream_wrapper_arm(
+    emitter: &mut Emitter,
+    indent: usize,
+    pattern: &str,
+    operation: &PlannedOperation,
+    status: &PlannedStatus,
+    layout: &Layout,
+    op_index: usize,
+    status_index: usize,
+    wrapper: &str,
+) {
+    let _ = layout;
+    let _ = op_index;
+    let _ = status_index;
+    let enum_name = &operation.response_enum_name;
+    let variant = &status.enum_variant;
+    if struct_variant_status(status) {
+        // Range/default struct variants carry `status` beside the wrapper.
+        emitter.line(indent, &format!("{pattern} Ok({enum_name}::{variant} {{"));
+        emitter.line(indent + 1, "status,");
+        emit_stream_wrapper_literal_fields(emitter, indent + 1, "body", wrapper);
+        emitter.line(indent, "}),");
+        return;
+    }
+    let head_a = format!("{pattern} Ok({enum_name}::{variant}({wrapper} {{");
+    if fits(indent, &head_a) {
+        emitter.line(indent, &head_a);
+        emitter.line(indent + 1, "response,");
+        emitter.line(indent + 1, "limits: self.limits,");
+        emitter.line(indent, "})),");
+    } else {
+        emitter.line(indent, &format!("{pattern} Ok({enum_name}::{variant}("));
+        emitter.line(indent + 1, &format!("{wrapper} {{"));
+        emitter.line(indent + 2, "response,");
+        emitter.line(indent + 2, "limits: self.limits,");
+        emitter.line(indent + 1, "},");
+        emitter.line(indent, ")),");
+    }
+}
+
+/// The two trailing fields of an inline `<…>Stream` literal under `field:`.
+fn emit_stream_wrapper_literal_fields(
+    emitter: &mut Emitter,
+    indent: usize,
+    field: &str,
+    wrapper: &str,
+) {
+    emitter.line(indent, &format!("{field}: {wrapper} {{"));
+    emitter.line(indent + 1, "response,");
+    emitter.line(indent + 1, "limits: self.limits,");
+    emitter.line(indent, "}},");
+}
+
+/// Emits one `<Op><Status>[<Variant>]Stream` wrapper plus its incremental
+/// decode method (§18–§20 Output A): owns the raw response and a stored
+/// [`BodyLimits`] whose `max_stream_record_bytes` bounds every decoded
+/// record; nothing ever aggregates the body.
+fn emit_stream_wrapper(
+    emitter: &mut Emitter,
+    operation: &PlannedOperation,
+    status: &PlannedStatus,
+    name: &str,
+    content: &PlannedContent,
+) {
+    let stream = content.stream.as_ref().expect("stream entry");
+    let framing = stream.framing;
+    let item = &stream.item_model_path;
+    let error_type = match framing {
+        StreamFraming::Sse => "SseDecodeError",
+        StreamFraming::Ndjson => "NdjsonDecodeError",
+        StreamFraming::JsonSeq => "JsonSeqDecodeError",
+    };
+    let decode_call = match framing {
+        StreamFraming::Sse => "decode_sse_json",
+        StreamFraming::Ndjson => "decode_ndjson",
+        StreamFraming::JsonSeq => "decode_jsonseq",
+    };
+    let method = format!("into_{}_stream", framing.as_snake());
+    emitter.docs(
+        0,
+        &[format!(
+            "Streaming payload for status {} of `{}` (main spec §{} Output \
+             A): owns the response; `{method}` decodes items incrementally, \
+             bounding each record by `max_stream_record_bytes` — never \
+             collecting the body.",
+            crate::normalize::status_label(&status.key),
+            operation.method,
+            match framing {
+                StreamFraming::Sse => "18",
+                StreamFraming::Ndjson => "19",
+                StreamFraming::JsonSeq => "20",
+            }
+        )],
+    );
+    emitter.line(0, "#[derive(Debug)]");
+    emitter.line(0, &format!("pub struct {name} {{"));
+    emit_header_fields(emitter, status, 1);
+    emitter.line(1, "pub response: ::reqwest::Response,");
+    emitter.line(1, "pub limits: BodyLimits,");
+    emitter.line(0, "}");
+    emitter.blank();
+    emitter.line(0, &format!("impl {name} {{"));
+    emitter.docs(
+        1,
+        &[format!(
+            "Consumes the wrapper into the incremental `{}` item stream.",
+            framing.as_snake()
+        )],
+    );
+    // NOTE: deliberately no `#[must_use]` — the returned opaque
+    // `impl Stream` is already `must_use`, and a bare attribute here trips
+    // clippy::double_must_use under `-D warnings`.
+    emitter.line(1, &format!("pub fn {method}("));
+    emitter.line(2, "self,");
+    let tail = format!(") -> impl ::futures_core::Stream<Item = Result<{item}, {error_type}>> {{");
+    if fits(1, &tail) {
+        emitter.line(1, &tail);
+    } else {
+        // rustfmt breaks the impl-Trait argument list vertically once the
+        // whole tail exceeds the width budget.
+        emitter.line(1, ") -> impl ::futures_core::Stream<");
+        emitter.line(2, &format!("Item = Result<{item}, {error_type}>,"));
+        emitter.line(1, "> {");
+    }
+    // §40 client-visible effect: the classifier around the decoder remaps
+    // hyper READ-side premature body ends to `{error_type}::Truncated`;
+    // every other transport failure stays `Source`.
+    let classify_call = format!("classify_{}_premature_ends", framing.as_snake());
+    let decode_head = format!("{decode_call}::<{item}, _, _>(");
+    if fits(2, &format!("{classify_call}({decode_head}")) {
+        // Nested-call form: the classifier wraps the whole decoder call.
+        emitter.line(2, &format!("{classify_call}({decode_head}"));
+        emitter.line(3, "self.response.bytes_stream(),");
+        emitter.line(3, "self.limits.max_stream_record_bytes,");
+        emitter.line(2, "))");
+    } else {
+        // Both heads break vertically once the item path outgrows the width.
+        emitter.line(2, &format!("{classify_call}("));
+        emitter.line(3, &decode_head);
+        emitter.line(4, "self.response.bytes_stream(),");
+        emitter.line(4, "self.limits.max_stream_record_bytes,");
+        emitter.line(3, "),");
+        emitter.line(2, ")");
+    }
+    emitter.line(1, "}");
+    emitter.line(0, "}");
+}
+
+/// Emits the shared §40 predicate used by every per-framing classifier: one
+/// thin alias over the support crate's hyper-aware READ-side classification
+/// (`hyper::Error::is_incomplete_message` walked across the source chain).
+fn emit_premature_end_predicate(emitter: &mut Emitter) {
+    emitter.docs(
+        0,
+        &[
+            "One predicate shared by every framing classifier (main spec §40): \
+             delegates to the support crate's hyper-aware READ-side \
+             premature-body-end classification."
+                .to_owned(),
+        ],
+    );
+    emitter.line(
+        0,
+        "fn premature_body_end(error: &(dyn ::std::error::Error + Send + Sync + 'static)) -> bool {",
+    );
+    emitter.line(
+        1,
+        "::openapi_support::transport_classify::is_premature_body_end(error)",
+    );
+    emitter.line(0, "}");
+}
+
+/// Emits the per-framing §40 truncation classifier for RESPONSE-direction
+/// stream adapters: a `Stream` combinator that remaps the framing's
+/// `Source(...)` terminal error to `Truncated` exactly when the boxed
+/// transport failure classifies as a hyper READ-side premature body end.
+fn emit_stream_truncation_classifier(emitter: &mut Emitter, framing: StreamFraming) {
+    let snake = framing.as_snake();
+    let pascal = framing.as_pascal();
+    let error_type = match framing {
+        StreamFraming::Sse => "SseDecodeError",
+        StreamFraming::Ndjson => "NdjsonDecodeError",
+        StreamFraming::JsonSeq => "JsonSeqDecodeError",
+    };
+    emitter.docs(
+        0,
+        &[
+            format!("Remaps ONE decoded item of the `{snake}` stream (main spec §40): hyper READ-side premature body ends — the connection closed before the promised message completed — become `{error_type}::Truncated`; every other transport failure keeps flowing through as `{error_type}::Source` with its cause preserved."),
+        ],
+    );
+    emitter.line(
+        0,
+        &format!(
+            "fn remap_{snake}_item<T>(item: Result<T, {error_type}>) -> Result<T, {error_type}> {{"
+        ),
+    );
+    emitter.line(1, "match item {");
+    emitter.line(2, "Ok(value) => Ok(value),");
+    emitter.line(
+        2,
+        &format!("Err({error_type}::Source(source)) if premature_body_end(source.as_ref()) => {{"),
+    );
+    emitter.line(3, &format!("Err({error_type}::Truncated)"));
+    emitter.line(2, "}");
+    emitter.line(2, "other => other,");
+    emitter.line(1, "}");
+    emitter.line(0, "}");
+    emitter.blank();
+    emitter.docs(
+        0,
+        &[
+            format!("Wraps one `{snake}` decoder so transport failures are classified once at the adapter boundary (main spec §40 client-visible effect): truncation is never mistaken for clean end-of-stream or an opaque transport fault."),
+        ],
+    );
+    emitter.line(0, &format!("struct Classify{pascal}PrematureEnds<S> {{"));
+    emitter.line(1, "inner: ::std::pin::Pin<Box<S>>,");
+    emitter.line(0, "}");
+    emitter.blank();
+    emitter.line(
+        0,
+        &format!("impl<S, T> ::futures_core::Stream for Classify{pascal}PrematureEnds<S>"),
+    );
+    emitter.line(0, "where");
+    emitter.line(
+        1,
+        &format!("S: ::futures_core::Stream<Item = Result<T, {error_type}>>,"),
+    );
+    emitter.line(0, "{");
+    emitter.line(1, &format!("type Item = Result<T, {error_type}>;"));
+    emitter.blank();
+    emitter.line(1, "fn poll_next(");
+    emitter.line(2, "self: ::std::pin::Pin<&mut Self>,");
+    emitter.line(2, "cx: &mut ::core::task::Context<'_>,");
+    emitter.line(1, ") -> ::core::task::Poll<Option<Self::Item>> {");
+    emitter.line(2, "self.get_mut()");
+    emitter.line(3, ".inner");
+    emitter.line(3, ".as_mut()");
+    emitter.line(3, ".poll_next(cx)");
+    emitter.line(
+        3,
+        &format!(".map(|option| option.map(remap_{snake}_item::<T>))"),
+    );
+    emitter.line(1, "}");
+    emitter.line(0, "}");
+    emitter.blank();
+    emitter.docs(
+        0,
+        &[format!(
+            "Classifies transport failures beneath one `{snake}` decoder (main spec §40)."
+        )],
+    );
+    emitter.line(
+        0,
+        &format!(
+            "fn classify_{snake}_premature_ends<S, T>(inner: S) -> Classify{pascal}PrematureEnds<S>"
+        ),
+    );
+    emitter.line(0, "where");
+    emitter.line(
+        1,
+        &format!("S: ::futures_core::Stream<Item = Result<T, {error_type}>>,"),
+    );
+    emitter.line(0, "{");
+    emitter.line(1, &format!("Classify{pascal}PrematureEnds {{"));
+    emitter.line(2, "inner: Box::pin(inner),");
+    emitter.line(1, "}");
+    emitter.line(0, "}");
 }
 
 fn emit_wrapper(
@@ -1461,7 +1976,10 @@ fn emit_wrapper(
     if streaming {
         emitter.line(1, "pub response: ::reqwest::Response,");
     } else {
-        emitter.line(1, &format!("pub body: {},", response_payload_type(content)));
+        emitter.line(
+            1,
+            &format!("pub body: {},", response_payload_type(content, None)),
+        );
     }
     emitter.line(0, "}");
     if !streaming {
@@ -1529,6 +2047,17 @@ fn emit_response_enum(
         )],
     );
     emitter.line(0, "#[derive(Debug)]");
+    if operation.statuses.iter().any(|status| {
+        status
+            .contents
+            .iter()
+            .any(|content| content.stream.is_some())
+    }) {
+        // The `<…>Stream` wrapper variant is intentionally larger than the
+        // decoded-error variants (response + stored limits); the size gap is
+        // the documented shape, not an accident to box away.
+        emitter.line(0, "#[allow(clippy::large_enum_variant)]");
+    }
     emitter.line(0, &format!("pub enum {} {{", operation.response_enum_name));
     for (status_index, status) in operation.statuses.iter().enumerate() {
         emit_variant_doc(emitter, status);
@@ -1550,7 +2079,10 @@ fn emit_response_enum(
                 0 => {}
                 _ => {
                     let body_type = match status.contents.len() {
-                        1 => response_payload_type(&status.contents[0]),
+                        1 => response_payload_type(
+                            &status.contents[0],
+                            layout.stream_wrapper(op_index, status_index, 0),
+                        ),
                         _ => layout
                             .content_enums
                             .get(&(op_index, status_index))
@@ -1590,7 +2122,10 @@ fn emit_response_enum(
                 emitter.line(1, &format!("{},", status.enum_variant));
             }
             1 => {
-                let payload = response_payload_type(&status.contents[0]);
+                let payload = response_payload_type(
+                    &status.contents[0],
+                    layout.stream_wrapper(op_index, status_index, 0),
+                );
                 emitter.line(1, &format!("{}({payload}),", status.enum_variant));
             }
             _ => {
@@ -1702,7 +2237,8 @@ fn signature_arguments(
                 }
             }
             (None, Some(content)) => {
-                let base = request_parameter_type(content, layout, op_index);
+                let content_index = 0; // single-content operations only reach here
+                let base = request_parameter_type(content, layout, op_index, content_index);
                 if operation.request_body_required {
                     base
                 } else {
@@ -1722,8 +2258,15 @@ fn signature_arguments(
 /// Direct request-parameter type for single-content operations (§6 table):
 /// `&T` for JSON and forms (D-§51.3 convenience), the owned `<Op>Request`
 /// input struct for multipart (§17 Output A), `&str` for text, owned
-/// `reqwest::Body` for streaming payloads.
-fn request_parameter_type(content: &PlannedContent, layout: &Layout, op_index: usize) -> String {
+/// `reqwest::Body` for streaming payloads, and the boxed `<Op><Framing>Body`
+/// item-stream alias for record-framed bodies
+/// (D-impl-request-direction-streams).
+fn request_parameter_type(
+    content: &PlannedContent,
+    layout: &Layout,
+    op_index: usize,
+    content_index: usize,
+) -> String {
     match content.media_class {
         MediaClass::JsonFamily | MediaClass::UrlEncodedForm => {
             format!("&{}", content.model_expr)
@@ -1731,7 +2274,10 @@ fn request_parameter_type(content: &PlannedContent, layout: &Layout, op_index: u
         MediaClass::Multipart => layout.request_struct(op_index).unwrap_or("()").to_owned(),
         MediaClass::PlainText => "&str".to_owned(),
         MediaClass::Binary | MediaClass::RawUnknown => "::reqwest::Body".to_owned(),
-        _ => "()".to_owned(),
+        _ => layout
+            .request_stream_body(op_index, content_index)
+            .expect("stream request body registered")
+            .to_owned(),
     }
 }
 
@@ -2055,9 +2601,14 @@ fn emit_request_construction(
         .request_contents
         .first()
         .is_some_and(|content| content.media_class == MediaClass::Multipart);
+    let is_stream_request = operation
+        .request_contents
+        .first()
+        .is_some_and(|content| content.stream.is_some());
     let needs_rebinding = multi_body
         || optional_single
         || is_multipart
+        || is_stream_request
         || !header_parameters.is_empty()
         || !cookie_parameters.is_empty();
 
@@ -2276,7 +2827,9 @@ fn emit_body_assignment(emitter: &mut Emitter, operation: &PlannedOperation, fla
 /// Single-payload assignment on the rebound request builder. Required JSON
 /// and form bodies were already bounded-encoded before `request` existed
 /// (`payload` binding); optional bodies serialize HERE so an encode overflow
-/// still returns before any wire traffic (§34.2).
+/// still returns before any wire traffic (§34.2). Streamed record bodies
+/// eagerly encode their first item here (same §34.2 guarantee) and hand the
+/// rest to the lazy mid-send encoder.
 fn emit_single_request_body(
     emitter: &mut Emitter,
     indent: usize,
@@ -2299,6 +2852,11 @@ fn emit_single_request_body(
         }
         _ => {}
     }
+    if content.stream.is_some() {
+        // Streamed record bodies bind the lazy encoder first so the eager
+        // head encode precedes any builder mutation (§34.2).
+        emit_stream_head_encode(emitter, indent, content, "body", flags);
+    }
     emitter.line(indent, "request = request");
     match content.media_class {
         MediaClass::JsonFamily | MediaClass::UrlEncodedForm => {
@@ -2317,6 +2875,16 @@ fn emit_single_request_body(
                 ".header(::http::header::CONTENT_TYPE, \"text/plain\")",
             );
             emitter.line(indent + 1, ".body(body.to_owned());");
+        }
+        _ if content.stream.is_some() => {
+            emitter.line(
+                indent + 1,
+                &format!(
+                    ".header(::http::header::CONTENT_TYPE, {})",
+                    rust_string_literal(&content.media_type_literal)
+                ),
+            );
+            emitter.line(indent + 1, ".body(::reqwest::Body::wrap_stream(encoder));");
         }
         _ => {
             emitter.line(
@@ -2405,6 +2973,21 @@ fn emit_request_enum_arm(
             let spec = content.multipart_spec.as_ref();
             emit_multipart_form_build(emitter, indent + 1, "value", spec, flags);
             emitter.line(indent + 1, "request.multipart(form)");
+            emitter.line(indent, "}");
+        }
+        _ if content.stream.is_some() => {
+            // §6 request-direction streams: eager head encode, then the lazy
+            // per-item encoder streams the remainder mid-send.
+            emitter.line(indent, &format!("{variant}(items) => {{"));
+            emit_stream_head_encode(emitter, indent + 1, content, "items", flags);
+            emitter.line(indent + 1, "request");
+            emit_chain_header(
+                emitter,
+                indent + 2,
+                "::http::header::CONTENT_TYPE",
+                &content.media_type_literal,
+            );
+            emitter.line(indent + 2, ".body(::reqwest::Body::wrap_stream(encoder))");
             emitter.line(indent, "}");
         }
         _ => {
@@ -2629,6 +3212,44 @@ fn emit_status_arm(
     };
 
     if let [content] = status.contents.as_slice() {
+        if content.stream.is_some() {
+            let wrapper = layout
+                .stream_wrapper(op_index, status_index, 0)
+                .expect("stream wrapper registered")
+                .to_owned();
+            if has_headers {
+                // Typed headers are read BEFORE handing the raw response to
+                // the wrapper (main spec §15).
+                emitter.line(3, &format!("{pattern} {{"));
+                emit_header_binds(emitter, 4, status);
+                emit_typed_wrapper_result(
+                    emitter,
+                    4,
+                    operation,
+                    status,
+                    status_index,
+                    layout,
+                    op_index,
+                    &["response,", "limits: self.limits,"],
+                );
+                emitter.line(3, "}");
+                return;
+            }
+            // rustfmt collapses single-expression block arms, so stream
+            // results are emitted directly in canonical expression form.
+            emit_stream_wrapper_arm(
+                emitter,
+                3,
+                &pattern,
+                operation,
+                status,
+                layout,
+                op_index,
+                status_index,
+                &wrapper,
+            );
+            return;
+        }
         if matches!(
             content.media_class,
             MediaClass::Binary | MediaClass::RawUnknown
@@ -2646,7 +3267,7 @@ fn emit_status_arm(
                     status_index,
                     layout,
                     op_index,
-                    "response,",
+                    &["response,"],
                 );
                 emitter.line(3, "}");
                 return;
@@ -2791,8 +3412,8 @@ fn emit_header_binds(emitter: &mut Emitter, indent: usize, status: &PlannedStatu
 
 /// Emits the `Ok(<Enum>::<Variant>(<Wrapper> {{ ... }}))` construction for a
 /// status whose typed wrapper carries documented headers beside its payload;
-/// `inner_line` is the trailing field (`response,` for streaming payloads or
-/// `body: value,` for decoded ones).
+/// `inner_lines` are the trailing fields (`response,` plus the stored limits
+/// for streaming payloads, or `body: value,` for decoded ones).
 #[allow(clippy::too_many_arguments)]
 fn emit_typed_wrapper_result(
     emitter: &mut Emitter,
@@ -2802,7 +3423,7 @@ fn emit_typed_wrapper_result(
     status_index: usize,
     layout: &Layout,
     op_index: usize,
-    inner_line: &str,
+    inner_lines: &[&str],
 ) {
     let wrapper = layout
         .wrappers
@@ -2816,7 +3437,9 @@ fn emit_typed_wrapper_result(
         ),
     );
     emit_wrapper_fields(emitter, indent + 1, status);
-    emitter.line(indent + 1, inner_line);
+    for line in inner_lines {
+        emitter.line(indent + 1, line);
+    }
     emitter.line(indent, "}))");
 }
 
@@ -2998,7 +3621,7 @@ fn emit_result_line(
                 status_index,
                 layout,
                 op_index,
-                "body: value,",
+                &["body: value,"],
             );
             return;
         }
@@ -3130,6 +3753,38 @@ fn emit_text_len_check(emitter: &mut Emitter, indent: usize, value_expr: &str) {
     emitter.line(indent, "}");
 }
 
+/// Attaches one streamed record body to the rebound request builder
+/// (§6 request-direction streams, D-impl-request-direction-streams): the
+/// eager FIRST-item encode happens inside the generated
+/// `stream_request_encoder` helper so an overflow still returns
+/// `ClientError::BodyTooLarge` before any wire traffic (§34.2); later items
+/// encode lazily mid-send, where an overflow aborts the body after prior
+/// chunks.
+fn emit_stream_head_encode(
+    emitter: &mut Emitter,
+    indent: usize,
+    content: &PlannedContent,
+    value_expr: &str,
+    flags: &mut Flags,
+) {
+    let stream = content.stream.as_ref().expect("stream entry");
+    flags.request_framings.insert(stream.framing);
+    flags.needs_encode_overflow = true;
+    flags.needs_body_limit_direction = true;
+    let encode_fn = match stream.framing {
+        StreamFraming::Sse => "encode_sse_event",
+        StreamFraming::Ndjson => "encode_ndjson_item",
+        StreamFraming::JsonSeq => "encode_jsonseq_item",
+    };
+    let item = &stream.item_model_path;
+    emitter.line(indent, "let encoder = stream_request_encoder(");
+    emitter.line(indent + 1, &format!("{value_expr},"));
+    emitter.line(indent + 1, &format!("{encode_fn}::<{item}>,"));
+    emitter.line(indent + 1, "self.limits.max_stream_record_bytes,");
+    emitter.line(indent, ")");
+    emitter.line(indent, ".await?;");
+}
+
 /// Bounded collection plus typed decoding for one structured/text entry
 /// (Example 1 pattern); produces a `value` binding.
 fn emit_collect_and_decode(
@@ -3242,6 +3897,16 @@ fn emit_negotiated_arm_body(
                     &format!("{}(value)", content.variant_name),
                 );
             }
+            _ if content.stream.is_some() => {
+                let wrapper = layout
+                    .stream_wrapper(op_index, status_index, index)
+                    .expect("stream wrapper registered");
+                let payload = format!(
+                    "{}({wrapper} {{ response, limits: self.limits }})",
+                    content.variant_name
+                );
+                emit_negotiated_result(emitter, 6, operation, status, content_enum, &payload);
+            }
             _ => {
                 emit_negotiated_result(
                     emitter,
@@ -3322,6 +3987,30 @@ fn emit_wrapper_fields_opt(emitter: &mut Emitter, indent: usize, status: &Planne
 // ----------------------------------------------------------------------
 
 fn emit_module_helpers(emitter: &mut Emitter, flags: &Flags, has_variables: bool) {
+    // §40 response-direction classifiers precede everything else so each
+    // `<Op><Status>Stream` adapter can wrap its decoder.
+    if !flags.response_framings.is_empty() {
+        emitter.blank();
+        emit_premature_end_predicate(emitter);
+        for framing in [
+            StreamFraming::JsonSeq,
+            StreamFraming::Ndjson,
+            StreamFraming::Sse,
+        ] {
+            if flags.response_framings.contains(&framing) {
+                emitter.blank();
+                emit_stream_truncation_classifier(emitter, framing);
+            }
+        }
+    }
+    if !flags.request_framings.is_empty() {
+        emitter.blank();
+        emit_poll_items_helper(emitter);
+        emitter.blank();
+        emit_request_item_encoder(emitter);
+        emitter.blank();
+        emit_stream_request_encoder(emitter);
+    }
     if flags.needs_multipart {
         emitter.blank();
         emitter.docs(
@@ -3789,6 +4478,163 @@ fn emit_module_helpers(emitter: &mut Emitter, flags: &Flags, has_variables: bool
     );
     emitter.line(2, "})");
     emitter.line(2, "&& !rest.is_empty()");
+    emitter.line(0, "}");
+}
+
+/// Polls the next item of a boxed erased stream without extension traits
+/// (generated code imports no combinator crates).
+fn emit_poll_items_helper(emitter: &mut Emitter) {
+    emitter.docs(
+        0,
+        &[
+            "Polls the next item of a boxed erased item stream (main spec §6 \
+             request-direction streams)."
+                .to_owned(),
+        ],
+    );
+    emitter.line(0, "fn poll_items<T>(");
+    emitter.line(
+        1,
+        "items: &mut ::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = T> + ::std::marker::Send>>,",
+    );
+    emitter.line(
+        0,
+        ") -> impl ::std::future::Future<Output = Option<T>> + '_ {",
+    );
+    emitter.line(
+        1,
+        "::std::future::poll_fn(|cx| ::futures_core::Stream::poll_next(items.as_mut(), cx))",
+    );
+    emitter.line(0, "}");
+}
+
+/// The lazy per-item request encoder: yields each encoded item as its own
+/// body chunk; the head chunk was already encoded before the send, and a
+/// later overflow terminates the body after the prior chunks — never partial
+/// item bytes (§34.2, D-impl-request-direction-streams).
+fn emit_request_item_encoder(emitter: &mut Emitter) {
+    emitter.docs(
+        0,
+        &[
+            "Lazy mid-send encoder over one streamed record request body \
+           (§34.2): items encode one at a time under `limit`."
+                .to_owned(),
+        ],
+    );
+    emitter.line(0, "struct RequestItemEncoder<T> {");
+    emitter.line(
+        1,
+        "items: ::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = T> + ::std::marker::Send>>,",
+    );
+    emitter.line(1, "head: Option<::bytes::Bytes>,");
+    emitter.line(1, "limit: usize,");
+    emitter.line(
+        1,
+        "encode: fn(&T, usize) -> Result<::bytes::Bytes, ::openapi_support::encode::EncodeTooLarge>,",
+    );
+    emitter.line(1, "finished: bool,");
+    emitter.line(0, "}");
+    emitter.blank();
+    emitter.line(
+        0,
+        "impl<T: serde::Serialize> ::futures_core::Stream for RequestItemEncoder<T> {",
+    );
+    emitter.line(
+        1,
+        "type Item = Result<::bytes::Bytes, ::openapi_support::encode::EncodeTooLarge>;",
+    );
+    emitter.blank();
+    emitter.line(1, "fn poll_next(");
+    emitter.line(2, "self: ::std::pin::Pin<&mut Self>,");
+    emitter.line(2, "cx: &mut ::core::task::Context<'_>,");
+    emitter.line(1, ") -> ::core::task::Poll<Option<Self::Item>> {");
+    emitter.line(2, "let this = self.get_mut();");
+    emitter.line(2, "if this.finished {");
+    emitter.line(3, "return ::core::task::Poll::Ready(None);");
+    emitter.line(2, "}");
+    emitter.line(2, "if let Some(head) = this.head.take() {");
+    emitter.line(3, "return ::core::task::Poll::Ready(Some(Ok(head)));");
+    emitter.line(2, "}");
+    emitter.line(
+        2,
+        "match ::futures_core::Stream::poll_next(this.items.as_mut(), cx) {",
+    );
+    emitter.line(
+        3,
+        "::core::task::Poll::Pending => ::core::task::Poll::Pending,",
+    );
+    emitter.line(3, "::core::task::Poll::Ready(None) => {");
+    emitter.line(4, "this.finished = true;");
+    emitter.line(4, "::core::task::Poll::Ready(None)");
+    emitter.line(3, "}");
+    emitter.line(
+        3,
+        "::core::task::Poll::Ready(Some(item)) => match (this.encode)(&item, this.limit) {",
+    );
+    emitter.line(
+        4,
+        "Ok(bytes) => ::core::task::Poll::Ready(Some(Ok(bytes))),",
+    );
+    emitter.line(4, "Err(error) => {");
+    emitter.line(5, "this.finished = true;");
+    emitter.line(5, "::core::task::Poll::Ready(Some(Err(error)))");
+    emitter.line(4, "}");
+    emitter.line(3, "},");
+    emitter.line(2, "}");
+    emitter.line(1, "}");
+    emitter.line(0, "}");
+}
+
+/// Builds the lazy request-item encoder for one streamed record body,
+/// eagerly encoding the FIRST item so an overflow returns
+/// `ClientError::BodyTooLarge` BEFORE any wire traffic (§34.2); later items
+/// encode lazily mid-send.
+fn emit_stream_request_encoder(emitter: &mut Emitter) {
+    emitter.docs(
+        0,
+        &[
+            "Encodes the first item of one streamed record request body eagerly \
+           (§34.2: an oversized head returns `ClientError::BodyTooLarge` \
+           without sending anything) and hands the remaining items to the \
+           lazy mid-send encoder."
+                .to_owned(),
+        ],
+    );
+    emitter.docs(
+        0,
+        &[
+            "`encode` is the per-framing bounded item encoder; `limit` is \
+           `max_stream_record_bytes`."
+                .to_owned(),
+        ],
+    );
+    emitter.line(0, "#[allow(clippy::missing_errors_doc)]");
+    emitter.line(0, "async fn stream_request_encoder<T>(");
+    emitter.line(
+        1,
+        "items: ::std::pin::Pin<Box<dyn ::futures_core::Stream<Item = T> + ::std::marker::Send>>,",
+    );
+    emitter.line(
+        1,
+        "encode: fn(&T, usize) -> Result<::bytes::Bytes, ::openapi_support::encode::EncodeTooLarge>,",
+    );
+    emitter.line(1, "limit: usize,");
+    emitter.line(0, ") -> Result<RequestItemEncoder<T>, ClientError> {");
+    emitter.line(1, "let mut items = items;");
+    emitter.line(1, "let mut head = None;");
+    emitter.line(1, "if let Some(item) = poll_items(&mut items).await {");
+    emitter.line(2, "match encode(&item, limit) {");
+    emitter.line(3, "Ok(bytes) => head = Some(bytes),");
+    emitter.line(3, "Err(_) => return Err(encode_overflow_error(limit)),");
+    emitter.line(2, "}");
+    emitter.line(1, "}");
+    emitter.line(1, "Ok(RequestItemEncoder {");
+    emitter.line(2, "items,");
+    emitter.line(2, "head,");
+    emitter.line(2, "limit,");
+    emitter.line(2, "encode,");
+    emitter.line(2, "finished: false,");
+    emitter.line(1, "})");
     emitter.line(0, "}");
 }
 

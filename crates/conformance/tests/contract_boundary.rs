@@ -18,8 +18,8 @@ use openapi_support::optional::OptionalField;
 use tower::ServiceExt;
 
 fn router09(api: Arc<dyn fx09::server::Api>) -> axum::Router {
-    let (limits, hook) = common::router_args();
-    fx09::server::router(api, limits, hook)
+    let (limits, hook, stream_hook) = common::router_args();
+    fx09::server::router(api, limits, hook, stream_hook)
 }
 
 // ----------------------------------------------------------------------
@@ -280,8 +280,8 @@ async fn test45_gzip_content_encoding_rejected_with_415_before_decode() {
 
     let invocations = Arc::new(AtomicUsize::new(0));
     let api = Arc::new(NeverInvokedApp(invocations.clone()));
-    let (limits, hook) = common::router_args();
-    let router = fx01::server::router(api, limits, hook);
+    let (limits, hook, stream_hook) = common::router_args();
+    let router = fx01::server::router(api, limits, hook, stream_hook);
 
     // The body need not be valid gzip: identity-only content coding (§30.4)
     // rejects the HEADER before anything touches the body stream.
@@ -411,8 +411,8 @@ impl fx10::server::Api for CountingSessionsApp {
 async fn fixture_10_malformed_form_body_is_a_400_and_skips_the_handler() {
     let invocations = Arc::new(AtomicUsize::new(0));
     let api = Arc::new(CountingSessionsApp(invocations.clone()));
-    let (limits, hook) = common::router_args();
-    let router = fx10::server::router(api, limits, hook);
+    let (limits, hook, stream_hook) = common::router_args();
+    let router = fx10::server::router(api, limits, hook, stream_hook);
 
     let response = router
         .oneshot(
@@ -471,7 +471,8 @@ async fn fixture_10_oversized_form_body_is_a_413() {
         ..BodyLimits::process_default()
     };
     let hook = Arc::new(openapi_support::hooks::NoOpEncodeOverflowHook);
-    let router = fx10::server::router(api, tiny, hook);
+    let stream_hook = Arc::new(openapi_support::hooks::NoOpStreamFailureHook);
+    let router = fx10::server::router(api, tiny, hook, stream_hook);
 
     // 32 bytes of well-formed pairs — the size gate wins BEFORE parsing.
     let response = router
