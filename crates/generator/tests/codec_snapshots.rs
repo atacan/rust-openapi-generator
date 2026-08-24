@@ -173,17 +173,36 @@ fn codec_bound_statuses_never_own_streaming_wrappers() {
         let start = client
             .find(&format!("pub async fn {method}("))
             .unwrap_or_else(|| panic!("{tag}: method {method} missing"));
-        let next = client[start + 10..]
-            .find("pub async fn")
-            .map(|offset| start + 10 + offset)
+        // Since the §31 decode-tail factoring the shared `decode_<op>`
+        // helper follows each method; the METHOD block under inspection
+        // ends at whichever item comes first.
+        let next = ["pub async fn", "async fn decode_"]
+            .iter()
+            .filter_map(|marker| {
+                client[start + 10..]
+                    .find(marker)
+                    .map(|offset| start + 10 + offset)
+            })
+            .min()
             .unwrap_or(client.len());
         let block = &client[start..next];
         // The claimed status decodes into the shared model through the codec
-        // helper — never a streaming wrapper or raw response (§45).
+        // helper — never a streaming wrapper or raw response (§45). The
+        // codec decode itself now lives in the shared decode tail; bound it
+        // at its own closing brace so later operations cannot satisfy the
+        // grep.
+        let helper_start = client[start..]
+            .find(&format!("async fn decode_{method}("))
+            .map(|offset| start + offset)
+            .unwrap_or(client.len());
+        let helper_end = client[helper_start..]
+            .find("\n    }\n")
+            .map_or(client.len(), |offset| helper_start + offset);
+        let decode_block = &client[helper_start..helper_end];
         assert!(
-            block.contains(&format!("{model}_decode_typed"))
-                || block.contains(&format!("{}_decode_typed", tag)),
-            "{tag}: bounded codec decode missing for {method}:\n{block}"
+            decode_block.contains(&format!("{model}_decode_typed"))
+                || decode_block.contains(&format!("{}_decode_typed", tag)),
+            "{tag}: bounded codec decode missing for {method}:\n{decode_block}"
         );
         assert!(
             !block.contains("::reqwest::Response"),
@@ -210,13 +229,29 @@ fn accept_literals_match_the_default_configuration() {
         ("msgpack", options_with(&["msgpack"])),
     ] {
         let (client, _) = generate_with(&options);
+        // Layout-proof extraction: the Accept literal may share its line
+        // with `::http::header::ACCEPT` (chain form) or follow on one of
+        // the next lines (rebinding form in methods and §31 twins), so
+        // look ahead for the quoted value instead of matching line shapes.
+        let lines: Vec<&str> = client.lines().collect();
         let mut found: Vec<String> = Vec::new();
-        for line in client.lines() {
-            if line.contains("::http::header::ACCEPT") && !line.contains("request =") {
-                found.push(line.trim().to_owned());
+        for (index, line) in lines.iter().enumerate() {
+            if !line.contains("::http::header::ACCEPT") {
+                continue;
             }
+            let same_line = line.find('"').map(|pos| line[pos..].trim_end().to_owned());
+            let lookahead = lines[index + 1..(index + 4).min(lines.len())]
+                .iter()
+                .map(|candidate| candidate.trim())
+                .find(|candidate| candidate.starts_with('"'))
+                .map(str::to_owned);
+            found.push(same_line.or(lookahead).expect("Accept literal follows"));
         }
+        // §29 compares the literal UNION: §31 twins repeat their operation's
+        // Accept on streaming representations, so occurrences (not values)
+        // may differ between configurations.
         found.sort();
+        found.dedup();
         accepts.push(found);
     }
     let first = accepts.first().expect("default run present").clone();

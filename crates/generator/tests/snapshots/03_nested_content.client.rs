@@ -130,6 +130,15 @@ impl Client {
             )
             .send()
             .await?;
+        self.decode_get_artifact(response).await
+    }
+
+    /// Shared decode tail for `get_artifact` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_get_artifact(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<GetArtifactResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::OK => {
                 let parsed = parse_response_content_type(&response)?;

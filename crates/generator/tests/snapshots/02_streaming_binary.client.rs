@@ -192,6 +192,16 @@ impl Client {
             .body(body)
             .send()
             .await?;
+        self.decode_put_object(response).await
+    }
+
+    /// Shared decode tail for `put_object` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    /// Called by `put_object` and its §31 `put_object_replaying` twin so both share one classification path.
+    #[allow(clippy::unused_async)]
+    async fn decode_put_object(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<PutObjectResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::CREATED => Ok(PutObjectResponse::Created201),
             ::http::StatusCode::BAD_REQUEST => {
@@ -219,6 +229,51 @@ impl Client {
         }
     }
 
+    /// `PUT` `/objects/{id}` with explicit-factory retries (§31/D-impl-retry).
+    /// Operation `putObject`.
+    /// Idempotency is the caller's responsibility: PUT-style operations are natural fits; retrying POST may duplicate effects.
+    /// Every attempt rebuilds the streaming body through `body_factory`; multipart-free raw payloads are never buffered for replay.
+    /// Only PRE-response transport failures classified by `openapi_support::retry::is_retryable_transport` are retried — once response headers arrive the outcome is final; factory errors abort without retry.
+    pub async fn put_object_replaying<F, Fut>(
+        &self,
+        id: &str,
+        body_factory: F,
+        policy: ::openapi_support::retry::RetryPolicy,
+    ) -> Result<PutObjectResponse, ClientError>
+    where
+        F: Fn() -> Fut,
+        Fut: ::std::future::Future<Output = Result<::reqwest::Body, ClientError>>,
+    {
+        let mut url = self.base_url.clone();
+        url.push_str("/objects/");
+        let spec = ParamSpec::new("id", ParamStyle::Simple, false, false);
+        let value = ParamValue::Text(id.to_owned());
+        url.push_str(&encode_path(&spec, &value));
+        let budget = policy.max_attempts.max(1);
+        let mut failed = 0_u32;
+        loop {
+            let body = (body_factory)().await?;
+            let mut request = self.http.request(::http::Method::PUT, &url);
+            request = request
+                .header(::http::header::CONTENT_TYPE, "application/octet-stream")
+                .body(body);
+            request = request.header(::http::header::ACCEPT, "application/problem+json");
+            let response = request.send().await;
+            match response {
+                Ok(response) => return self.decode_put_object(response).await,
+                Err(error) => {
+                    failed += 1;
+                    let keep_retrying =
+                        failed < budget && ::openapi_support::retry::is_retryable_transport(&error);
+                    if !keep_retrying {
+                        return Err(ClientError::Transport(error));
+                    }
+                    ::openapi_support::retry::backoff_sleep(policy, failed).await;
+                }
+            }
+        }
+    }
+
     /// `GET` `/objects/{id}`.
     /// Operation `getObject`.
     pub async fn get_object(&self, id: &str) -> Result<GetObjectResponse, ClientError> {
@@ -237,6 +292,15 @@ impl Client {
             )
             .send()
             .await?;
+        self.decode_get_object(response).await
+    }
+
+    /// Shared decode tail for `get_object` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_get_object(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<GetObjectResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::OK => {
                 let e_tag = parse_optional_header::<String>(&response, "etag")?;

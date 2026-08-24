@@ -129,6 +129,15 @@ impl Client {
             .body(payload)
             .send()
             .await?;
+        self.decode_create_widget(response).await
+    }
+
+    /// Shared decode tail for `create_widget` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_create_widget(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<CreateWidgetResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::CREATED => {
                 let parsed = parse_response_content_type(&response)?;

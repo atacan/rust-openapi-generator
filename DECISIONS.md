@@ -371,10 +371,16 @@ restore defaults; they may never invent a structured representation for an unkno
 Main spec §31 forbids retrying consumed one-shot bodies. Decision: generated methods NEVER retry
 implicitly. Every operation whose request carries streaming content gains a twin
 `<op>_replaying(body_factory, policy)` method that rebuilds the body per attempt via the
-caller-supplied factory. Only PRE-RESPONSE transport failures classified retryable by
+caller-supplied factory. Only PRE-RESPONSE transport failures classified by
 `openapi_support::retry::is_retryable_transport` are retried; once response headers arrive the
 outcome is final. Backoff sleeps between attempts. Idempotency is the caller's responsibility and
-documented on every twin (PUT-style operations are natural fits; POST caution noted).
+documented on every twin (PUT-style operations are natural fits; POST caution noted). Boundary:
+record-framed REQUEST streams (SSE/NDJSON/JSON-seq bodies) receive no `_replaying` twin in v1 —
+their typed item-stream inputs cannot be rebuilt from a bare `reqwest::Body` factory; such
+operations simply have no retry surface, which keeps the no-implicit-retry invariant intact.
+Codec-bound entries likewise need no twin (bounded bytes re-encode cheaply inside the base
+method's caller if desired), and multipart twins rebuild the whole form per attempt so bounded
+scalar parts re-encode deterministically.
 
 ### D-impl-long-memory-tests Ten-GiB passthrough proofs are ignore-gated
 Main spec §50 tests 5–7 want multi-GiB synthetic passthrough proof. Default suites stay fast, so

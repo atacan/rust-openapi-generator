@@ -203,6 +203,15 @@ impl Client {
             )
             .send()
             .await?;
+        self.decode_get_report(response).await
+    }
+
+    /// Shared decode tail for `get_report` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_get_report(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<GetReportResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::OK => {
                 let parsed = parse_response_content_type(&response)?;
@@ -376,6 +385,15 @@ impl Client {
                 .body(body),
         };
         let response = request.send().await?;
+        self.decode_post_mirror(response).await
+    }
+
+    /// Shared decode tail for `post_mirror` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_post_mirror(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<PostMirrorResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::ACCEPTED => Ok(PostMirrorResponse::Accepted202),
             other => Err(ClientError::UndocumentedStatus { status: other }),
@@ -394,6 +412,15 @@ impl Client {
             .header(::http::header::ACCEPT, "text/*")
             .send()
             .await?;
+        self.decode_get_raw_text(response).await
+    }
+
+    /// Shared decode tail for `get_raw_text` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_get_raw_text(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<GetRawTextResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::OK => Ok(GetRawTextResponse::Ok200(GetRawText200 { response })),
             other => Err(ClientError::UndocumentedStatus { status: other }),
@@ -412,6 +439,15 @@ impl Client {
             .header(::http::header::ACCEPT, "application/json, */*")
             .send()
             .await?;
+        self.decode_get_either(response).await
+    }
+
+    /// Shared decode tail for `get_either` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_get_either(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<GetEitherResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::OK => {
                 let parsed = parse_response_content_type(&response)?;
@@ -487,6 +523,15 @@ impl Client {
             .body(body.to_owned())
             .send()
             .await?;
+        self.decode_put_note(response).await
+    }
+
+    /// Shared decode tail for `put_note` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_put_note(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<PutNoteResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::NO_CONTENT => Ok(PutNoteResponse::NoContent204),
             other => Err(ClientError::UndocumentedStatus { status: other }),
@@ -509,9 +554,59 @@ impl Client {
             .body(body)
             .send()
             .await?;
+        self.decode_post_stream_note(response).await
+    }
+
+    /// Shared decode tail for `post_stream_note` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    /// Called by `post_stream_note` and its §31 `post_stream_note_replaying` twin so both share one classification path.
+    #[allow(clippy::unused_async)]
+    async fn decode_post_stream_note(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<PostStreamNoteResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::NO_CONTENT => Ok(PostStreamNoteResponse::NoContent204),
             other => Err(ClientError::UndocumentedStatus { status: other }),
+        }
+    }
+
+    /// `POST` `/stream-notes` with explicit-factory retries (§31/D-impl-retry).
+    /// Operation `postStreamNote`.
+    /// Idempotency is the caller's responsibility: PUT-style operations are natural fits; retrying POST may duplicate effects.
+    /// Every attempt rebuilds the streaming body through `body_factory`; multipart-free raw payloads are never buffered for replay.
+    /// Only PRE-response transport failures classified by `openapi_support::retry::is_retryable_transport` are retried — once response headers arrive the outcome is final; factory errors abort without retry.
+    pub async fn post_stream_note_replaying<F, Fut>(
+        &self,
+        body_factory: F,
+        policy: ::openapi_support::retry::RetryPolicy,
+    ) -> Result<PostStreamNoteResponse, ClientError>
+    where
+        F: Fn() -> Fut,
+        Fut: ::std::future::Future<Output = Result<::reqwest::Body, ClientError>>,
+    {
+        let mut url = self.base_url.clone();
+        url.push_str("/stream-notes");
+        let budget = policy.max_attempts.max(1);
+        let mut failed = 0_u32;
+        loop {
+            let body = (body_factory)().await?;
+            let mut request = self.http.request(::http::Method::POST, &url);
+            request = request
+                .header(::http::header::CONTENT_TYPE, "text/plain")
+                .body(body);
+            let response = request.send().await;
+            match response {
+                Ok(response) => return self.decode_post_stream_note(response).await,
+                Err(error) => {
+                    failed += 1;
+                    let keep_retrying =
+                        failed < budget && ::openapi_support::retry::is_retryable_transport(&error);
+                    if !keep_retrying {
+                        return Err(ClientError::Transport(error));
+                    }
+                    ::openapi_support::retry::backoff_sleep(policy, failed).await;
+                }
+            }
         }
     }
 }

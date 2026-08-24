@@ -190,6 +190,15 @@ impl Client {
             .body(payload)
             .send()
             .await?;
+        self.decode_create_ticket(response).await
+    }
+
+    /// Shared decode tail for `create_ticket` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_create_ticket(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<CreateTicketResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::CREATED => {
                 let parsed = parse_response_content_type(&response)?;
@@ -234,6 +243,15 @@ impl Client {
             .body(payload)
             .send()
             .await?;
+        self.decode_register_slug(response).await
+    }
+
+    /// Shared decode tail for `register_slug` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_register_slug(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<RegisterSlugResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::CREATED => {
                 let parsed = parse_response_content_type(&response)?;
@@ -277,6 +295,15 @@ impl Client {
             .body(body.to_owned())
             .send()
             .await?;
+        self.decode_post_note(response).await
+    }
+
+    /// Shared decode tail for `post_note` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_post_note(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<PostNoteResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::CREATED => {
                 let parsed = parse_response_content_type(&response)?;
@@ -326,6 +353,15 @@ impl Client {
             .body(payload)
             .send()
             .await?;
+        self.decode_send_feedback(response).await
+    }
+
+    /// Shared decode tail for `send_feedback` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_send_feedback(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<SendFeedbackResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::NO_CONTENT => Ok(SendFeedbackResponse::NoContent204),
             other => Err(ClientError::UndocumentedStatus { status: other }),
@@ -357,6 +393,16 @@ impl Client {
         request = request.multipart(form);
         request = request.header(::http::header::ACCEPT, "application/json");
         let response = request.send().await?;
+        self.decode_upload_attachment(response).await
+    }
+
+    /// Shared decode tail for `upload_attachment` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    /// Called by `upload_attachment` and its §31 `upload_attachment_replaying` twin so both share one classification path.
+    #[allow(clippy::unused_async)]
+    async fn decode_upload_attachment(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<UploadAttachmentResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::CREATED => {
                 let parsed = parse_response_content_type(&response)?;
@@ -381,6 +427,58 @@ impl Client {
                 Ok(UploadAttachmentResponse::Created201(value))
             }
             other => Err(ClientError::UndocumentedStatus { status: other }),
+        }
+    }
+
+    /// `POST` `/uploads` with explicit-factory retries (§31/D-impl-retry).
+    /// Operation `uploadAttachment`.
+    /// Idempotency is the caller's responsibility: PUT-style operations are natural fits; retrying POST may duplicate effects.
+    /// Every attempt rebuilds the ENTIRE multipart form through `body_factory`, re-encoding scalar/JSON parts through the bounded serializers each time.
+    /// Only PRE-response transport failures classified by `openapi_support::retry::is_retryable_transport` are retried — once response headers arrive the outcome is final; factory errors abort without retry.
+    pub async fn upload_attachment_replaying<F, Fut>(
+        &self,
+        body_factory: F,
+        policy: ::openapi_support::retry::RetryPolicy,
+    ) -> Result<UploadAttachmentResponse, ClientError>
+    where
+        F: Fn() -> Fut,
+        Fut: ::std::future::Future<Output = Result<UploadAttachmentRequest, ClientError>>,
+    {
+        let mut url = self.base_url.clone();
+        url.push_str("/uploads");
+        let budget = policy.max_attempts.max(1);
+        let mut failed = 0_u32;
+        loop {
+            let body = (body_factory)().await?;
+            let mut request = self.http.request(::http::Method::POST, &url);
+            let mut form = Form::new();
+            form = form.part("title", Part::text(body.title.clone()));
+            form = form.part("kind", Part::text(body.kind.clone()));
+            form = form.part("attachment", {
+                let mut part = Part::stream(body.attachment);
+                if let Some(value) = body.attachment_name {
+                    part = part.file_name(value.clone());
+                }
+                if let Some(value) = body.attachment_content_type {
+                    part = part_with_mime(part, value.as_ref())?;
+                }
+                part
+            });
+            request = request.multipart(form);
+            request = request.header(::http::header::ACCEPT, "application/json");
+            let response = request.send().await;
+            match response {
+                Ok(response) => return self.decode_upload_attachment(response).await,
+                Err(error) => {
+                    failed += 1;
+                    let keep_retrying =
+                        failed < budget && ::openapi_support::retry::is_retryable_transport(&error);
+                    if !keep_retrying {
+                        return Err(ClientError::Transport(error));
+                    }
+                    ::openapi_support::retry::backoff_sleep(policy, failed).await;
+                }
+            }
         }
     }
 }

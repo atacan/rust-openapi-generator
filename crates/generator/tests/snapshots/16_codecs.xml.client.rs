@@ -187,6 +187,15 @@ impl Client {
             .body(payload)
             .send()
             .await?;
+        self.decode_create_xml_document(response).await
+    }
+
+    /// Shared decode tail for `create_xml_document` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_create_xml_document(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<CreateXmlDocumentResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::CREATED => {
                 let parsed = parse_response_content_type(&response)?;
@@ -247,6 +256,16 @@ impl Client {
             .body(body)
             .send()
             .await?;
+        self.decode_put_cbor_state(response).await
+    }
+
+    /// Shared decode tail for `put_cbor_state` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    /// Called by `put_cbor_state` and its §31 `put_cbor_state_replaying` twin so both share one classification path.
+    #[allow(clippy::unused_async)]
+    async fn decode_put_cbor_state(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<PutCborStateResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::OK => Ok(PutCborStateResponse::Ok200(PutCborState200 { response })),
             ::http::StatusCode::BAD_REQUEST => {
@@ -274,6 +293,50 @@ impl Client {
         }
     }
 
+    /// `PUT` `/cbor/state` with explicit-factory retries (§31/D-impl-retry).
+    /// Operation `putCborState`.
+    /// Idempotency is the caller's responsibility: PUT-style operations are natural fits; retrying POST may duplicate effects.
+    /// Every attempt rebuilds the streaming body through `body_factory`; multipart-free raw payloads are never buffered for replay.
+    /// Only PRE-response transport failures classified by `openapi_support::retry::is_retryable_transport` are retried — once response headers arrive the outcome is final; factory errors abort without retry.
+    pub async fn put_cbor_state_replaying<F, Fut>(
+        &self,
+        body_factory: F,
+        policy: ::openapi_support::retry::RetryPolicy,
+    ) -> Result<PutCborStateResponse, ClientError>
+    where
+        F: Fn() -> Fut,
+        Fut: ::std::future::Future<Output = Result<::reqwest::Body, ClientError>>,
+    {
+        let mut url = self.base_url.clone();
+        url.push_str("/cbor/state");
+        let budget = policy.max_attempts.max(1);
+        let mut failed = 0_u32;
+        loop {
+            let body = (body_factory)().await?;
+            let mut request = self.http.request(::http::Method::PUT, &url);
+            request = request
+                .header(::http::header::CONTENT_TYPE, "application/cbor")
+                .body(body);
+            request = request.header(
+                ::http::header::ACCEPT,
+                "application/cbor, application/problem+json",
+            );
+            let response = request.send().await;
+            match response {
+                Ok(response) => return self.decode_put_cbor_state(response).await,
+                Err(error) => {
+                    failed += 1;
+                    let keep_retrying =
+                        failed < budget && ::openapi_support::retry::is_retryable_transport(&error);
+                    if !keep_retrying {
+                        return Err(ClientError::Transport(error));
+                    }
+                    ::openapi_support::retry::backoff_sleep(policy, failed).await;
+                }
+            }
+        }
+    }
+
     /// `POST` `/msgpack/events`.
     /// Operation `postMsgPackEvent`.
     pub async fn post_msg_pack_event(
@@ -294,6 +357,16 @@ impl Client {
             .body(body)
             .send()
             .await?;
+        self.decode_post_msg_pack_event(response).await
+    }
+
+    /// Shared decode tail for `post_msg_pack_event` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    /// Called by `post_msg_pack_event` and its §31 `post_msg_pack_event_replaying` twin so both share one classification path.
+    #[allow(clippy::unused_async)]
+    async fn decode_post_msg_pack_event(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<PostMsgPackEventResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::OK => Ok(PostMsgPackEventResponse::Ok200(PostMsgPackEvent200 {
                 response,
@@ -323,6 +396,50 @@ impl Client {
         }
     }
 
+    /// `POST` `/msgpack/events` with explicit-factory retries (§31/D-impl-retry).
+    /// Operation `postMsgPackEvent`.
+    /// Idempotency is the caller's responsibility: PUT-style operations are natural fits; retrying POST may duplicate effects.
+    /// Every attempt rebuilds the streaming body through `body_factory`; multipart-free raw payloads are never buffered for replay.
+    /// Only PRE-response transport failures classified by `openapi_support::retry::is_retryable_transport` are retried — once response headers arrive the outcome is final; factory errors abort without retry.
+    pub async fn post_msg_pack_event_replaying<F, Fut>(
+        &self,
+        body_factory: F,
+        policy: ::openapi_support::retry::RetryPolicy,
+    ) -> Result<PostMsgPackEventResponse, ClientError>
+    where
+        F: Fn() -> Fut,
+        Fut: ::std::future::Future<Output = Result<::reqwest::Body, ClientError>>,
+    {
+        let mut url = self.base_url.clone();
+        url.push_str("/msgpack/events");
+        let budget = policy.max_attempts.max(1);
+        let mut failed = 0_u32;
+        loop {
+            let body = (body_factory)().await?;
+            let mut request = self.http.request(::http::Method::POST, &url);
+            request = request
+                .header(::http::header::CONTENT_TYPE, "application/msgpack")
+                .body(body);
+            request = request.header(
+                ::http::header::ACCEPT,
+                "application/msgpack, application/problem+json",
+            );
+            let response = request.send().await;
+            match response {
+                Ok(response) => return self.decode_post_msg_pack_event(response).await,
+                Err(error) => {
+                    failed += 1;
+                    let keep_retrying =
+                        failed < budget && ::openapi_support::retry::is_retryable_transport(&error);
+                    if !keep_retrying {
+                        return Err(ClientError::Transport(error));
+                    }
+                    ::openapi_support::retry::backoff_sleep(policy, failed).await;
+                }
+            }
+        }
+    }
+
     /// `POST` `/json/echo`.
     /// Operation `echoJson`.
     pub async fn echo_json(&self, body: &JsonPing) -> Result<EchoJsonResponse, ClientError> {
@@ -344,6 +461,15 @@ impl Client {
             .body(payload)
             .send()
             .await?;
+        self.decode_echo_json(response).await
+    }
+
+    /// Shared decode tail for `echo_json` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_echo_json(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<EchoJsonResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::OK => {
                 let parsed = parse_response_content_type(&response)?;

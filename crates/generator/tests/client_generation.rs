@@ -416,8 +416,10 @@ fn fixture_04_ranges_default_and_explicit_precedence_ordering() {
         "\n{response_enum}"
     );
 
-    // Literal 200 beats the range; Default matches LAST.
-    let method = method_block(&output, "get_widget");
+    // Literal 200 beats the range; Default matches LAST. Since the §31
+    // factoring, the status arms live in the shared `decode_get_widget`
+    // tail (called by the base method and any `_replaying` twin).
+    let method = method_block(&output, "decode_get_widget");
     let ok_arm = method
         .find("::http::StatusCode::OK =>")
         .expect("explicit 200 arm");
@@ -574,9 +576,10 @@ fn struct_block(output: &str, name: &str) -> String {
     item_block(output, &format!("pub struct {name} {{"))
 }
 
-/// The whole `pub async fn <name>` method through its closing brace.
+/// The whole `pub async fn <name>` (or private `async fn <name>`) method
+/// through its closing brace.
 fn method_block(output: &str, name: &str) -> String {
-    let marker = format!("pub async fn {name}(");
+    let marker = format!("async fn {name}(");
     let start = output
         .find(&marker)
         .unwrap_or_else(|| panic!("method `{name}` not found"));
@@ -681,8 +684,9 @@ fn headers_hoist_onto_multi_content_variants_and_header_only_statuses() {
     );
 
     // The 302 decode arm reads the header BEFORE constructing the variant
-    // and never touches a body.
-    let method = method_block(&output, "get_multi");
+    // and never touches a body. The §31 factoring moved the status arms
+    // into the shared `decode_get_multi` tail.
+    let method = method_block(&output, "decode_get_multi");
     assert!(
         method.contains("parse_required_header::<String>(&response, \"location\")?"),
         "{method}"

@@ -167,6 +167,15 @@ impl Client {
             .body(payload)
             .send()
             .await?;
+        self.decode_create_session(response).await
+    }
+
+    /// Shared decode tail for `create_session` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_create_session(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<CreateSessionResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::CREATED => {
                 let location = parse_required_header::<String>(&response, "location")?;
@@ -238,6 +247,15 @@ impl Client {
             )
             .send()
             .await?;
+        self.decode_get_session(response).await
+    }
+
+    /// Shared decode tail for `get_session` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_get_session(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<GetSessionResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::OK => {
                 let parsed = parse_response_content_type(&response)?;
@@ -316,6 +334,15 @@ impl Client {
             .body(payload)
             .send()
             .await?;
+        self.decode_put_cache_entry(response).await
+    }
+
+    /// Shared decode tail for `put_cache_entry` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_put_cache_entry(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<PutCacheEntryResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::NO_CONTENT => Ok(PutCacheEntryResponse::NoContent204),
             other => Err(ClientError::UndocumentedStatus { status: other }),

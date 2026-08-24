@@ -9,7 +9,8 @@
 //! NDJSON (§19), and JSON Text Sequences (§20). Dispatch layer: media-type
 //! parsing/matching and peek-and-preserve presence detection (§28), percent
 //! encoding (companion §8), the parameter style × explode matrix (companion §6),
-//! and the authoritative `ClientError` (§36).
+//! the authoritative `ClientError` (§36), and the §31 explicit-factory replay
+//! primitives ([`retry`], D-impl-retry).
 
 pub mod collect;
 pub mod content_coding;
@@ -24,6 +25,8 @@ pub mod optional;
 pub mod params;
 pub mod percent;
 pub mod rejection;
+#[cfg(feature = "client")]
+pub mod retry;
 pub mod sse;
 pub mod stream_errors;
 #[cfg(feature = "client")]

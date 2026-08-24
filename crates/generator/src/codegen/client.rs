@@ -2285,6 +2285,15 @@ fn emit_methods(
         // (companion §8); ops sharing the primary URL keep referencing it.
         let base_field = bases.field_for(op_index).to_owned();
         emit_operation_method(emitter, op_index, operation, &base_field, layout, flags);
+        // The factored decode tail follows the base method so the §31
+        // `_replaying` twin (when one is emitted below) shares the SAME
+        // status-classification code with it.
+        emitter.blank();
+        emit_decode_helper(emitter, op_index, operation, layout, flags);
+        if replay_twin_kind(operation).is_some() {
+            emitter.blank();
+            emit_replaying_twin(emitter, op_index, operation, &base_field, layout, flags);
+        }
     }
     emitter.line(0, "}");
 }
@@ -2435,7 +2444,73 @@ fn emit_operation_method(
     emit_url_building(emitter, operation, base_field, flags);
     emit_request_construction(emitter, operation, flags);
 
+    // The decode tail lives in the shared inherent helper (see
+    // `emit_decode_helper`) so the §31 `_replaying` twin reuses the exact
+    // same status classification instead of a divergent copy.
+    let tail = format!("self.decode_{}(response).await", operation.method);
+    if fits(2, &tail) {
+        emitter.line(2, &tail);
+    } else {
+        emitter.line(2, &format!("self.decode_{}(response)", operation.method));
+        emitter.line(3, ".await");
+    }
+    emitter.line(1, "}");
+}
+
+/// Emits the shared decode tail of one operation as an inherent `Client`
+/// method (§23–§28): classifies a received response into its exhaustive
+/// documented-status enum. Both [`emit_operation_method`] and the §31
+/// `_replaying` twin ([`emit_replaying_twin`]) end with a call here.
+fn emit_decode_helper(
+    emitter: &mut Emitter,
+    op_index: usize,
+    operation: &PlannedOperation,
+    layout: &Layout,
+    flags: &mut Flags,
+) {
+    let helper = format!("decode_{}", operation.method);
+    let mut doc_lines = vec![format!(
+        "Shared decode tail for `{}` (main spec §23–§28): classifies the \
+         received response into its exhaustive documented-status enum.",
+        operation.method
+    )];
+    if replay_twin_kind(operation).is_some() {
+        doc_lines.push(format!(
+            "Called by `{}` and its §31 `{}_replaying` twin so both share \
+             one classification path.",
+            operation.method, operation.method
+        ));
+    }
+    emitter.docs(1, &doc_lines);
+    // `unused_async` fires when no documented status collects a body; the
+    // uniform shape keeps emission deterministic across operations.
+    emitter.line(1, "#[allow(clippy::unused_async)]");
+    let return_type = format!("Result<{}, ClientError>", operation.response_enum_name);
+    let inline =
+        format!("async fn {helper}(&self, response: ::reqwest::Response) -> {return_type} {{");
+    if fits(1, &inline) {
+        emitter.line(1, &inline);
+    } else {
+        emitter.line(1, &format!("async fn {helper}("));
+        emitter.line(2, "&self,");
+        emitter.line(2, "response: ::reqwest::Response,");
+        emitter.line(1, &format!(") -> {return_type} {{"));
+    }
     emitter.line(2, "match response.status() {");
+    emit_decode_arms(emitter, op_index, operation, layout, flags);
+    emitter.line(2, "}");
+    emitter.line(1, "}");
+}
+
+/// The exhaustive status match shared by the base method and its twin:
+/// every arm at indent 3 exactly as before the §31 factoring.
+fn emit_decode_arms(
+    emitter: &mut Emitter,
+    op_index: usize,
+    operation: &PlannedOperation,
+    layout: &Layout,
+    flags: &mut Flags,
+) {
     let has_default = operation
         .statuses
         .last()
@@ -2449,6 +2524,253 @@ fn emit_operation_method(
             "other => Err(ClientError::UndocumentedStatus { status: other }),",
         );
     }
+}
+
+// ----------------------------------------------------------------------
+// §31 replayable-request twins (main spec §31, D-impl-retry)
+// ----------------------------------------------------------------------
+
+/// Which §31 `_replaying` twin an operation earns (D-impl-retry): exactly
+/// the single-content operations whose sole request entry carries streaming
+/// content — raw/binary bodies (including forced-streaming text and
+/// wildcard entries holding `reqwest::Body`) and multipart forms.
+///
+/// Deliberately excluded: multi-content request enums (the factory would
+/// have to rebuild a whole variant enum — v1 leaves that to callers),
+/// codec-claimed entries (bounded bytes re-encode per attempt; nothing
+/// one-shot streams), and record-framed SSE/NDJSON/JSON-seq request bodies
+/// (their bodies are lazily encoded item streams whose per-attempt
+/// reconstruction needs the typed item stream, not a bare `reqwest::Body`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayBody {
+    /// One `reqwest::Body` rebuilt per attempt through the factory.
+    Raw,
+    /// The ENTIRE `<Op>Request` form rebuilt per attempt; scalar/JSON parts
+    /// re-encode through the bounded serializers on every attempt.
+    Multipart,
+}
+
+fn replay_twin_kind(operation: &PlannedOperation) -> Option<ReplayBody> {
+    if operation.request_contents.len() != 1 {
+        return None;
+    }
+    let content = &operation.request_contents[0];
+    // §45 codec-claimed entries stay excluded even though their planned
+    // class is RawUnknown: their bytes are bounded and re-encoded per
+    // attempt through the fail-fast writer, never streamed one-shot.
+    if content.codec.is_some() {
+        return None;
+    }
+    match content.media_class {
+        MediaClass::Binary | MediaClass::RawUnknown => Some(ReplayBody::Raw),
+        MediaClass::Multipart => Some(ReplayBody::Multipart),
+        _ => None,
+    }
+}
+
+/// Emits the `<op>_replaying(body_factory, policy)` twin of one streaming
+/// request operation (main spec §31, D-impl-retry): each attempt rebuilds
+/// the body through the caller-supplied factory, sends once, and classifies
+/// the outcome — success flows into the SAME decode tail as the base
+/// method; only PRE-response transport failures classified by
+/// `openapi_support::retry::is_retryable_transport` retry after a
+/// deterministic backoff sleep. Factory errors abort without retry.
+fn emit_replaying_twin(
+    emitter: &mut Emitter,
+    op_index: usize,
+    operation: &PlannedOperation,
+    base_field: &str,
+    layout: &Layout,
+    flags: &mut Flags,
+) {
+    let kind = replay_twin_kind(operation).expect("twin kind decided by caller");
+    let content = &operation.request_contents[0];
+    let twin = format!("{}_replaying", operation.method);
+    let return_type = format!("Result<{}, ClientError>", operation.response_enum_name);
+
+    let mut doc_lines = vec![format!(
+        "`{}` `{}` with explicit-factory retries (§31/D-impl-retry).",
+        operation.http.as_keyword().to_ascii_uppercase(),
+        operation.path_template
+    )];
+    if let Some(operation_id) = &operation.operation_id {
+        doc_lines.push(format!("Operation `{operation_id}`."));
+    }
+    doc_lines.push(
+        "Idempotency is the caller's responsibility: PUT-style operations \
+         are natural fits; retrying POST may duplicate effects."
+            .to_owned(),
+    );
+    match kind {
+        ReplayBody::Raw => {
+            doc_lines.push(
+                "Every attempt rebuilds the streaming body through \
+                 `body_factory`; multipart-free raw payloads are never \
+                 buffered for replay."
+                    .to_owned(),
+            );
+        }
+        ReplayBody::Multipart => {
+            doc_lines.push(
+                "Every attempt rebuilds the ENTIRE multipart form through \
+                 `body_factory`, re-encoding scalar/JSON parts through the \
+                 bounded serializers each time."
+                    .to_owned(),
+            );
+        }
+    }
+    doc_lines.push(
+        "Only PRE-response transport failures classified by \
+         `openapi_support::retry::is_retryable_transport` are retried — \
+         once response headers arrive the outcome is final; factory errors \
+         abort without retry."
+            .to_owned(),
+    );
+    emitter.docs(1, &doc_lines);
+    if operation.deprecated {
+        emitter.line(1, "#[deprecated]");
+    }
+
+    // Signature: the base arguments minus the body parameter, then the
+    // factory + policy pair. The factory's future yields either a fresh
+    // `reqwest::Body` or a fresh multipart input struct per attempt.
+    let fut_output = match kind {
+        ReplayBody::Raw => "::reqwest::Body".to_owned(),
+        ReplayBody::Multipart => layout
+            .request_struct(op_index)
+            .expect("multipart input struct registered")
+            .to_owned(),
+    };
+    let arguments: Vec<SignatureArgument> = signature_arguments(operation, layout, op_index)
+        .into_iter()
+        .filter(|argument| argument.name != "body")
+        .chain([
+            SignatureArgument {
+                name: "body_factory".to_owned(),
+                rust_type: "F".to_owned(),
+            },
+            SignatureArgument {
+                name: "policy".to_owned(),
+                rust_type: "::openapi_support::retry::RetryPolicy".to_owned(),
+            },
+        ])
+        .collect();
+    emitter.line(1, &format!("pub async fn {twin}<F, Fut>("));
+    emitter.line(2, "&self,");
+    for argument in &arguments {
+        emitter.line(2, &format!("{}: {},", argument.name, argument.rust_type));
+    }
+    emitter.line(1, &format!(") -> {return_type}"));
+    emitter.line(1, "where");
+    emitter.line(2, "F: Fn() -> Fut,");
+    emitter.line(
+        2,
+        &format!("Fut: ::std::future::Future<Output = Result<{fut_output}, ClientError>>,"),
+    );
+    emitter.line(1, "{");
+
+    emit_url_building(emitter, operation, base_field, flags);
+    emitter.line(2, "let budget = policy.max_attempts.max(1);");
+    emitter.line(2, "let mut failed = 0_u32;");
+    emitter.line(2, "loop {");
+    emitter.line(3, "let body = (body_factory)().await?;");
+    emitter.line(
+        3,
+        &format!(
+            "let mut request = self.http.request(::http::Method::{}, &url);",
+            http_method_const(operation.http)
+        ),
+    );
+    let header_parameters: Vec<&PlannedParameter> = operation
+        .parameters
+        .iter()
+        .filter(|parameter| parameter.location == ParameterLocation::Header)
+        .collect();
+    let cookie_parameters: Vec<&PlannedParameter> = operation
+        .parameters
+        .iter()
+        .filter(|parameter| parameter.location == ParameterLocation::Cookie)
+        .collect();
+    emit_header_params(emitter, 3, &header_parameters, flags);
+    emit_cookie_params(emitter, 3, &cookie_parameters);
+    match kind {
+        ReplayBody::Raw => {
+            emitter.line(3, "request = request");
+            emit_chain_header(
+                emitter,
+                4,
+                "::http::header::CONTENT_TYPE",
+                &content.media_type_literal,
+            );
+            emitter.line(4, ".body(body);");
+        }
+        ReplayBody::Multipart => {
+            let spec = content.multipart_spec.as_ref();
+            emit_multipart_form_build(emitter, 3, "body", spec, flags);
+            emitter.line(3, "request = request.multipart(form);");
+        }
+    }
+    if !operation.accept_header_value.is_empty() {
+        let accept = format!(
+            "request = request.header(::http::header::ACCEPT, {});",
+            rust_string_literal(&operation.accept_header_value)
+        );
+        if fits(3, &accept) {
+            emitter.line(3, &accept);
+        } else {
+            emitter.line(3, "request = request.header(");
+            emitter.line(4, "::http::header::ACCEPT,");
+            emitter.line(
+                4,
+                &format!("{},", rust_string_literal(&operation.accept_header_value)),
+            );
+            emitter.line(3, ");");
+        }
+    }
+    let send_line = "let response = request.send().await;";
+    if fits(3, send_line) {
+        emitter.line(3, send_line);
+    } else {
+        emitter.line(3, "let response = request");
+        emitter.line(4, ".send()");
+        emitter.line(4, ".await;");
+    }
+    emitter.line(3, "match response {");
+    let ok_arm = format!(
+        "Ok(response) => return self.decode_{}(response).await,",
+        operation.method
+    );
+    if fits(4, &ok_arm) {
+        emitter.line(4, &ok_arm);
+    } else {
+        emitter.line(
+            4,
+            &format!("Ok(response) => return self.decode_{}", operation.method),
+        );
+        emitter.line(5, "(response)");
+        emitter.line(5, ".await,");
+    }
+    emitter.line(4, "Err(error) => {");
+    emitter.line(5, "failed += 1;");
+    // rustfmt breaks after `=` first when the whole binding overflows the
+    // width budget; mirror its canonical layout.
+    let retry_head = "let keep_retrying =";
+    let retry_tail = "failed < budget && ::openapi_support::retry::is_retryable_transport(&error);";
+    if fits(5, &format!("{retry_head} {retry_tail}")) {
+        emitter.line(5, &format!("{retry_head} {retry_tail}"));
+    } else {
+        emitter.line(5, retry_head);
+        emitter.line(6, retry_tail);
+    }
+    emitter.line(5, "if !keep_retrying {");
+    emitter.line(6, "return Err(ClientError::Transport(error));");
+    emitter.line(5, "}");
+    emitter.line(
+        5,
+        "::openapi_support::retry::backoff_sleep(policy, failed).await;",
+    );
+    emitter.line(4, "}");
+    emitter.line(3, "}");
     emitter.line(2, "}");
     emitter.line(1, "}");
 }
@@ -2746,8 +3068,8 @@ fn emit_request_construction(
                 ),
             );
         }
-        emit_header_params(emitter, &header_parameters, flags);
-        emit_cookie_params(emitter, &cookie_parameters);
+        emit_header_params(emitter, 2, &header_parameters, flags);
+        emit_cookie_params(emitter, 2, &cookie_parameters);
         emit_body_assignment(emitter, operation, flags);
         if !operation.accept_header_value.is_empty() {
             emitter.line(
@@ -2805,13 +3127,18 @@ fn emit_request_construction(
     }
 }
 
-fn emit_header_params(emitter: &mut Emitter, parameters: &[&PlannedParameter], flags: &mut Flags) {
+fn emit_header_params(
+    emitter: &mut Emitter,
+    indent: usize,
+    parameters: &[&PlannedParameter],
+    flags: &mut Flags,
+) {
     for parameter in parameters {
         flags.needs_header_value = true;
-        emit_param_spec(emitter, 2, parameter);
-        let header_call = |emitter: &mut Emitter, indent: usize| {
+        emit_param_spec(emitter, indent, parameter);
+        let header_call = |emitter: &mut Emitter, at: usize| {
             emitter.line(
-                indent,
+                at,
                 &format!(
                     "request = request.header({}, encode_header_value(&spec, &value));",
                     rust_string_literal(&parameter.wire_name)
@@ -2820,69 +3147,75 @@ fn emit_header_params(emitter: &mut Emitter, parameters: &[&PlannedParameter], f
         };
         if parameter.required {
             emitter.line(
-                2,
+                indent,
                 &format!(
                     "let value = {};",
                     param_value_expr(parameter, parameter.rust_name.clone())
                 ),
             );
-            header_call(emitter, 2);
+            header_call(emitter, indent);
         } else {
-            emitter.line(2, &format!("if let Some(raw) = {} {{", parameter.rust_name));
             emitter.line(
-                3,
+                indent,
+                &format!("if let Some(raw) = {} {{", parameter.rust_name),
+            );
+            emitter.line(
+                indent + 1,
                 &format!(
                     "let value = {};",
                     param_value_expr(parameter, "raw".to_owned())
                 ),
             );
-            header_call(emitter, 3);
-            emitter.line(2, "}");
+            header_call(emitter, indent + 1);
+            emitter.line(indent, "}");
         }
     }
 }
 
-fn emit_cookie_params(emitter: &mut Emitter, parameters: &[&PlannedParameter]) {
+fn emit_cookie_params(emitter: &mut Emitter, indent: usize, parameters: &[&PlannedParameter]) {
     if parameters.is_empty() {
         return;
     }
-    emitter.line(2, "let mut cookie_segments: Vec<String> = Vec::new();");
+    emitter.line(indent, "let mut cookie_segments: Vec<String> = Vec::new();");
     for parameter in parameters {
-        emit_param_spec(emitter, 2, parameter);
+        emit_param_spec(emitter, indent, parameter);
         if parameter.required {
             emitter.line(
-                2,
+                indent,
                 &format!(
                     "let value = {};",
                     param_value_expr(parameter, parameter.rust_name.clone())
                 ),
             );
             emitter.line(
-                2,
+                indent,
                 "cookie_segments.push(encode_cookie_value(&spec, &value));",
             );
         } else {
-            emitter.line(2, &format!("if let Some(raw) = {} {{", parameter.rust_name));
             emitter.line(
-                3,
+                indent,
+                &format!("if let Some(raw) = {} {{", parameter.rust_name),
+            );
+            emitter.line(
+                indent + 1,
                 &format!(
                     "let value = {};",
                     param_value_expr(parameter, "raw".to_owned())
                 ),
             );
             emitter.line(
-                3,
+                indent + 1,
                 "cookie_segments.push(encode_cookie_value(&spec, &value));",
             );
-            emitter.line(2, "}");
+            emitter.line(indent, "}");
         }
     }
-    emitter.line(2, "if !cookie_segments.is_empty() {");
+    emitter.line(indent, "if !cookie_segments.is_empty() {");
     emitter.line(
-        3,
+        indent + 1,
         "request = request.header(::http::header::COOKIE, cookie_segments.join(\"; \"));",
     );
-    emitter.line(2, "}");
+    emitter.line(indent, "}");
 }
 
 /// Body assignment for rebound requests: single payloads (required or

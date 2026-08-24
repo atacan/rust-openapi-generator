@@ -212,6 +212,15 @@ impl Client {
             )
             .send()
             .await?;
+        self.decode_export_records(response).await
+    }
+
+    /// Shared decode tail for `export_records` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_export_records(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<ExportRecordsResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::OK => Ok(ExportRecordsResponse::Ok200(ExportRecords200Stream {
                 response,
@@ -257,6 +266,15 @@ impl Client {
             )
             .send()
             .await?;
+        self.decode_stream_events(response).await
+    }
+
+    /// Shared decode tail for `stream_events` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_stream_events(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<StreamEventsResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::OK => Ok(StreamEventsResponse::Ok200(StreamEvents200Stream {
                 response,
@@ -304,6 +322,15 @@ impl Client {
             )
             .send()
             .await?;
+        self.decode_stream_envelope_events(response).await
+    }
+
+    /// Shared decode tail for `stream_envelope_events` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_stream_envelope_events(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<StreamEnvelopeEventsResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::OK => Ok(StreamEnvelopeEventsResponse::Ok200(
                 StreamEnvelopeEvents200Stream {
@@ -356,6 +383,15 @@ impl Client {
             .body(::reqwest::Body::wrap_stream(encoder));
         request = request.header(::http::header::ACCEPT, "application/json");
         let response = request.send().await?;
+        self.decode_push_metrics(response).await
+    }
+
+    /// Shared decode tail for `push_metrics` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    #[allow(clippy::unused_async)]
+    async fn decode_push_metrics(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<PushMetricsResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::ACCEPTED => {
                 let parsed = parse_response_content_type(&response)?;

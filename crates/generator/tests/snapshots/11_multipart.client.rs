@@ -186,6 +186,16 @@ impl Client {
         request = request.multipart(form);
         request = request.header(::http::header::ACCEPT, "application/json");
         let response = request.send().await?;
+        self.decode_upload_document(response).await
+    }
+
+    /// Shared decode tail for `upload_document` (main spec §23–§28): classifies the received response into its exhaustive documented-status enum.
+    /// Called by `upload_document` and its §31 `upload_document_replaying` twin so both share one classification path.
+    #[allow(clippy::unused_async)]
+    async fn decode_upload_document(
+        &self,
+        response: ::reqwest::Response,
+    ) -> Result<UploadDocumentResponse, ClientError> {
         match response.status() {
             ::http::StatusCode::CREATED => {
                 let location = parse_required_header::<String>(&response, "location")?;
@@ -213,6 +223,70 @@ impl Client {
                 }))
             }
             other => Err(ClientError::UndocumentedStatus { status: other }),
+        }
+    }
+
+    /// `POST` `/documents` with explicit-factory retries (§31/D-impl-retry).
+    /// Operation `uploadDocument`.
+    /// Idempotency is the caller's responsibility: PUT-style operations are natural fits; retrying POST may duplicate effects.
+    /// Every attempt rebuilds the ENTIRE multipart form through `body_factory`, re-encoding scalar/JSON parts through the bounded serializers each time.
+    /// Only PRE-response transport failures classified by `openapi_support::retry::is_retryable_transport` are retried — once response headers arrive the outcome is final; factory errors abort without retry.
+    pub async fn upload_document_replaying<F, Fut>(
+        &self,
+        body_factory: F,
+        policy: ::openapi_support::retry::RetryPolicy,
+    ) -> Result<UploadDocumentResponse, ClientError>
+    where
+        F: Fn() -> Fut,
+        Fut: ::std::future::Future<Output = Result<UploadDocumentRequest, ClientError>>,
+    {
+        let mut url = self.base_url.clone();
+        url.push_str("/documents");
+        let budget = policy.max_attempts.max(1);
+        let mut failed = 0_u32;
+        loop {
+            let body = (body_factory)().await?;
+            let mut request = self.http.request(::http::Method::POST, &url);
+            let mut form = Form::new();
+            let payload =
+                match serialize_json_limited(&body.metadata, self.limits.structured_encode_bytes) {
+                    Ok(payload) => payload,
+                    Err(_) => {
+                        return Err(encode_overflow_error(self.limits.structured_encode_bytes));
+                    }
+                };
+            form = form.part(
+                "metadata",
+                part_with_mime(Part::bytes(Vec::from(&payload[..])), "application/json")?,
+            );
+            for value in &body.tags {
+                form = form.part("tags", Part::text(value.clone()));
+            }
+            form = form.part("file", {
+                let mut part = Part::stream(body.file);
+                if let Some(value) = body.file_name {
+                    part = part.file_name(value.clone());
+                }
+                if let Some(value) = body.file_content_type {
+                    part = part_with_mime(part, value.as_ref())?;
+                }
+                part
+            });
+            request = request.multipart(form);
+            request = request.header(::http::header::ACCEPT, "application/json");
+            let response = request.send().await;
+            match response {
+                Ok(response) => return self.decode_upload_document(response).await,
+                Err(error) => {
+                    failed += 1;
+                    let keep_retrying =
+                        failed < budget && ::openapi_support::retry::is_retryable_transport(&error);
+                    if !keep_retrying {
+                        return Err(ClientError::Transport(error));
+                    }
+                    ::openapi_support::retry::backoff_sleep(policy, failed).await;
+                }
+            }
         }
     }
 }
