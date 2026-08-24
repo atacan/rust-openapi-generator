@@ -1,0 +1,140 @@
+# CI for openapi-to-rust — encodes the project verification suite.
+#
+# Spec anchors:
+# - main spec §3.1: MSRV tuple is pinned at Rust 1.85 (workspace
+#   `rust-version = "1.85"`); the `msrv` job proves it explicitly.
+# - main spec §50 tests: fmt/clippy gates, workspace test suite with the
+#   long-haul proofs #[ignore]-gated (NOT run in CI), and double-generation
+#   determinism (test 39) — enforced both by conformance's build.rs (which
+#   byte-compares two generations per fixture into $OUT_DIR) and, end to end,
+#   by the committed-snapshot check in the `determinism` job below.
+#
+# Jobs are independent and run in parallel; each is a required-ish gate.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ─── 1. Formatting ──────────────────────────────────────────────────────
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # actions/checkout@v4 (SHA-pinned; resolves tag v4 as of 2026-08)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # dtolnay/rust-toolchain branch "stable" head (SHA-pinned)
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+      - run: cargo fmt --check
+
+  # ─── 2. Lints: workspace + feature matrix (§50 clippy gate) ─────────────
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+      # Swatinem/rust-cache@v2.9.2 (SHA-pinned; resolves tag v2)
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      # Default-feature lint gate over every target in the workspace.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Feature-matrix variant: openapi-support's client+server halves
+      # (DECISIONS D-impl-codec-plugins keeps these optional).
+      - run: >
+          cargo clippy -p openapi-support --all-targets --features client,server
+          --locked -- -D warnings
+
+  # ─── 3. Tests (long-haul proofs stay #[ignore]-gated) ───────────────────
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      # Plain `cargo test` implicitly excludes the #[ignore]-gated long-haul
+      # proofs (crates/conformance/tests/long_haul.rs); CI must not run them.
+      - run: cargo test --workspace --locked
+
+  # ─── 4. Double-generation determinism (main spec §50 test 39) ───────────
+  determinism:
+    name: determinism
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - name: Regenerate three times; committed snapshots must never move
+        run: |
+          for pass in 1 2 3; do
+            # Literal proof that update mode stays OFF: unset every
+            # snapshot-update switch (CLIENT_/SERVER_/MODELS_/VIEWS_/
+            # OPENAPI_/CODEC_) before each pass so regeneration can never
+            # silently rewrite committed files.
+            unset CLIENT_SNAPSHOT_UPDATE SERVER_SNAPSHOT_UPDATE \
+                  MODELS_SNAPSHOT_UPDATE VIEWS_SNAPSHOT_UPDATE \
+                  OPENAPI_SNAPSHOT_UPDATE CODEC_SNAPSHOT_UPDATE
+
+            echo "::group::generation pass ${pass}"
+            cargo test -p openapi-to-rust-generator -p openapi-conformance --locked
+            echo '::endgroup::'
+
+            dirty="$(git status --porcelain crates/generator/tests/snapshots crates/conformance)"
+            if [ -n "$dirty" ]; then
+              echo "::error::Determinism violation (main spec §50 test 39): \
+          generation pass ${pass} changed tracked snapshot/conformance files. \
+          Generation must be byte-stable across runs; investigate before merging."
+              printf '%s\n' "$dirty"
+              exit 1
+            fi
+            echo "pass ${pass}: porcelain clean — snapshots byte-stable"
+          done
+
+  # ─── 5. MSRV (main spec §3.1 pinned tuple: Rust 1.85) ───────────────────
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      # dtolnay/rust-toolchain branch "1.85.0" head (SHA-pinned). Installs
+      # 1.85.0 and makes it the default toolchain for this job — plain
+      # `cargo` invocations below therefore run under MSRV (no `+1.85`
+      # override needed, avoiding rustup partial-version resolution issues).
+      - uses: dtolnay/rust-toolchain@bc540ba06a4ccee415bb241490e0b25ee8e7d315
+        with:
+          toolchain: 1.85.0
+      # rust-cache keys include the rustc version, so this cache is separate
+      # from the stable ones automatically.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - run: rustc --version | grep -q '^rustc 1\.85\.' || { echo 'wrong toolchain'; exit 1; }
+      # Test-only on purpose: locally verified that 1.85's bundled clippy does
+      # NOT pass cleanly (`explicit lifetimes could be elided` fires 7× in
+      # openapi-to-rust-generator where current-stable clippy is silent — the
+      # lint matured between versions). Re-add an MSRV clippy gate only once
+      # the sources satisfy both linters.
+      - run: cargo test --workspace --locked
