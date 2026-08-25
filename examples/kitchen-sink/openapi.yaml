@@ -1,0 +1,827 @@
+# Kitchen-sink union document — one OpenAPI 3.1.0 file exercising every
+# feature class of the corpus, each operation copied from a PROVEN fixture
+# shape under crates/generator/fixtures/ (structure reused verbatim; names
+# adapted where two fixtures would otherwise collide). Every operation
+# carries a comment cross-referencing its source fixture and main-spec
+# sections. No `servers` anywhere: every operation's effective servers
+# default to `/` (companion §8 rule 3), so clients pass base_url explicitly
+# (DECISIONS D-impl-relative-servers).
+#
+# Feature-class index (work-package checklist):
+#   a  JSON + problem+json ........ createWidget            (fixture 01)
+#   b  urlencoded form ............ createSession           (fixture 10)
+#   c  bounded text/plain ......... putNote                 (fixture 14)
+#   d  octet-stream up/download ... putObject/getObject     (fixture 02)
+#   e  image/* wildcard next to .. getThumbnail             (fixtures 03+14)
+#      application/json on 200
+#   f  multipart scalar/JSON ..... uploadDocument           (fixture 11)
+#      metadata + ONE binary part
+#   g  SSE / NDJSON / json-seq ... streamEvents/exportRecords/
+#                                    pushMetrics/exportMetrics (fixture 15)
+#   h  unknown vendor type ....... postVendorDocument       (fixture 16, §21)
+#      (codecs all OFF)
+#   i  status range + explicit ... probeStatus              (fixture 04)
+#      precedence + default
+#   j  204 no-body + HEAD ........ deleteTask/getWidget/
+#                                    headWidget            (fixtures 09+17)
+#   k  optional body ≠ null ...... echoNote                 (fixture 09)
+#      + nullable properties ..... AuditEntry/MatrixRecord (fixtures 08+07)
+#   l  readOnly/writeOnly views .. createAccount/listAuditEntries/syncRecord
+#                                                        (fixture 08)
+#   m  oneOf+discriminator / ..... createPet/createRecord    (fixtures 05+07)
+#      allOf merge / string enum
+openapi: 3.1.0
+info:
+  title: kitchen sink
+  version: "1"
+paths:
+  # ── (a) JSON request/response + application/problem+json error ──────────
+  # Fixture 01 (main spec §8) verbatim.
+  /widgets:
+    post:
+      operationId: createWidget
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWidget'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Widget'
+        '400':
+          description: Invalid request
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  # ── (b) application/x-www-form-urlencoded request (+ §15 typed headers) ─
+  # Fixture 10 (main spec §16) verbatim: REQUIRED form body answering 201
+  # JSON with Location (required) + ETag (optional) response headers.
+  /sessions:
+    post:
+      operationId: createSession
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/CreateSessionForm'
+      responses:
+        '201':
+          description: Session created
+          headers:
+            Location:
+              description: URL of the created session
+              required: true
+              schema:
+                type: string
+                format: uri
+            ETag:
+              description: entity tag of the session representation
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '401':
+          description: Invalid credentials
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  # ── (c) text/plain body — bounded String by default (§5.2/§44) ──────────
+  # Fixture 14's putNote verbatim (path renamed).
+  /notes/{id}:
+    put:
+      operationId: putNote
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema:
+              type: string
+      responses:
+        '204':
+          description: Saved
+
+  # ── (d) streaming binary upload AND download with typed headers ─────────
+  # Fixture 02 Examples 2+3 (§9, §10, §15): octet-stream PUT plus GET whose
+  # 200 documents ETag (string) and Content-Length (int64) headers over a
+  # streaming download.
+  /objects/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+    put:
+      operationId: putObject
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '201':
+          description: Stored
+        '400':
+          description: Invalid object
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+    get:
+      operationId: getObject
+      responses:
+        '200':
+          description: Object bytes
+          headers:
+            ETag:
+              description: entity tag of the stored bytes
+              schema:
+                type: string
+            Content-Length:
+              description: byte size of the stored object
+              schema:
+                type: integer
+                format: int64
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: Missing
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  # ── (e) image/* wildcard beside application/json on ONE status ──────────
+  # §22 Example 15 as exercised by fixture 14's getEither, with fixture 03's
+  # nested-content structure on the same status: exact `application/json`
+  # entry takes precedence over the `image/*` raw-streaming wildcard at
+  # runtime (§5.10 specificity order).
+  /thumbnails/{id}:
+    get:
+      operationId: getThumbnail
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Metadata JSON or any image representation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ThumbnailMetadata'
+            'image/*':
+              schema: {}
+        '404':
+          description: Missing thumbnail
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  # ── (f) multipart: bounded metadata parts + EXACTLY ONE binary part ─────
+  # Fixture 11 (§17, §17.1; DECISIONS D-impl-multipart-single-binary):
+  # `metadata` is a bounded JSON part, `tags` an optional repeated textual
+  # part collecting in wire order, `file` the single streaming binary part.
+  # Required scalar/JSON parts precede the binary part so sequential
+  # streaming can validate them pre-handler.
+  /documents:
+    post:
+      operationId: uploadDocument
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [metadata, file]
+              properties:
+                metadata:
+                  $ref: '#/components/schemas/DocumentMetadata'
+                tags:
+                  type: array
+                  items:
+                    type: string
+                file:
+                  type: string
+                  format: binary
+            encoding:
+              metadata:
+                contentType: application/json
+              file:
+                contentType: application/octet-stream
+      responses:
+        '201':
+          description: Uploaded
+          headers:
+            Location:
+              description: URL of the stored document
+              required: true
+              schema:
+                type: string
+                format: uri
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+
+  # ── (g) SSE, NDJSON, and JSON Text Sequences ────────────────────────────
+  # Fixture 15 (§5.6–§5.8, §18–§20, §18.1): SSE events + NDJSON export as
+  # responses, json-seq as REQUEST body (pushMetrics) AND as RESPONSE
+  # (exportMetrics — exportRecords' proven shape re-keyed to the json-seq
+  # literal).
+  /events:
+    get:
+      operationId: streamEvents
+      responses:
+        '200':
+          description: Server-sent event stream of typed events
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/Event'
+        '401':
+          description: Unauthorized
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+  /records/export:
+    get:
+      operationId: exportRecords
+      responses:
+        '200':
+          description: Newline-delimited records
+          content:
+            application/x-ndjson:
+              schema:
+                $ref: '#/components/schemas/Record'
+        '401':
+          description: Unauthorized
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+  /metrics:
+    post:
+      operationId: pushMetrics
+      requestBody:
+        required: true
+        content:
+          application/json-seq:
+            schema:
+              $ref: '#/components/schemas/Metric'
+      responses:
+        '202':
+          description: Accepted for processing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ack'
+  /metrics/export:
+    get:
+      operationId: exportMetrics
+      responses:
+        '200':
+          description: RFC 7464 JSON Text Sequence of metrics
+          content:
+            application/json-seq:
+              schema:
+                $ref: '#/components/schemas/Metric'
+        '401':
+          description: Unauthorized
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  # ── (h) unknown vendor media type — raw streaming fallback (§21/§5.9) ───
+  # Fixture 16's echo-operation structure under the DEFAULT configuration
+  # (every codec OFF, §45): `application/vnd.acme.document-v7` stays in the
+  # §5.9 raw-streaming fallback in BOTH directions; problem+json on 400 keeps
+  # the malformed-body mapping observable through the documented enum.
+  /vendor-documents:
+    post:
+      operationId: postVendorDocument
+      requestBody:
+        required: true
+        content:
+          application/vnd.acme.document-v7:
+            schema:
+              $ref: '#/components/schemas/VendorDocument'
+      responses:
+        '200':
+          description: Proprietary document echoed back verbatim
+          content:
+            application/vnd.acme.document-v7:
+              schema:
+                $ref: '#/components/schemas/VendorDocument'
+        '400':
+          description: Malformed request
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  # ── (i) status range + explicit-code precedence + default ───────────────
+  # Fixture 04 Examples 16+17 (§23, §24): literal '200' beats the '2XX'
+  # range; '4XX' and `default` close the space. Declaration order preserved
+  # through the IR into normalization.
+  /status-probes/{id}:
+    get:
+      operationId: probeStatus
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Normal result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Widget'
+        '2XX':
+          description: Other successful result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessEnvelope'
+        '4XX':
+          description: Client error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        default:
+          description: Undocumented API error
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  # ── (j) 204 No Content + HEAD header-only probes ────────────────────────
+  # Fixture 09's deleteTask (§14, §35 unit no-body variant) and fixture 17's
+  # HEAD probe pair (§35): headWidget documents ONLY typed headers (ETag +
+  # Content-Length, both required) with NO content — decoders read headers,
+  # never a body. getWidget is the GET counterpart whose representation the
+  # metadata describes.
+  /tasks/{id}:
+    delete:
+      operationId: deleteTask
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Deleted
+        '404':
+          description: Missing task
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+  /widgets/{id}:
+    get:
+      operationId: getWidget
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The widget
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Widget'
+        '404':
+          description: Missing widget
+    head:
+      operationId: headWidget
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Widget exists; metadata only, never a body
+          headers:
+            ETag:
+              description: entity tag of the widget representation
+              required: true
+              schema:
+                type: string
+            Content-Length:
+              description: byte size of the GET representation
+              required: true
+              schema:
+                type: integer
+                format: int64
+        '404':
+          description: Missing widget
+
+  # ── (k) optional request body distinct from null ────────────────────────
+  # Fixture 09 (§26, §27; companion §2.1): echoNote carries a REQUIRED-false
+  # body of a nullable string so the generated pair distinguishes ABSENT
+  # (trait `None`) from JSON `null` (`Some(None)`) from a value
+  # (`Some(Some(..))`). Nullable properties also live on AuditEntry.metadata
+  # and MatrixRecord's nullable cells below.
+  /echo-note:
+    post:
+      operationId: echoNote
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: [string, 'null']
+      responses:
+        '200':
+          description: Echoed note
+          content:
+            application/json:
+              schema:
+                type: [string, 'null']
+
+  # ── (l) readOnly/writeOnly directional views ────────────────────────────
+  # Fixture 08 (companion §5): request codecs target <M>Write, response
+  # codecs <M>Read. createAccount exercises the lossless write view; GET
+  # /audit/{id} serves AuditEntry's read view; syncRecord mixes readOnly AND
+  # writeOnly so neither direction is lossless (trait takes the view).
+  /accounts:
+    post:
+      operationId: createAccount
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Account'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+  /audit/{id}:
+    get:
+      operationId: listAuditEntries
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEntry'
+  /synced:
+    put:
+      operationId: syncRecord
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SyncedRecord'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncedRecord'
+
+  # ── (m) composition: oneOf WITH discriminator, allOf merge, enums ───────
+  # Fixture 05 (companion §4): Pet's branches carry contradictory const tags
+  # AND an explicit disjoint discriminator mapping (provable exclusivity);
+  # FullWidget merges field-wise with required unions. Fixture 07 adds the
+  # companion §2.1 presence/nullability matrix and the StringStatus enum on
+  # a plain JSON roundtrip.
+  /pets:
+    post:
+      operationId: createPet
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Pet'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FullWidget'
+  /records:
+    post:
+      operationId: createRecord
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MatrixRecord'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatrixRecord'
+
+components:
+  schemas:
+    # Shared error shape (fixtures 01/02/09/10/…).
+    ProblemDetails:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+        detail:
+          type: string
+
+    # Fixture 01 shapes (feature class a; Widget also serves getWidget /
+    # probeStatus exactly as fixtures 17/04 reference their Widget).
+    CreateWidget:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+    Widget:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+
+    # Fixture 04's range payload (feature class i).
+    SuccessEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+
+    # Fixture 10 shapes (feature classes b).
+    CreateSessionForm:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+        remember_me:
+          type: boolean
+    Session:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+        token:
+          type: string
+
+    # Fixture 11 shapes (feature class f).
+    DocumentMetadata:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+        pages:
+          type: integer
+          format: int32
+    Document:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+
+    # Fixture 15 shapes (feature class g).
+    Record:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+        value:
+          type: number
+    Event:
+      type: object
+      required: [seq]
+      properties:
+        seq:
+          type: integer
+          format: int64
+        payload:
+          type: string
+    Metric:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        value:
+          type: number
+    Ack:
+      type: object
+      required: [accepted]
+      properties:
+        accepted:
+          type: boolean
+        received:
+          type: integer
+          format: int32
+
+    # Fixture 03's ArtifactMetadata fields, renamed for the thumbnail op
+    # (feature class e).
+    ThumbnailMetadata:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        size:
+          type: integer
+          format: int64
+
+    # Fixture 16's XmlDocument shape (title carries one runtime-validated
+    # constraint so SchemaViolation 422 stays provable after decode),
+    # re-keyed to the §21 vendor literal (feature class h).
+    VendorDocument:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+          minLength: 2
+        revision:
+          type: integer
+          format: int32
+
+    # Fixture 08 shapes (feature classes k+l). AuditEntry.metadata is the
+    # optional+nullable cell of companion §2.1.
+    Account:
+      type: object
+      required: [id, password]
+      properties:
+        id:
+          type: string
+        password:
+          type: string
+          writeOnly: true
+        note:
+          type: string
+    AuditEntry:
+      type: object
+      required: [createdAt]
+      properties:
+        createdAt:
+          type: string
+          readOnly: true
+        draftNote:
+          type: string
+          writeOnly: true
+        metadata:
+          type: [string, 'null']
+    SyncedRecord:
+      type: object
+      required: [id, label]
+      properties:
+        id:
+          type: string
+          readOnly: true
+        label:
+          type: string
+          minLength: 3
+        secretToken:
+          type: string
+          writeOnly: true
+        reviewedBy:
+          type: string
+          readOnly: true
+
+    # Fixture 05 composition shapes (feature class m).
+    BaseWidget:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+    Timestamps:
+      type: object
+      required: [createdAt]
+      properties:
+        name:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+    FullWidget:
+      allOf:
+        - $ref: '#/components/schemas/BaseWidget'
+        - $ref: '#/components/schemas/Timestamps'
+    Dog:
+      type: object
+      required: [kind, bark]
+      properties:
+        kind:
+          type: string
+          enum: [dog]
+        bark:
+          type: boolean
+    Cat:
+      type: object
+      required: [kind, meow]
+      properties:
+        kind:
+          type: string
+          enum: [cat]
+        meow:
+          type: integer
+    Pet:
+      oneOf:
+        - $ref: '#/components/schemas/Dog'
+        - $ref: '#/components/schemas/Cat'
+      discriminator:
+        propertyName: kind
+        mapping:
+          dog: '#/components/schemas/Dog'
+          cat: '#/components/schemas/Cat'
+
+    # Fixture 07 matrix + enum shapes (feature classes m and k's nullable
+    # model): all FOUR presence/nullability cells plus a string enum field.
+    MatrixRecord:
+      type: object
+      required: [req_plain, req_nullable]
+      properties:
+        req_plain:
+          type: string
+        req_nullable:
+          type: [string, 'null']
+        opt_plain:
+          type: integer
+          format: int32
+        opt_nullable:
+          type: [integer, 'null']
+        status:
+          $ref: '#/components/schemas/StringStatus'
+    StringStatus:
+      type: string
+      enum: [draft, in_review]

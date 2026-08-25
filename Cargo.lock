@@ -643,6 +643,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "kitchen-sink"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "futures-core",
+ "futures-util",
+ "http",
+ "mime",
+ "openapi-support",
+ "openapi-to-rust-generator",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"

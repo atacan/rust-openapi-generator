@@ -106,10 +106,10 @@ jobs:
                   MANIFEST_SNAPSHOT_UPDATE
 
             echo "::group::generation pass ${pass}"
-            cargo test -p openapi-to-rust-generator -p openapi-conformance --locked
+            cargo test -p openapi-to-rust-generator -p openapi-conformance -p kitchen-sink --locked
             echo '::endgroup::'
 
-            dirty="$(git status --porcelain crates/generator/tests/snapshots crates/conformance)"
+            dirty="$(git status --porcelain crates/generator/tests/snapshots crates/conformance examples/kitchen-sink)"
             if [ -n "$dirty" ]; then
               echo "::error::Determinism violation (main spec §50 test 39): \
           generation pass ${pass} changed tracked snapshot/conformance files. \
