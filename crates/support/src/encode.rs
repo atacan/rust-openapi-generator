@@ -552,7 +552,7 @@ impl<W: io::Write> FormKeyStager<'_, W> {
     }
 }
 
-impl<'a, W: io::Write> ser::Serializer for FormKeyStager<'a, W> {
+impl<W: io::Write> ser::Serializer for FormKeyStager<'_, W> {
     type Ok = ();
     type Error = EncodeTooLarge;
     type SerializeSeq = ser::Impossible<(), EncodeTooLarge>;

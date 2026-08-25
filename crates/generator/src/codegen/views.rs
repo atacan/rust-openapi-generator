@@ -395,7 +395,7 @@ struct Generator<'a> {
     blocks: Vec<Block>,
 }
 
-impl<'a> Generator<'a> {
+impl Generator<'_> {
     fn chase(&self, id: SchemaId) -> SchemaId {
         self.doc.resolve_alias(id)
     }

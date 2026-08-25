@@ -512,7 +512,7 @@ fn unify_family(a: Family, b: Family) -> Option<Family> {
     })
 }
 
-impl<'a> Resolver<'a> {
+impl Resolver<'_> {
     fn resolve_all_of_like(
         &mut self,
         members: Vec<SchemaEdge>,
@@ -966,7 +966,7 @@ struct BranchFacts {
     consts: BTreeMap<String, ConstantFact>,
 }
 
-impl<'a> Resolver<'a> {
+impl Resolver<'_> {
     fn resolve_choice(
         &mut self,
         keyword: ChoiceKeyword,
@@ -1318,7 +1318,7 @@ fn enum_values_len(values: &EnumValues) -> usize {
 // Structural equivalence of arena nodes (merge conflict detection)
 // ----------------------------------------------------------------------
 
-impl<'a> Resolver<'a> {
+impl Resolver<'_> {
     /// Structural equality of two schema nodes after normalization:
     /// kind (recursively), nullability, directionality, default, and
     /// validation must agree; descriptions and load diagnostics are

@@ -443,7 +443,7 @@ struct Generator<'a> {
     defs: Vec<Def>,
 }
 
-impl<'a> Generator<'a> {
+impl Generator<'_> {
     fn chase(&self, id: SchemaId) -> SchemaId {
         self.doc.resolve_alias(id)
     }
@@ -1411,7 +1411,7 @@ pub(crate) fn wrap_property_count_intro(body: Vec<String>, counting: bool) -> Ve
 // Type expressions
 // ----------------------------------------------------------------------
 
-impl<'a> Generator<'a> {
+impl Generator<'_> {
     /// Type expression for one edge: referenced type path with heap
     /// indirection applied (`Box<T>` when the cycle-precise pass flagged the
     /// property edge, D-impl-boxing). Nullability wrapping belongs to the
@@ -1495,7 +1495,7 @@ impl<'a> Generator<'a> {
 // Choice enums (proven oneOf/anyOf)
 // ----------------------------------------------------------------------
 
-impl<'a> Generator<'a> {
+impl Generator<'_> {
     /// Newtype variants over branch types; variant names come from branch
     /// component names with numeric suffixes on collision (companion §10).
     fn build_choice_enum(

@@ -291,9 +291,7 @@ async fn route_upload_document(
             ));
         }
         RequestEntryMatch::Entry(0) => {
-            let request_body =
-                collect_upload_document_multipart(body, parsed.as_ref(), &limits).await?;
-            request_body
+            collect_upload_document_multipart(body, parsed.as_ref(), &limits).await?
         }
         RequestEntryMatch::Entry(_) => unreachable!("request entry index out of range"),
     };

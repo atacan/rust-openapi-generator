@@ -138,11 +138,10 @@ jobs:
       # from the stable ones automatically.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - run: rustc --version | grep -q '^rustc 1\.85\.' || { echo 'wrong toolchain'; exit 1; }
-      # Test-only on purpose: locally verified that 1.85's bundled clippy does
-      # NOT pass cleanly (`explicit lifetimes could be elided` fires 7× in
-      # openapi-to-rust-generator where current-stable clippy is silent — the
-      # lint matured between versions). Re-add an MSRV clippy gate only once
-      # the sources satisfy both linters.
+      # F4 closed the gap: the elided-lifetime sites were fixed, so 1.85's
+      # clippy now passes with -D warnings (verified locally under
+      # RUSTUP_TOOLCHAIN=1.85) — the MSRV job lints as well as tests.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
   # ─── 6. Fuzz smoke (main spec §50 test 41) ──────────────────────────────

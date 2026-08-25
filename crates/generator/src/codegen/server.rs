@@ -4289,15 +4289,21 @@ fn emit_entry_arm(
     {
         emitter.line(indent, &format!("RequestEntryMatch::Entry({index}) => {{"));
         let call = format!("{collector}(body, parsed.as_ref(), &limits).await?");
-        let bind = format!("let request_body = {call}");
-        if fits(indent + 1, &bind) {
-            emitter.line(indent + 1, &bind);
-        } else {
-            emitter.line(indent + 1, "let request_body =");
-            emitter.line(
-                indent + 2,
-                &format!("{collector}(body, parsed.as_ref(), &limits).await?;"),
-            );
+        // A bare `let request_body = X; request_body` trips
+        // clippy::let_and_return on the MSRV toolchain (rustc 1.85), so the
+        // binding is only emitted when a wrapper consumes it.
+        let needs_binding = enum_variant.is_some() || !required;
+        if needs_binding {
+            let bind = format!("let request_body = {call}");
+            if fits(indent + 1, &bind) {
+                emitter.line(indent + 1, &bind);
+            } else {
+                emitter.line(indent + 1, "let request_body =");
+                emitter.line(
+                    indent + 2,
+                    &format!("{collector}(body, parsed.as_ref(), &limits).await?;"),
+                );
+            }
         }
         match enum_variant {
             Some((enum_name, variant)) => {
@@ -4310,7 +4316,8 @@ fn emit_entry_arm(
             }
             None => {
                 if required {
-                    emitter.line(indent + 1, "request_body");
+                    // Tail expression: no binding was emitted above.
+                    emitter.line(indent + 1, &call);
                 } else {
                     emitter.line(indent + 1, "Some(request_body)");
                 }
