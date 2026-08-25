@@ -61,6 +61,11 @@ jobs:
       - run: >
           cargo clippy -p openapi-support --all-targets --features client,server
           --locked -- -D warnings
+      # §30.2 decompression feature (opt-in): lint the decoded-byte
+      # accounting test module that only exists under `client-gzip`.
+      - run: >
+          cargo clippy -p openapi-support --all-targets --features
+          client,client-gzip --locked -- -D warnings
 
   # ─── 3. Tests (long-haul proofs stay #[ignore]-gated) ───────────────────
   test:

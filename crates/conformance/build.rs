@@ -19,7 +19,7 @@ use openapi_to_rust_generator::codegen::client::generate_client;
 use openapi_to_rust_generator::codegen::manifest::{generate_manifest, ManifestConfig};
 use openapi_to_rust_generator::codegen::models::generate_models;
 use openapi_to_rust_generator::codegen::plan::{
-    plan_api_with_config, GeneratorPlanOptions, OperationPattern, PlanConfig,
+    plan_api_with_config, Decompression, GeneratorPlanOptions, OperationPattern, PlanConfig,
     RepresentationOverride,
 };
 use openapi_to_rust_generator::codegen::server::generate_server;
@@ -33,6 +33,12 @@ use openapi_to_rust_generator::parse::{load_document, LoadConfig};
 /// directory suffix and its own `include!` module tree.
 const CODEC_FIXTURE: &str = "16_codecs.yaml";
 
+/// Fixture 01 is regenerated once with §30.2 gzip decompression enabled so
+/// the emitted builder calls `.gzip(true)` and the emitted manifest routes
+/// the matching features; the compression round trips drive THAT artifact
+/// set (§50 test 32's end-to-end half).
+const JSON_FIXTURE_GZIP_VARIANT: &str = ".gzip";
+
 /// `(directory suffix, plan options)` for every codec-enabled variant.
 fn codec_variants() -> Vec<(&'static str, GeneratorPlanOptions)> {
     vec![
@@ -41,6 +47,7 @@ fn codec_variants() -> Vec<(&'static str, GeneratorPlanOptions)> {
             GeneratorPlanOptions {
                 enabled_codecs: ["xml"].into_iter().collect(),
                 overrides: Vec::new(),
+                response_decompression: Decompression::OFF,
             },
         ),
         (
@@ -48,6 +55,7 @@ fn codec_variants() -> Vec<(&'static str, GeneratorPlanOptions)> {
             GeneratorPlanOptions {
                 enabled_codecs: ["cbor"].into_iter().collect(),
                 overrides: Vec::new(),
+                response_decompression: Decompression::OFF,
             },
         ),
         (
@@ -55,6 +63,7 @@ fn codec_variants() -> Vec<(&'static str, GeneratorPlanOptions)> {
             GeneratorPlanOptions {
                 enabled_codecs: ["msgpack"].into_iter().collect(),
                 overrides: Vec::new(),
+                response_decompression: Decompression::OFF,
             },
         ),
         (
@@ -80,6 +89,7 @@ fn codec_variants() -> Vec<(&'static str, GeneratorPlanOptions)> {
                         match_operation: OperationPattern::Any,
                     },
                 ],
+                response_decompression: Decompression::OFF,
             },
         ),
     ]
@@ -130,6 +140,27 @@ fn main() {
                     },
                 );
             }
+        }
+        if fixture == "01_json_roundtrip.yaml" {
+            let stem = fixture.strip_suffix(".yaml").unwrap_or(fixture);
+            let dir = out_dir.join(format!("{stem}{JSON_FIXTURE_GZIP_VARIANT}"));
+            emit_with_options(
+                &fixtures_dir,
+                fixture,
+                &dir,
+                &PlanConfig {
+                    generator_options: GeneratorPlanOptions {
+                        enabled_codecs: Default::default(),
+                        overrides: Vec::new(),
+                        response_decompression: Decompression {
+                            gzip: true,
+                            brotli: false,
+                            zstd: false,
+                        },
+                    },
+                    ..PlanConfig::default()
+                },
+            );
         }
     }
 }
@@ -215,6 +246,11 @@ fn generate_with_config(
         &plan,
         &ManifestConfig {
             enabled_codecs: config.generator_options.enabled_codecs.clone(),
+            features: openapi_to_rust_generator::codegen::manifest::FeatureSelection {
+                client: true,
+                server: true,
+                decompression: config.generator_options.response_decompression,
+            },
             ..ManifestConfig::default()
         },
     )

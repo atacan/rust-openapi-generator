@@ -17,8 +17,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 mime = "0.3"
     # `time` backs the §31 replay-twin backoff sleeps
-    # (::openapi_support::retry); DECISIONS D-impl-retry.
-    tokio = { version = "1", features = ["fs", "io-util", "macros", "rt", "time"] }
+    # (::openapi_support::retry); DECISIONS D-impl-retry. `net` backs the
+    # §30.2/§50-t32 decoded-byte-limit proof, which serves a gzipped body over
+    # a hermetic loopback socket from inside openapi-support's test suite.
+    tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
 futures-core = "0.3"
 futures-util = "0.3"

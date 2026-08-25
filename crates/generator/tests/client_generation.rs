@@ -30,6 +30,7 @@ const SNAPSHOT_FIXTURES: &[&str] = &[
     "13_validation.yaml",
     "14_negotiation.yaml",
     "15_streams.yaml",
+    "17_head.yaml",
 ];
 
 /// Every fixture must plan + render without diagnostics (07/08 included).
@@ -49,6 +50,7 @@ const ALL_FIXTURES: &[&str] = &[
     "13_validation.yaml",
     "14_negotiation.yaml",
     "15_streams.yaml",
+    "17_head.yaml",
 ];
 
 fn fixtures_dir() -> PathBuf {
@@ -665,11 +667,11 @@ fn headers_hoist_onto_multi_content_variants_and_header_only_statuses() {
     let response_enum = enum_block(&output, "GetMultiResponse");
     assert!(response_enum.contains("Ok200 {"), "{response_enum}");
     assert!(
-        response_enum.contains("pub x_request_id: String,"),
+        response_enum.contains("x_request_id: String,"),
         "{response_enum}"
     );
     assert!(
-        response_enum.contains("pub retry_after_seconds: Option<i32>,"),
+        response_enum.contains("retry_after_seconds: Option<i32>,"),
         "{response_enum}"
     );
     assert!(
@@ -680,7 +682,7 @@ fn headers_hoist_onto_multi_content_variants_and_header_only_statuses() {
     // Header-only 302: exactly the typed headers, never a body field.
     assert!(output.contains("Found302 {"), "\n{output}");
     assert!(
-        response_enum.contains("pub location: String,"),
+        response_enum.contains("location: String,"),
         "{response_enum}"
     );
 
@@ -950,4 +952,62 @@ fn fixture_08_client_request_enums_and_methods_take_write_views() {
         output.contains("Directional views (companion §5"),
         "\n{output}"
     );
+}
+
+// ----------------------------------------------------------------------
+// Fixture 17 — HEAD header-only variants (§15, §35)
+// ----------------------------------------------------------------------
+
+#[test]
+fn fixture_17_head_variants_carry_typed_headers_without_body_accessor() {
+    let output = generate_fixture("17_head.yaml");
+
+    // The HEAD response variant carries EXACTLY the typed headers: no body
+    // field exists to reach, and the GET counterpart keeps its normal
+    // decoded-payload shape beside it.
+    let head_enum = enum_block(&output, "HeadWidgetResponse");
+    assert!(
+        head_enum.contains("Ok200 {")
+            && head_enum.contains("e_tag: String,")
+            && head_enum.contains("content_length: i64,"),
+        "HEAD variant must carry the typed headers:\n{head_enum}"
+    );
+    assert!(
+        !head_enum.contains("body"),
+        "HEAD variants must not expose a body accessor:\n{head_enum}"
+    );
+    assert!(
+        enum_block(&output, "GetWidgetResponse").contains("Ok200(Widget),"),
+        "GET counterpart decodes its representation:\n{output}"
+    );
+
+    // The decode arm parses the headers and constructs the variant without
+    // ever collecting or validating a body (§35), and sends no Accept
+    // header (§29: HEAD decode nothing). The decode tail (shared
+    // `decode_head_widget`) is where header parsing happens; slice BOTH fns.
+    let head_tail = output
+        .split_once("async fn decode_head_widget(")
+        .expect("HEAD decode tail emitted")
+        .1;
+    let head_fn = head_tail.split("\n    }\n").next().expect("fn body");
+    assert!(
+        head_fn.contains("let e_tag = parse_required_header::<String>(&response, \"etag\")?;"),
+        "\n{head_fn}"
+    );
+    assert!(
+        head_fn.contains(
+            "let content_length = parse_required_header::<i64>(&response, \
+             \"content-length\")?;"
+        ),
+        "\n{head_fn}"
+    );
+    assert!(
+        head_fn.contains("Ok(HeadWidgetResponse::Ok200 {\n                    e_tag,\n                    content_length,\n                })"),
+        "\n{head_fn}"
+    );
+    assert!(
+        !head_fn.contains("collect_reqwest_limited"),
+        "HEAD must never buffer a response body:\n{head_fn}"
+    );
+    assert!(!head_fn.contains("ACCEPT"), "\n{head_fn}");
 }

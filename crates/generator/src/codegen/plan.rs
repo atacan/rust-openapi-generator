@@ -88,6 +88,60 @@ pub struct GeneratorPlanOptions {
     pub enabled_codecs: BTreeSet<&'static str>,
     /// Representation overrides applied before codec claims are considered.
     pub overrides: Vec<RepresentationOverride>,
+    /// §30.2 transparent response decompression opt-ins; ALL OFF by default
+    /// ([`Decompression::OFF`]), so existing documents generate byte-identical
+    /// clients. When any coding is enabled the emitted `ClientBuilder` calls
+    /// the matching Reqwest method and the emitted manifest wires the matching
+    /// `openapi-support` feature.
+    pub response_decompression: Decompression,
+}
+
+/// §30.2 transparent response decompression configuration (MAY clause): one
+/// flag per content coding Reqwest can remove beneath the generated decode
+/// path. Structured-body limits count DECODED bytes regardless — collection
+/// happens above Reqwest's decompression layer — so enabling these never
+/// weakens the bomb bound; it only widens what servers may send.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Decompression {
+    /// Wire `.gzip(true)` on the emitted builder and route the generated
+    /// crate's `client-gzip` feature to `openapi-support/client-gzip`.
+    pub gzip: bool,
+    /// Same for Brotli (`client-br` / `reqwest/brotli`).
+    pub brotli: bool,
+    /// Same for Zstandard (`client-zstd` / `reqwest/zstd`).
+    pub zstd: bool,
+}
+
+impl Decompression {
+    /// All codings OFF (the default policy).
+    pub const OFF: Self = Self {
+        gzip: false,
+        brotli: false,
+        zstd: false,
+    };
+
+    /// True when at least one coding is enabled.
+    #[must_use]
+    pub fn any(self) -> bool {
+        self.gzip || self.brotli || self.zstd
+    }
+
+    /// `(feature suffix, builder method)` pairs in deterministic emission
+    /// order, filtered to the enabled codings.
+    #[must_use]
+    pub fn enabled(self) -> Vec<(&'static str, &'static str)> {
+        let mut out = Vec::new();
+        if self.gzip {
+            out.push(("gzip", "gzip"));
+        }
+        if self.brotli {
+            out.push(("br", "brotli"));
+        }
+        if self.zstd {
+            out.push(("zstd", "zstd"));
+        }
+        out
+    }
 }
 
 /// Custom generator representation override (main spec §44): today only
@@ -160,6 +214,11 @@ pub struct PlannedApi {
     /// ids against these and resolves dependency fragments through
     /// [`super::codecs::manifest_dependency_for`].
     pub enabled_codecs: BTreeSet<&'static str>,
+    /// §30.2 decompression policy copied from
+    /// [`PlanConfig::generator_options`] so the client emitter and the
+    /// emitted-manifest feature graph both consume the SAME verdict without
+    /// re-deriving it.
+    pub response_decompression: Decompression,
 }
 
 /// One operation with every codegen decision precomputed so both emitters
@@ -465,6 +524,7 @@ pub fn plan_api_with_config(
         operations,
         server_runtime_validation: config.server_runtime_validation,
         enabled_codecs: config.generator_options.enabled_codecs.clone(),
+        response_decompression: config.generator_options.response_decompression,
     })
 }
 
@@ -530,7 +590,7 @@ fn plan_operation(
                 analysis,
                 view_bindings,
             );
-            let headers = plan_response_headers(doc, response, operation.method, &location, diags);
+            let headers = plan_response_headers(doc, response, &location, diags);
             let status = PlannedStatus {
                 key: response.status,
                 enum_variant: variant_name(&response.status),
@@ -1507,11 +1567,13 @@ fn effective_kind(doc: &NormalizedDocument, effective: SchemaId) -> Box<SchemaKi
 /// Plans the typed header fields of one response (main spec §15): scalar
 /// schemas map like parameters; arrays/composites stop with an Error
 /// diagnostic. No-body statuses (§35) refuse documented headers outright —
-/// their unit variants would silently drop contract information.
+/// their unit variants would silently drop contract information. HEAD
+/// operations DO carry their documented headers: §35 makes them the ONLY
+/// payload a HEAD response has, so both emitters render the header-only
+/// variant shape (typed fields, no body accessor) for them.
 fn plan_response_headers(
     doc: &NormalizedDocument,
     response: &ResponseEntryIr,
-    http_method: HttpMethod,
     location: &DocumentPath,
     diags: &mut Diagnostics,
 ) -> Vec<PlannedResponseHeader> {
@@ -1532,20 +1594,6 @@ fn plan_response_headers(
                  the headers to another status",
                 crate::normalize::status_label(&response.status)
             ),
-        );
-        return Vec::new();
-    }
-    if http_method == HttpMethod::Head {
-        // §35 wants HEAD decoders to surface typed headers without touching
-        // the body; that dedicated decoder shape remains a later-phase
-        // deliverable, so stop-and-report instead of improvising.
-        diags.error(
-            header_location().key("headers"),
-            "headers_on_head_operation",
-            "operation documents response headers on a HEAD request (main \
-             spec §35); the typed-header HEAD decoder shape is a \
-             later-phase deliverable"
-                .to_owned(),
         );
         return Vec::new();
     }

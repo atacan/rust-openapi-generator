@@ -29,12 +29,19 @@
 //! ```toml
 //! client = ["openapi_support/client", "dep:reqwest", "dep:hyper", "dep:tokio", "dep:tokio-util", "dep:futures-util"]
 //! server = ["openapi_support/server", "dep:axum", "dep:tokio", "dep:tokio-util", "dep:futures-util"]
+//! client-gzip = ["client", "openapi-support/client-gzip", "reqwest/gzip"]
+//! client-br = ["client", "openapi-support/client-br", "reqwest/brotli"]
+//! client-zstd = ["client", "openapi-support/client-zstd", "reqwest/zstd"]
 //! ```
 //!
-//! Both lines are always declared so consumers can flip a surface on
-//! downstream; only `default` reflects the configured selection (§3 default
-//! `["client", "server"]`). Support stays dependency-light: codec runtime
-//! crates appear ONLY when enabled (D-impl-codec-plugins), rendered from
+//! Both transport lines are always declared so consumers can flip a surface
+//! on downstream; the three §30.2 codings mirror `openapi-support`'s own
+//! `client-gzip`/`client-br`/`client-zstd` graph (routing BOTH the support
+//! twin and this crate's `reqwest` feature — the emitted builder calls
+//! Reqwest's decoding methods directly); only `default` reflects the
+//! configured selection (§3 default `["client", "server"]`). Support stays
+//! dependency-light: codec runtime crates appear ONLY when enabled
+//! (D-impl-codec-plugins), rendered from
 //! [`super::codecs::manifest_dependency_for`] verbatim.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -44,7 +51,7 @@ use crate::normalize::naming;
 use crate::normalize::NormalizedDocument;
 
 use super::codecs;
-use super::plan::PlannedApi;
+use super::plan::{Decompression, PlannedApi};
 
 /// Version requirements for crates outside the §3.1 tuple. Fixed per
 /// generator release like the tuple itself; not user-overridable because
@@ -103,20 +110,24 @@ impl EmbeddedToolchain {
 
 /// Which transport surfaces the generated crate wires by default (§3):
 /// both `client` and `server` by default; the feature DEFINITIONS are always
-/// emitted so consumers can enable either later.
+/// emitted so consumers can enable either later. Decompression mirrors the
+/// §30.2 policy: all codings OFF unless configured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FeatureSelection {
     /// Wire `client` into `default`.
     pub client: bool,
     /// Wire `server` into `default`.
     pub server: bool,
+    /// §30.2 transparent response decompression wired into `default`.
+    pub decompression: Decompression,
 }
 
 impl FeatureSelection {
-    /// Both surfaces wired (the §3 default shape).
+    /// Both surfaces wired (the §3 default shape) with decompression OFF.
     pub const BOTH: Self = Self {
         client: true,
         server: true,
+        decompression: Decompression::OFF,
     };
 }
 
@@ -197,6 +208,7 @@ pub fn generate_manifest(
 ) -> Result<String, Vec<Diagnostic>> {
     let mut diags = Vec::new();
     validate_codecs(cfg, plan, &mut diags);
+    validate_decompression(cfg, plan, &mut diags);
     if !cfg.features.client && !cfg.features.server {
         diags.push(Diagnostic {
             severity: crate::diagnostics::Severity::Error,
@@ -329,6 +341,37 @@ fn validate_codecs(cfg: &ManifestConfig, plan: &PlannedApi, diags: &mut Vec<Diag
     }
 }
 
+/// §30.2 counterpart of [`validate_codecs`]: a coding the PLAN enables must
+/// also be configured in the feature selection, or the emitted
+/// `ClientBuilder` would call a Reqwest method its dependency graph does not
+/// compile (`manifest_decompression_not_enabled`). Extra configured codings
+/// are harmless — the routing lines exist regardless, mirroring
+/// openapi-support's own graph.
+fn validate_decompression(cfg: &ManifestConfig, plan: &PlannedApi, diags: &mut Vec<Diagnostic>) {
+    for (suffix, _) in plan.response_decompression.enabled() {
+        let configured = match suffix {
+            "gzip" => cfg.features.decompression.gzip,
+            "br" => cfg.features.decompression.brotli,
+            _ => cfg.features.decompression.zstd,
+        };
+        if !configured {
+            diags.push(Diagnostic {
+                severity: crate::diagnostics::Severity::Error,
+                path: DocumentPath::root()
+                    .key("features")
+                    .key(format!("client-{suffix}")),
+                code: "manifest_decompression_not_enabled",
+                message: format!(
+                    "the plan enables `{suffix}` response decompression but \
+                     `features.decompression` does not; the emitted builder \
+                     would call Reqwest's method without the matching feature \
+                     compiled in (§30.2)"
+                ),
+            });
+        }
+    }
+}
+
 /// Every codec plugin id claimed anywhere in the plan (deterministic order
 /// via `BTreeSet`).
 fn planned_codec_ids(plan: &PlannedApi) -> BTreeSet<&'static str> {
@@ -428,12 +471,22 @@ fn render(
     if cfg.features.server {
         default_features.push("server");
     }
+    for (suffix, _) in cfg.features.decompression.enabled() {
+        default_features.push(match suffix {
+            "gzip" => "client-gzip",
+            "br" => "client-br",
+            _ => "client-zstd",
+        });
+    }
     out.push_str(&format!("default = [{}]\n", quoted_list(&default_features)));
     // Feature lines mirror openapi-support's own graph EXACTLY (D-impl-
     // crate), prefixed by the routing into the matching support half so the
     // generated code can see the support-side items behind those features.
     // Routing uses the dependency's LITERAL key (`openapi-support`);
-    // underscored forms are rejected by cargo here.
+    // underscored forms are rejected by cargo here. The §30.2 codings route
+    // BOTH halves: support's twin feature AND this crate's own `reqwest`
+    // feature, because the emitted builder calls Reqwest's decoding methods
+    // directly.
     out.push_str(&format!(
         "client = [{}, {}, {}, {}, {}, {}]\n",
         "\"openapi-support/client\"",
@@ -451,6 +504,28 @@ fn render(
         "\"dep:tokio-util\"",
         "\"dep:futures-util\""
     ));
+    // §30.2 decompression features are OPT-IN: each coding's feature line is
+    // emitted only when the corresponding config flag is set, so documents
+    // generated with the default (all-OFF) configuration stay byte-identical
+    // to pre-decompression output.
+    if cfg.features.decompression.gzip {
+        out.push_str(
+            "client-gzip = [\"client\", \"openapi-support/client-gzip\", \
+             \"reqwest/gzip\"]\n",
+        );
+    }
+    if cfg.features.decompression.brotli {
+        out.push_str(
+            "client-br = [\"client\", \"openapi-support/client-br\", \
+             \"reqwest/brotli\"]\n",
+        );
+    }
+    if cfg.features.decompression.zstd {
+        out.push_str(
+            "client-zstd = [\"client\", \"openapi-support/client-zstd\", \
+             \"reqwest/zstd\"]\n",
+        );
+    }
     out.push('\n');
 
     // [dependencies]: every entry lands in the map; alphabetical key order

@@ -33,8 +33,8 @@ use crate::normalize::NormalizedDocument;
 
 use super::codecs::{default_registry as codec_registry, helper_prefix};
 use super::plan::{
-    PlannedApi, PlannedContent, PlannedMultipart, PlannedMultipartField, PlannedMultipartFieldKind,
-    PlannedOperation, PlannedParameter, PlannedStatus, StreamFraming,
+    Decompression, PlannedApi, PlannedContent, PlannedMultipart, PlannedMultipartField,
+    PlannedMultipartFieldKind, PlannedOperation, PlannedParameter, PlannedStatus, StreamFraming,
 };
 use super::Emitter;
 
@@ -56,7 +56,7 @@ pub fn generate_client(doc: &NormalizedDocument, plan: &PlannedApi) -> String {
     emit_header(&mut emitter, doc, &flags);
     let bases = BaseSet::new(plan);
     emit_client(&mut emitter, &bases);
-    emit_builder(&mut emitter, &bases);
+    emit_builder(&mut emitter, &bases, plan.response_decompression);
     for (op_index, operation) in plan.operations.iter().enumerate() {
         emit_operation_definitions(&mut emitter, op_index, operation, &layout);
     }
@@ -731,21 +731,35 @@ fn emit_client(emitter: &mut Emitter, bases: &BaseSet) {
     emitter.line(0, "}");
 }
 
-fn emit_builder(emitter: &mut Emitter, bases: &BaseSet) {
+fn emit_builder(emitter: &mut Emitter, bases: &BaseSet, decompression: Decompression) {
     let primary = bases.primary();
     emitter.blank();
-    emitter.docs(
-        0,
-        &[
-            "Builder for `Client` (main spec §30.1): redirects disabled unless \
+    let mut builder_docs = vec![
+        "Builder for `Client` (main spec §30.1): redirects disabled unless \
              opted in through `follow_redirects`; relative default servers \
              require explicit overrides (D-impl-relative-servers). Recorded \
              decision (companion §8): an explicit `base_url` replaces ONLY \
              the primary base; every additional base is overridden per key \
              through `secondary_base_url`."
-                .to_owned(),
-        ],
-    );
+            .to_owned(),
+    ];
+    if decompression.any() {
+        // §30.2 opt-in: the codings are wired HERE so every generated method
+        // observes decoded streams beneath its bounded collectors.
+        let codings = decompression
+            .enabled()
+            .into_iter()
+            .map(|(suffix, _)| suffix)
+            .collect::<Vec<_>>()
+            .join(", ");
+        builder_docs.push(format!(
+            "Transparent response decompression (§30.2) is pre-wired for this \
+             API: the transport removes [{codings}] before any generated code \
+             observes the payload, so structured-body limits count DECODED \
+             bytes."
+        ));
+    }
+    emitter.docs(0, &builder_docs);
     emitter.line(0, "pub struct ClientBuilder {");
     emitter.line(1, "http: ::reqwest::ClientBuilder,");
     emitter.line(1, "base_url: Option<String>,");
@@ -828,10 +842,21 @@ fn emit_builder(emitter: &mut Emitter, bases: &BaseSet) {
         );
     }
     emitter.line(2, "Self {");
-    emitter.line(
-        3,
-        "http: ::reqwest::Client::builder().redirect(::reqwest::redirect::Policy::none()),",
-    );
+    if decompression.any() {
+        // §30.2: the chain goes fully vertical under rustfmt's chain width
+        // once any coding joins, in the deterministic gzip/brotli/zstd order.
+        emitter.line(3, "http: ::reqwest::Client::builder()");
+        emitter.line(4, ".redirect(::reqwest::redirect::Policy::none())");
+        for (_, method) in decompression.enabled() {
+            emitter.line(4, &format!(".{method}(true)"));
+        }
+        emitter.line(3, ",");
+    } else {
+        emitter.line(
+            3,
+            "http: ::reqwest::Client::builder().redirect(::reqwest::redirect::Policy::none()),",
+        );
+    }
     emitter.line(3, "base_url: None,");
     emitter.line(3, "limits: BodyLimits::process_default(),");
     emitter.line(3, "default_server_url,");
@@ -1914,7 +1939,7 @@ fn emit_stream_wrapper(
     );
     emitter.line(0, "#[derive(Debug)]");
     emitter.line(0, &format!("pub struct {name} {{"));
-    emit_header_fields(emitter, status, 1);
+    emit_header_fields(emitter, status, 1, "pub ");
     emitter.line(1, "pub response: ::reqwest::Response,");
     emitter.line(1, "pub limits: BodyLimits,");
     emitter.line(0, "}");
@@ -2129,7 +2154,7 @@ fn emit_wrapper(
     emitter.docs(0, &docs);
     emitter.line(0, "#[derive(Debug)]");
     emitter.line(0, &format!("pub struct {name} {{"));
-    emit_header_fields(emitter, status, 1);
+    emit_header_fields(emitter, status, 1, "pub ");
     if streaming {
         emitter.line(1, "pub response: ::reqwest::Response,");
     } else {
@@ -2165,8 +2190,15 @@ fn emit_wrapper(
 }
 
 /// Typed documented-header fields of one status (main spec §15): required
-/// headers become plain fields, optional ones `Option<T>`.
-fn emit_header_fields(emitter: &mut Emitter, status: &PlannedStatus, indent: usize) {
+/// headers become plain fields, optional ones `Option<T>`. `visibility` is
+/// `pub` for wrapper STRUCTS; enum-variant fields share the enum's
+/// visibility, so enum paths pass the empty prefix.
+fn emit_header_fields(
+    emitter: &mut Emitter,
+    status: &PlannedStatus,
+    indent: usize,
+    visibility: &str,
+) {
     for header in &status.headers {
         let field_type = if header.required {
             header.rust_type.clone()
@@ -2185,7 +2217,10 @@ fn emit_header_fields(emitter: &mut Emitter, status: &PlannedStatus, indent: usi
                 }
             )],
         );
-        emitter.line(indent, &format!("pub {}: {field_type},", header.rust_name));
+        emitter.line(
+            indent,
+            &format!("{visibility}{}: {field_type},", header.rust_name),
+        );
     }
 }
 
@@ -2231,7 +2266,7 @@ fn emit_response_enum(
             // documented headers ride inside the struct variant (§15).
             emitter.line(1, &format!("{} {{", status.enum_variant));
             emitter.line(2, "status: ::http::StatusCode,");
-            emit_header_fields(emitter, status, 2);
+            emit_header_fields(emitter, status, 2, "");
             match status.contents.len() {
                 0 => {}
                 _ => {
@@ -2256,7 +2291,7 @@ fn emit_response_enum(
             // Header-only documented response (e.g. 302 + Location): the
             // variant carries exactly the typed headers.
             emitter.line(1, &format!("{} {{", status.enum_variant));
-            emit_header_fields(emitter, status, 2);
+            emit_header_fields(emitter, status, 2, "");
             emitter.line(1, "},");
             continue;
         }
@@ -2269,7 +2304,7 @@ fn emit_response_enum(
                 .get(&(op_index, status_index))
                 .expect("content enum registered");
             emitter.line(1, &format!("{} {{", status.enum_variant));
-            emit_header_fields(emitter, status, 2);
+            emit_header_fields(emitter, status, 2, "");
             emitter.line(2, &format!("content: {content_enum},"));
             emitter.line(1, "},");
             continue;
@@ -3143,31 +3178,29 @@ fn emit_request_construction(
             "// \u{a7}30.1: redirects are off by default so documented 3xx statuses reach \
              the exhaustive enum; opt-in following never buffers bodies for replay.",
         );
-        emitter.line(2, "let response = self");
-        emitter.line(3, ".http");
-        emitter.line(
-            3,
-            &format!(
+        // Build the send chain as segments, then collapse to one line exactly
+        // when rustfmt would: total line within max width AND the chain
+        // portion within `chain_width` (60). Header/body segments usually
+        // push it past that, which is why most methods stay vertical.
+        let mut segments: Vec<String> = vec![
+            "self.http".to_owned(),
+            format!(
                 ".request(::http::Method::{}, &url)",
                 http_method_const(operation.http)
             ),
-        );
+        ];
         if !operation.request_contents.is_empty() {
             let content = &operation.request_contents[0];
-            emit_chain_header(
-                emitter,
-                3,
-                "::http::header::CONTENT_TYPE",
-                &content.media_type_literal,
-            );
+            segments.push(format!(
+                ".header(::http::header::CONTENT_TYPE, {})",
+                rust_string_literal(&content.media_type_literal)
+            ));
         }
         if !operation.accept_header_value.is_empty() {
-            emit_chain_header(
-                emitter,
-                3,
-                "::http::header::ACCEPT",
-                &operation.accept_header_value,
-            );
+            segments.push(format!(
+                ".header(::http::header::ACCEPT, {})",
+                rust_string_literal(&operation.accept_header_value)
+            ));
         }
         if let [content] = operation.request_contents.as_slice() {
             let payload_expr = match content.media_class {
@@ -3176,10 +3209,53 @@ fn emit_request_construction(
                 _ if content.codec.is_some() => "payload",
                 _ => "body",
             };
-            emitter.line(3, &format!(".body({payload_expr})"));
+            segments.push(format!(".body({payload_expr})"));
         }
-        emitter.line(3, ".send()");
-        emitter.line(3, ".await?;");
+        segments.push(".send()".to_owned());
+        let chain = segments.join("");
+        let single = format!("let response = {chain}.await?;");
+        // Empirical rustfmt rule for these chains: one line whenever the
+        // whole statement fits the max width, regardless of chain_width —
+        // header/body segments usually push past 100, which is why most
+        // methods stay vertical.
+        let line_fits_max_width = single.len() + 8 <= 100;
+        if line_fits_max_width {
+            emitter.line(2, &single);
+        } else {
+            emitter.line(2, "let response = self");
+            // Vertical form continues the receiver chain, so the leading
+            // `self.http` segment becomes `.http`. Header segments carry a
+            // PRE-QUOTED literal (rust_string_literal already applied when
+            // the segment was built), so break their args across lines
+            // directly instead of delegating to emit_chain_header, which
+            // would quote a second time.
+            for (index, segment) in segments.iter().enumerate() {
+                if let Some(rest) = segment.strip_prefix(".header(") {
+                    let inner = rest.trim_end_matches(')');
+                    if let Some((path, value)) = inner.split_once(", ") {
+                        // Same threshold as emit_chain_header: path +
+                        // value + ", " + "()" overhead against
+                        // fn_call_width; longer ones break their args.
+                        if path.len() + value.len() + 4 <= FN_CALL_WIDTH {
+                            emitter.line(3, segment);
+                        } else {
+                            emitter.line(3, ".header(");
+                            emitter.line(4, &format!("{path},"));
+                            emitter.line(4, &format!("{value},"));
+                            emitter.line(3, ")");
+                        }
+                        continue;
+                    }
+                }
+                let rendered = if index == 0 {
+                    segment.replace("self.http", ".http")
+                } else {
+                    segment.clone()
+                };
+                emitter.line(3, &rendered);
+            }
+            emitter.line(3, ".await?;");
+        }
     }
 }
 
@@ -3727,20 +3803,27 @@ fn emit_status_arm(
     let has_headers = !status.headers.is_empty();
 
     // §35: no-body statuses and HEAD never read or validate the body, even
-    // when the document lists content entries for them. (Planning refuses
-    // headers on no-body statuses, so nothing is dropped here.)
+    // when the document lists content entries for them. Documented HEAD
+    // headers are that response's ONLY payload, so they surface through the
+    // §15 header-only variant shape: typed fields, no body accessor.
+    // (Planning refuses headers on 204/205/304, so nothing is dropped there.)
+    let head_only = operation.http == HttpMethod::Head && !status.headers.is_empty();
     if status.is_no_body_status || operation.http == HttpMethod::Head {
-        emit_simple_arm(
-            emitter,
-            3,
-            &pattern,
-            op_index,
-            operation,
-            status,
-            status_index,
-            layout,
-            BodyExpr::None,
-        );
+        if !head_only {
+            emit_simple_arm(
+                emitter,
+                3,
+                &pattern,
+                op_index,
+                operation,
+                status,
+                status_index,
+                layout,
+                BodyExpr::None,
+            );
+            return;
+        }
+        emit_header_only_arm(emitter, 3, &pattern, operation, status);
         return;
     }
 
@@ -3852,38 +3935,9 @@ fn emit_status_arm(
 
     if status.contents.is_empty() {
         if has_headers {
-            // Header-only documented response (§15): parse the headers and
-            // construct the struct variant; no body is read.
-            emitter.line(3, &format!("{pattern} {{"));
-            emit_header_binds(emitter, 4, status);
-            let mut fields: Vec<String> = Vec::new();
-            if struct_variant_status(status) {
-                fields.push("status".to_owned());
-            }
-            for header in &status.headers {
-                fields.push(header.rust_name.clone());
-            }
-            let head = format!(
-                "Ok({}::{} {{",
-                operation.response_enum_name, status.enum_variant
-            );
-            // rustfmt keeps at most two-field struct literals on one line
-            // (struct_lit_width heuristic), vertical beyond that.
-            let joined = fields.join(", ");
-            if fields.len() <= 2 {
-                let inline = format!("{head} {joined} }})");
-                if fits(4, &inline) {
-                    emitter.line(4, &inline);
-                    emitter.line(3, "}");
-                    return;
-                }
-            }
-            emitter.line(4, &head);
-            for field in &fields {
-                emitter.line(5, &format!("{field},"));
-            }
-            emitter.line(4, "})");
-            emitter.line(3, "}");
+            // Header-only documented response (e.g. 302 + Location): parse
+            // the headers and construct the struct variant; no body is read.
+            emit_header_only_arm(emitter, 3, &pattern, operation, status);
             return;
         }
         emit_simple_arm(
@@ -3934,6 +3988,50 @@ fn emit_status_arm(
         }
     }
     emitter.line(3, "}");
+}
+
+/// Header-only documented response (main spec §15 — e.g. 302 + Location, or
+/// every documented HEAD outcome per §35): parse the typed headers and
+/// construct the struct variant; no body is ever read or validated.
+fn emit_header_only_arm(
+    emitter: &mut Emitter,
+    indent: usize,
+    pattern: &str,
+    operation: &PlannedOperation,
+    status: &PlannedStatus,
+) {
+    emitter.line(indent, &format!("{pattern} {{"));
+    emit_header_binds(emitter, indent + 1, status);
+    let mut fields: Vec<String> = Vec::new();
+    if struct_variant_status(status) {
+        fields.push("status".to_owned());
+    }
+    for header in &status.headers {
+        fields.push(header.rust_name.clone());
+    }
+    // Constructed enum-variant struct literals stay single-line exactly when
+    // the WHOLE `Ok(Path::Variant { … })` expression fits rustfmt's
+    // `fn_call_width` (60) from the line start; otherwise rustfmt breaks the
+    // call and stacks the fields vertically. Verified against the three
+    // canonical cases: short variants collapse (Found302), longer ones go
+    // vertical (HeadWidget200, fixture-04 Success2xx).
+    let head = format!(
+        "Ok({}::{} {{",
+        operation.response_enum_name, status.enum_variant
+    );
+    let joined = fields.join(", ");
+    let inline = format!("{head} {joined} }})");
+    if indent * 4 + inline.len() <= 60 {
+        emitter.line(indent + 1, &inline);
+        emitter.line(indent, "}");
+        return;
+    }
+    emitter.line(indent + 1, &head);
+    for field in &fields {
+        emitter.line(indent + 2, &format!("{field},"));
+    }
+    emitter.line(indent + 1, "})");
+    emitter.line(indent, "}");
 }
 
 /// Emits one `let <rust_name> = parse_{required,optional}_header::<T>(

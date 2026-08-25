@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use openapi_to_rust_generator::codegen::client::generate_client;
 use openapi_to_rust_generator::codegen::plan::{
-    plan_api_with_config, GeneratorPlanOptions, OperationPattern, PlanConfig,
+    plan_api_with_config, Decompression, GeneratorPlanOptions, OperationPattern, PlanConfig,
     RepresentationOverride,
 };
 use openapi_to_rust_generator::codegen::server::generate_server;
@@ -49,6 +49,7 @@ fn options_with(ids: &[&'static str]) -> GeneratorPlanOptions {
     GeneratorPlanOptions {
         enabled_codecs: ids.iter().copied().collect(),
         overrides: Vec::new(),
+        response_decompression: Decompression::OFF,
     }
 }
 
@@ -310,6 +311,7 @@ fn force_streaming_override_beats_codec_claims_and_keeps_literals() {
             ),
             match_operation: OperationPattern::Any,
         }],
+        response_decompression: Decompression::OFF,
     };
     let doc = normalize_fixture();
     let config = PlanConfig {

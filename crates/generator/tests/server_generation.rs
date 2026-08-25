@@ -35,6 +35,7 @@ const SNAPSHOT_FIXTURES: &[&str] = &[
     "13_validation.yaml",
     "14_negotiation.yaml",
     "15_streams.yaml",
+    "17_head.yaml",
 ];
 
 /// Every fixture must plan + render without diagnostics.
@@ -54,6 +55,7 @@ const ALL_FIXTURES: &[&str] = &[
     "13_validation.yaml",
     "14_negotiation.yaml",
     "15_streams.yaml",
+    "17_head.yaml",
 ];
 
 fn fixtures_dir() -> PathBuf {
@@ -739,11 +741,11 @@ fn headers_hoist_and_header_only_variants_are_pinned() {
     // Multi-content WITH documented headers: fields hoist onto the VARIANT.
     let response_enum = enum_block(&output, "GetMultiResponse");
     assert!(
-        response_enum.contains("pub x_request_id: String,"),
+        response_enum.contains("x_request_id: String,"),
         "{response_enum}"
     );
     assert!(
-        response_enum.contains("pub retry_after_seconds: Option<i32>,"),
+        response_enum.contains("retry_after_seconds: Option<i32>,"),
         "{response_enum}"
     );
     assert!(
@@ -754,7 +756,7 @@ fn headers_hoist_and_header_only_variants_are_pinned() {
     // Header-only 302: exactly the typed headers, never a body field.
     assert!(output.contains("Found302 {"), "\n{output}");
     assert!(
-        response_enum.contains("pub location: String,"),
+        response_enum.contains("location: String,"),
         "{response_enum}"
     );
 

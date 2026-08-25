@@ -11,6 +11,15 @@ unsafe_code = "forbid"
 default = []
 client = ["dep:reqwest", "dep:hyper", "dep:tokio", "dep:tokio-util", "dep:futures-util"]
 server = ["dep:axum", "dep:tokio", "dep:tokio-util", "dep:futures-util"]
+# §30.2 transparent response decompression. Each implies `client` because
+# content coding only ever applies to the Reqwest response path — enabling a
+# bare compression feature without the client stack would silently pull
+# reqwest while nothing could use it. The reqwest feature names are the
+# upstream ones verbatim (`gzip`/`brotli`/`zstd`; there is no `client-…`
+# spelling on the reqwest side).
+client-gzip = ["client", "reqwest/gzip"]
+client-br = ["client", "reqwest/brotli"]
+client-zstd = ["client", "reqwest/zstd"]
 
 [dependencies]
 serde = { workspace = true }

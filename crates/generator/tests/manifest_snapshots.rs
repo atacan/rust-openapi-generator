@@ -26,7 +26,7 @@ use openapi_to_rust_generator::codegen::manifest::{
     ManifestOverrides,
 };
 use openapi_to_rust_generator::codegen::plan::{
-    plan_api_with_config, GeneratorPlanOptions, PlanConfig,
+    plan_api_with_config, Decompression, GeneratorPlanOptions, PlanConfig,
 };
 use openapi_to_rust_generator::normalize::{normalize_with_config, NormalizeConfig};
 use openapi_to_rust_generator::parse::{load_document, LoadConfig};
@@ -68,6 +68,7 @@ const MATRIX: &[MatrixRow] = &[
         features: FeatureSelection {
             client: true,
             server: true,
+            decompression: Decompression::OFF,
         },
         codecs: &[],
     },
@@ -78,6 +79,7 @@ const MATRIX: &[MatrixRow] = &[
         features: FeatureSelection {
             client: true,
             server: false,
+            decompression: Decompression::OFF,
         },
         codecs: &[],
     },
@@ -88,6 +90,7 @@ const MATRIX: &[MatrixRow] = &[
         features: FeatureSelection {
             client: false,
             server: true,
+            decompression: Decompression::OFF,
         },
         codecs: &[],
     },
@@ -98,6 +101,7 @@ const MATRIX: &[MatrixRow] = &[
         features: FeatureSelection {
             client: true,
             server: true,
+            decompression: Decompression::OFF,
         },
         codecs: &[],
     },
@@ -148,6 +152,7 @@ fn generate_for(row: &MatrixRow) -> String {
         generator_options: GeneratorPlanOptions {
             enabled_codecs: row.codecs.iter().copied().collect(),
             overrides: Vec::new(),
+            response_decompression: Decompression::OFF,
         },
         ..PlanConfig::default()
     };
@@ -347,6 +352,7 @@ fn key_ordering_is_stable_regardless_of_set_insertion_order() {
             generator_options: GeneratorPlanOptions {
                 enabled_codecs: codecs.clone(),
                 overrides: Vec::new(),
+                response_decompression: Decompression::OFF,
             },
             ..PlanConfig::default()
         };
@@ -414,6 +420,7 @@ fn unplanned_codec_claims_without_configuration_are_rejected() {
             generator_options: GeneratorPlanOptions {
                 enabled_codecs: ["xml"].into_iter().collect(),
                 overrides: Vec::new(),
+                response_decompression: Decompression::OFF,
             },
             ..PlanConfig::default()
         },
@@ -508,6 +515,7 @@ fn featureless_selection_is_rejected() {
             features: FeatureSelection {
                 client: false,
                 server: false,
+                decompression: Decompression::OFF,
             },
             enabled_codecs: BTreeSet::new(),
             overrides: None,

@@ -1,0 +1,62 @@
+# Fixture 17 — HEAD probes (main spec §35): a HEAD operation's documented
+# response headers are its ONLY payload, so headWidget documents ETag
+# (required) and Content-Length (required) with NO content and both emitters
+# must render the header-only variant shape — typed header fields, no body
+# accessor, and no body read on either side. getWidget is the GET counterpart
+# returning the representation that metadata describes.
+openapi: 3.1.0
+info:
+  title: head probe
+  version: "1"
+paths:
+  /widgets/{id}:
+    get:
+      operationId: getWidget
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The widget
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Widget'
+        '404':
+          description: Missing widget
+    head:
+      operationId: headWidget
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Widget exists; metadata only, never a body
+          headers:
+            ETag:
+              description: entity tag of the widget representation
+              required: true
+              schema:
+                type: string
+            Content-Length:
+              description: byte size of the GET representation
+              required: true
+              schema:
+                type: integer
+                format: int64
+        '404':
+          description: Missing widget
+components:
+  schemas:
+    Widget:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string

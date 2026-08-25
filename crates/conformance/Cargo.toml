@@ -12,13 +12,17 @@ unsafe_code = "forbid"
 openapi-to-rust-generator = { path = "../generator" }
 
 [dependencies]
-openapi-support = { path = "../support", features = ["client", "server"] }
+# `client-gzip` routes the §30.2 transparent-decompression proof: the gzip
+# variant of fixture 01 emits `.gzip(true)`, which only compiles against a
+# Reqwest with the matching feature, and the compression round trips drive
+# that artifact set (§50 test 32).
+openapi-support = { path = "../support", features = ["client", "server", "client-gzip"] }
 async-trait = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 mime = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["gzip"] }
 futures-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

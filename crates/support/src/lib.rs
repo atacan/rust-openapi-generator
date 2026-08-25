@@ -11,6 +11,18 @@
 //! encoding (companion §8), the parameter style × explode matrix (companion §6),
 //! the authoritative `ClientError` (§36), and the §31 explicit-factory replay
 //! primitives ([`retry`], D-impl-retry).
+//!
+//! # Transparent response decompression (§30.2)
+//!
+//! The `client-gzip`/`client-br`/`client-zstd` features forward to Reqwest's
+//! `gzip`/`brotli`/`zstd` features; generated builders opt into decoding with
+//! `.gzip(true)` etc. when the generator configuration enables them (§30.2
+//! MAY). Because [`collect::collect_reqwest_limited`] measures the stream
+//! AFTER Reqwest's decompression layer, structured-body limits already count
+//! DECODED bytes: a body that decompresses beyond the limit is rejected even
+//! when its wire size fits. Generated code never branches on
+//! `Content-Encoding`, and streaming raw bodies pass through without
+//! total-size accounting.
 
 pub mod collect;
 pub mod content_coding;

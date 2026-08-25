@@ -195,3 +195,171 @@ mod tests {
         );
     }
 }
+
+/// §30.2 / main spec §50 test 32: structured-body limits count DECODED
+/// bytes. A one-shot loopback server answers with a gzipped JSON body whose
+/// WIRE size is far below the configured limit while its DECOMPRESSED size
+/// exceeds it; a gzip-enabled Reqwest client removes the content coding
+/// beneath [`collect_reqwest_limited`], so the collector must reject the
+/// response as `TooLarge` even though the wire transfer itself would fit.
+#[cfg(all(test, feature = "client", feature = "client-gzip"))]
+mod gzip_decoded_byte_tests {
+    use super::*;
+
+    /// `gzip --best` of `{"id":"w-1","name":"widget","blob":"aaa…a"}` (294
+    /// decoded bytes; deterministic constant so no compression dependency is
+    /// needed to build the fixture).
+    const GZIP_JSON_WIRE: [u8; 56] = [
+        31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 86, 202, 76, 81, 178, 82, 42, 215, 53, 84, 210, 81,
+        202, 75, 204, 77, 5, 113, 50, 83, 210, 83, 75, 128, 252, 164, 156, 252, 36, 32, 63, 113,
+        132, 3, 165, 90, 0, 251, 232, 12, 232, 38, 1, 0, 0,
+    ];
+    /// Strictly between wire (56) and decoded (294) sizes.
+    const LIMIT: usize = 128;
+
+    /// Answers every connection with the same HTTP/1.1 response carrying the
+    /// gzipped constant. Raw-socket on purpose: no axum/hyper server
+    /// dependency is pulled into openapi-support for a test, and nothing
+    /// recompresses or strips the hand-set `Content-Encoding` behind the
+    /// collector's back. Multiple connections are fine — each test spins up
+    /// its own ephemeral instance and issues as many requests as its proof
+    /// needs.
+    async fn serve_gzip() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let address = listener.local_addr().expect("local address");
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                // Drain request headers up to the empty line before answering.
+                let mut seen = 0_usize;
+                let mut scratch = [0_u8; 4096];
+                loop {
+                    let read = tokio::io::AsyncReadExt::read(&mut socket, &mut scratch)
+                        .await
+                        .expect("read request head");
+                    seen += read;
+                    if read == 0 || scratch[..seen].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-encoding: gzip\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n",
+                    GZIP_JSON_WIRE.len()
+                );
+                use tokio::io::AsyncWriteExt;
+                socket.write_all(head.as_bytes()).await.expect("write head");
+                socket.write_all(&GZIP_JSON_WIRE).await.expect("write body");
+                socket.shutdown().await.expect("shutdown");
+            }
+        });
+        address
+    }
+
+    fn gzip_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .gzip(true)
+            .build()
+            .expect("gzip-capable client builds")
+    }
+
+    /// Control transport for the triangulation: Reqwest 0.12 removes codings
+    /// BY DEFAULT whenever the matching cargo feature is active, so exposing
+    /// the raw wire bytes requires explicitly opting OUT through
+    /// `.gzip(false)`.
+    fn plain_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .gzip(false)
+            .build()
+            .expect("plain client builds")
+    }
+
+    #[tokio::test]
+    async fn limit_rejects_when_decoded_size_exceeds_it_despite_small_wire_size() {
+        assert!(
+            GZIP_JSON_WIRE.len() < LIMIT,
+            "fixture invariant broken: wire must fit the limit"
+        );
+        let address = serve_gzip().await;
+        let response = gzip_client()
+            .get(format!("http://{address}/widgets/w-1"))
+            .send()
+            .await
+            .expect("transport succeeds");
+        assert_eq!(response.status(), 200);
+        // Reqwest's transparent decoder CONSUMES `Content-Encoding` (and
+        // `Content-Length`) off the response before returning it — visible
+        // proof that collection happens ABOVE the decompression layer.
+        assert_eq!(
+            response.headers().get("content-encoding").map(|_| "gzip"),
+            None,
+            "decoder must strip the coding header it removed"
+        );
+
+        let error = collect_reqwest_limited(response, LIMIT)
+            .await
+            .expect_err("decoded size exceeds the limit despite the small wire size");
+        assert!(
+            matches!(error, ReqwestCollectError::TooLarge { limit: LIMIT }),
+            "expected TooLarge at {LIMIT}, got {error:?}"
+        );
+    }
+
+    /// The triangulating half of the §50-test-32 proof: with decoding OFF the
+    /// SAME body fits `LIMIT` on the wire (collector observes exactly the
+    /// gzipped constant), so the rejection above can only be explained by
+    /// DECODED-byte accounting under a decompressing client.
+    #[tokio::test]
+    async fn wire_size_alone_fits_the_limit_so_rejection_proves_decoded_accounting() {
+        assert!(
+            GZIP_JSON_WIRE.len() < LIMIT,
+            "fixture invariant broken: wire must fit the limit"
+        );
+        let address = serve_gzip().await;
+        let response = plain_client()
+            .get(format!("http://{address}/widgets/w-1"))
+            .send()
+            .await
+            .expect("transport succeeds");
+        assert_eq!(
+            response
+                .headers()
+                .get("content-encoding")
+                .and_then(|value| value.to_str().ok()),
+            Some("gzip"),
+            "without opt-in the coding must still be on the wire"
+        );
+
+        let collected = collect_reqwest_limited(response, LIMIT)
+            .await
+            .expect("wire transfer fits the limit when no coding is removed");
+        assert_eq!(collected.len(), GZIP_JSON_WIRE.len());
+        assert!(
+            collected.starts_with(&[0x1f, 0x8b]),
+            "raw gzip magic proves the collector saw WIRE bytes: {collected:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_yields_the_decompressed_payload_under_a_fitting_limit() {
+        let address = serve_gzip().await;
+        let response = gzip_client()
+            .get(format!("http://{address}/widgets/w-1"))
+            .send()
+            .await
+            .expect("transport succeeds");
+
+        let decoded = collect_reqwest_limited(response, 512)
+            .await
+            .expect("decoded payload fits 512");
+        assert_eq!(decoded.len(), 294, "collector must observe DECODED bytes");
+        assert!(
+            decoded.starts_with(b"{\"id\":\"w-1\",\"name\":\"widget\""),
+            "transparent decompression must yield the original JSON: {decoded:?}"
+        );
+    }
+}

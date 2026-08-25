@@ -344,4 +344,52 @@ pub mod fixtures {
             ));
         }
     }
+
+    /// Fixture 01 regenerated with §30.2 gzip decompression enabled: the
+    /// emitted builder pre-wires `.gzip(true)`, so every structured response
+    /// this client collects has its content coding removed BENEATH the
+    /// bounded collectors (§50 test 32's end-to-end half). Compilation of
+    /// this module is also the proof that emitted decompression opt-ins
+    /// compile against a Reqwest built with the matching feature.
+    pub mod fixture_01_json_roundtrip_gzip {
+        pub mod models {
+            include!(concat!(
+                env!("OUT_DIR"),
+                "/01_json_roundtrip.gzip/models.rs"
+            ));
+        }
+        pub mod views {
+            include!(concat!(env!("OUT_DIR"), "/01_json_roundtrip.gzip/views.rs"));
+        }
+        pub mod client {
+            include!(concat!(
+                env!("OUT_DIR"),
+                "/01_json_roundtrip.gzip/client.rs"
+            ));
+        }
+        pub mod server {
+            include!(concat!(
+                env!("OUT_DIR"),
+                "/01_json_roundtrip.gzip/server.rs"
+            ));
+        }
+    }
+
+    /// Fixture 17 (§35 HEAD probes): typed response headers WITHOUT any body
+    /// accessor on the client, and a server wrapper carrying exactly those
+    /// fields.
+    pub mod fixture_17_head {
+        pub mod models {
+            include!(concat!(env!("OUT_DIR"), "/17_head/models.rs"));
+        }
+        pub mod views {
+            include!(concat!(env!("OUT_DIR"), "/17_head/views.rs"));
+        }
+        pub mod client {
+            include!(concat!(env!("OUT_DIR"), "/17_head/client.rs"));
+        }
+        pub mod server {
+            include!(concat!(env!("OUT_DIR"), "/17_head/server.rs"));
+        }
+    }
 }

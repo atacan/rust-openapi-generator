@@ -1443,7 +1443,7 @@ fn emit_wrapper(
         emitter.line(0, "#[derive(Debug)]");
     }
     emitter.line(0, &format!("pub struct {name} {{"));
-    emit_header_fields(emitter, status, 1);
+    emit_header_fields(emitter, status, 1, "pub ");
     match shape {
         // §22 Output B: the wildcard carries BOTH the application-supplied
         // Content-Type and the raw streaming body (`any_response` reads the
@@ -1486,7 +1486,16 @@ fn emit_wrapper(
 
 /// Typed documented-header fields of one status (main spec §15): required
 /// headers become plain fields, optional ones `Option<T>`.
-fn emit_header_fields(emitter: &mut Emitter, status: &PlannedStatus, indent: usize) {
+/// Typed documented-header fields of one status (main spec §15): required
+/// headers become plain fields, optional ones `Option<T>`. `visibility` is
+/// `pub` for wrapper STRUCTS; enum-variant fields share the enum's
+/// visibility, so enum paths pass the empty prefix.
+fn emit_header_fields(
+    emitter: &mut Emitter,
+    status: &PlannedStatus,
+    indent: usize,
+    visibility: &str,
+) {
     for header in &status.headers {
         let field_type = if header.required {
             header.rust_type.clone()
@@ -1505,7 +1514,10 @@ fn emit_header_fields(emitter: &mut Emitter, status: &PlannedStatus, indent: usi
                 }
             )],
         );
-        emitter.line(indent, &format!("pub {}: {field_type},", header.rust_name));
+        emitter.line(
+            indent,
+            &format!("{visibility}{}: {field_type},", header.rust_name),
+        );
     }
 }
 
@@ -1541,7 +1553,7 @@ fn emit_response_enum(
             // headers ride inside the struct variant (§15).
             emitter.line(1, &format!("{} {{", status.enum_variant));
             emitter.line(2, "status: ::http::StatusCode,");
-            emit_header_fields(emitter, status, 2);
+            emit_header_fields(emitter, status, 2, "");
             match contents.len() {
                 0 => {}
                 1 => {
@@ -1568,7 +1580,7 @@ fn emit_response_enum(
             // Header-only documented response (e.g. 302 + Location): the
             // variant carries exactly the typed headers.
             emitter.line(1, &format!("{} {{", status.enum_variant));
-            emit_header_fields(emitter, status, 2);
+            emit_header_fields(emitter, status, 2, "");
             emitter.line(1, "},");
             continue;
         }
@@ -1580,7 +1592,7 @@ fn emit_response_enum(
                 .content_enum(op_index, status_index)
                 .expect("registered");
             emitter.line(1, &format!("{} {{", status.enum_variant));
-            emit_header_fields(emitter, status, 2);
+            emit_header_fields(emitter, status, 2, "");
             emitter.line(2, &format!("content: {content_enum},"));
             emitter.line(1, "},");
             continue;
@@ -1730,9 +1742,11 @@ fn emit_encoding_impl(
     }
     emitter.line(1, "pub fn into_response_with_limits(");
     emitter.line(2, "self,");
-    // Operations whose every arm is a bare status or a pure passthrough
-    // (streaming/wildcard bodies without documented headers) never touch
-    // the limits/hook pair; underscore names keep `-D warnings` clean.
+    // Arms that bound-encode payloads (textual/codec contents, per-item
+    // stream encoding) consume `limits`; typed-header commits additionally
+    // consume the overflow `hook`. Bare-status or pure-passthrough arms
+    // touch neither, so each parameter underscores independently to keep
+    // `-D warnings` clean (header-only HEAD outcomes use only the hook).
     let has_stream_status = operation.statuses.iter().any(|status| {
         !status.is_no_body_status
             && status
@@ -1740,22 +1754,32 @@ fn emit_encoding_impl(
                 .iter()
                 .any(|content| content.stream.is_some())
     });
-    let arg_uses = operation.statuses.iter().any(|status| {
-        !status.headers.is_empty()
-            || effective_contents(status).iter().any(|content| {
+    let encodes_payloads = operation.statuses.iter().any(|status| {
+        effective_contents(status).iter().any(|content| {
+            (matches!(
+                content.media_class,
+                MediaClass::JsonFamily | MediaClass::PlainText
+            ) && !content.is_wildcard)
+                || content.codec.is_some()
+        }) || (!status.is_no_body_status && status.contents.iter().any(|c| c.stream.is_some()))
+    });
+    let hook_uses = operation.statuses.iter().any(|status| {
+        !status.headers.is_empty() || {
+            effective_contents(status).iter().any(|content| {
                 (matches!(
                     content.media_class,
                     MediaClass::JsonFamily | MediaClass::PlainText
                 ) && !content.is_wildcard)
                     || content.codec.is_some()
-            })
-            || (!status.is_no_body_status && status.contents.iter().any(|c| c.stream.is_some()))
+            }) || (!status.is_no_body_status && status.contents.iter().any(|c| c.stream.is_some()))
+        }
     });
-    let (limits_name, hook_name) = if arg_uses {
-        ("limits", "hook")
+    let limits_name = if encodes_payloads {
+        "limits"
     } else {
-        ("_limits", "_hook")
+        "_limits"
     };
+    let hook_name = if hook_uses { "hook" } else { "_hook" };
     emitter.line(2, &format!("{limits_name}: &BodyLimits,"));
     emitter.line(2, &format!("{hook_name}: &dyn EncodeOverflowHook,"));
     if has_stream_status {
@@ -2310,15 +2334,23 @@ fn emit_encode_arm(
                 }
             } else {
                 // Header-only variant: write the typed headers beside the
-                // bare status.
-                emitter.line(
-                    3,
-                    &format!("Self::{variant} {{ {} }} => {{", {
-                        let names: Vec<String> =
-                            status.headers.iter().map(|h| h.rust_name.clone()).collect();
-                        names.join(", ")
-                    }),
-                );
+                // bare status. Multi-field struct PATTERNS in block arms go
+                // vertical under rustfmt (canonical layout verified against
+                // fixture 17); single-field patterns stay inline.
+                let names: Vec<String> =
+                    status.headers.iter().map(|h| h.rust_name.clone()).collect();
+                if names.len() <= 1 {
+                    emitter.line(
+                        3,
+                        &format!("Self::{variant} {{ {} }} => {{", names.join(", ")),
+                    );
+                } else {
+                    emitter.line(3, &format!("Self::{variant} {{"));
+                    for name in &names {
+                        emitter.line(4, &format!("{name},"));
+                    }
+                    emitter.line(3, "} => {");
+                }
                 emit_typed_pushes(emitter, 4, status, HeaderSource::Local);
                 emitter.line(4, &format!("let encoded = {constant}.into_response();"));
                 emit_header_write(emitter, 4, op_id, variant);
