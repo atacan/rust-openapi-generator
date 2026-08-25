@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### `examples/kitchen-sink` — end-to-end example package
+
+- New workspace-member example crate built around ONE OpenAPI 3.1.0 union document
+  (`examples/kitchen-sink/openapi.yaml`, 22 operations): every feature class of the fixture
+  corpus in a single API — JSON/problem+json, urlencoded forms, bounded `text/plain`,
+  chunk-wise octet-stream upload+download with typed ETag/Content-Length, the `image/*`
+  wildcard beside JSON on one status, multipart with exactly one streaming binary part,
+  SSE/NDJSON/json-seq in both directions, unknown-vendor raw fallback, status-range
+  precedence + `default`, 204/HEAD no-body probes, optional-body-vs-null, readOnly/writeOnly
+  views in matching positions, and oneOf-discriminator/allOf/string-enum composition.
+- Committed deterministic output: the four generated artifacts plus the emitted §3.1
+  manifest artifact live under `generated/` and are compiled UNMODIFIED via `include!`;
+  `tests/determinism.rs` double-generates and byte-compares against them
+  (`KITCHEN_SINK_GENERATED_UPDATE=1` refreshes, mirroring the golden-harness convention).
+- Runnable demos: thin server/client binaries sharing a 28-step full-operation sweep over
+  real TCP, with the same sweep asserted by an `#[ignore]`-gated smoke test
+  (`cargo test -p kitchen-sink -- --ignored`).
+- CI guard: the determinism job now regenerates `-p kitchen-sink` and fails on any drift in
+  `examples/kitchen-sink`.
+- Recorded `D-header-field-shape` in DECISIONS.md: optional-header structs use plain domain
+  fields (§48 option 2); conversion failures follow the §34.1 fallback path (hook + fixed
+  empty 500); checked constructors stay reserved for required-fallible headers.
+
 ## v0.1.0-alpha.1 — 2026-08-24
 
 All four implementation milestones of `rust-openapi-axum-reqwest-codegen-spec.md` §52,

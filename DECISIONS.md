@@ -402,3 +402,27 @@ the type contract instead of relaxing its memory bound.
 **Rationale.** Minimal-diff realization of §44: flipping the planned media class reuses the
 existing streaming emitters byte-for-byte on both sides instead of threading a third representation
 through every textual arm; boundedness is recovered by the application draining the stream.
+
+---
+
+## G. Post-v0.1.0 example-package decisions
+
+### D-header-field-shape Optional-header response-header structs carry plain domain fields
+
+**Decision.** Optional-header structs use plain domain fields (main spec §48 option 2);
+conversion failures follow the §34.1 fallback path. Checked constructors remain reserved for
+required-fallible headers.
+
+Concretely (verified against generated output): an optional documented header becomes an
+`Option<T>` domain field on the status wrapper; the emitted encoder collects present values and
+converts them through `HeaderValue::try_from` inside `write_typed_headers`, whose failure arm fires
+the encode hook and emits the fixed empty-bodied `500` (`header_encode_failure`; hook limit `0` is
+the recorded sentinel for non-size encode failures). No panic or unwrap exists on this path.
+Required headers keep the fallible checked-constructor shape of §48 option 1
+(`CreateSession201::new(...) -> Result<_, InvalidResponseHeader>`).
+
+**Rationale.** Optionality means absence is legal, so construction cannot fail and a fallible
+constructor would force ceremony for the common case; the only remaining failure mode — a stored
+value that is not representable as a header value — surfaces at encode time, where the committed
+response cannot be changed, so it lands in the same hook-plus-fallback family as encode overflow
+(§34.1) rather than inventing a second error channel.
