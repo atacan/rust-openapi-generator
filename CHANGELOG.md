@@ -92,15 +92,28 @@ the embedded toolchain tuple: Axum 0.8 / Reqwest 0.12 / http 1 / bytes 1, MSRV 1
 - trybuild negative fixtures proving §49 misuse fails to compile against generated crates.
 - §50 test 52 pinned both halves after the §39 Codec exception amendment (50081c8).
 
-### Known gaps at this tag (tracked for v0.1.0)
+### Post-alpha hardening (F1–F4)
 
-- Operation codecs do not yet consume directional views: shared models ride both wire
-  directions, so `readOnly` fields would be sent on requests today (companion §5 /
-  §50 test 50 runtime half). Scheduled.
-- Transparent response decompression (§30.2) is not yet implemented; limits count wire
-  bytes when content coding is present. Scheduled together with a HEAD round-trip
-  conformance test (§35 / §50 tests 32+34).
-- MSRV CI job is test-only until seven elided-lifetime sites are cleaned up for
-  rustc-1.85 clippy. Scheduled.
-- Record-framed request streams have no `_replaying` twins (recorded decision,
-  `D-impl-retry`). Closed without action by design.
+Closed after the `v0.1.0-alpha.1` review, one gated work package each:
+
+- **Directional views consumed by operation codecs** (`f81fac0`): request codecs
+  encode/decode `<M>Write` views and response codecs `<M>Read` views wherever models carry
+  readOnly/writeOnly fields; the router auto-converts to shared models only when lossless
+  and never fabricates values. Fixture 08 gained real operations; t50a/b/c conformance
+  proofs pin wire-level directionality and per-direction requiredness (companion §5,
+  §50 test 50 runtime half). Zero churn on view-less fixtures.
+- **Opt-in response decompression with decoded-byte accounting** (`790feff`, F2): gzip /
+  Brotli / Zstandard features forward to Reqwest's codings; limits count DECODED bytes,
+  proven at support level and end-to-end with a hostile gzipped origin whose decoded body
+  exceeds the lowered limit (§30.2, §50 test 32). Default stays all-OFF with byte-stable
+  manifests.
+- **HEAD header-only round-trip proof** (`790feff`, F3): fixture 17 pins typed-header-only
+  variants on both sides; zero body bytes are ever read or exposed (§35, §50 test 34).
+  Emission fixes surfaced by the new fixtures: rustfmt-canonical send chains, variant
+  literal layouts, and struct-pattern breaking.
+- **MSRV clippy gate restored** (`44eed98`, F4): elided-lifetime sites fixed and a
+  generated-code `let_and_return` eliminated, so rustc 1.85's clippy passes `-D warnings`;
+  the CI MSRV job now lints alongside tests.
+
+Standing decision (closed by design): record-framed request streams have no `_replaying`
+twins — see DECISIONS.md `D-impl-retry`.
