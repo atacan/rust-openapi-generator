@@ -1,0 +1,102 @@
+# Large-upload example document — deliberately minimal: two paths, each a
+# single streaming binary PUT whose request body is consumed chunk-by-chunk
+# by the generated server (streaming-body routes are exempt from
+# DefaultBodyLimit, main spec §38) and streamed chunk-by-chunk by the
+# generated client (main spec §17). The two media types classify identically
+# (raw byte stream, `ir/document.rs` binary-media rule: application/*
+# octet-stream-like + every audio/*|video/*|image/*|font type), so the pair
+# proves the equivalence at the codegen level while keeping the demo story
+# concrete: raw blobs and WAV audio tracks.
+#
+# Both operations answer with a SMALL structured JSON receipt
+# ({bytes_received, sha256}) so the client can prove the full payload was
+# handled without ever downloading it back; the server computes the digest
+# incrementally while streaming to disk — no buffering anywhere.
+#
+# No `servers` anywhere: effective servers default to `/` (companion §8
+# rule 3), so clients pass base_url explicitly (DECISIONS
+# D-impl-relative-servers).
+openapi: 3.1.0
+info:
+  title: large upload
+  version: "1"
+paths:
+  /blobs/{id}:
+    put:
+      operationId: putBlob
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '201':
+          description: Stored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadReceipt'
+        '400':
+          description: Invalid object or storage failure
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+  /audio/{id}:
+    put:
+      operationId: putAudioTrack
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          audio/wav:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '201':
+          description: Stored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadReceipt'
+        '400':
+          description: Invalid track id or storage failure
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+
+components:
+  schemas:
+    UploadReceipt:
+      type: object
+      required: [bytes_received, sha256]
+      properties:
+        bytes_received:
+          type: integer
+          format: int64
+          description: exact number of body bytes written for the upload
+        sha256:
+          type: string
+          description: lowercase hex SHA-256 over the received bytes, computed incrementally
+    ProblemDetails:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string

@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### `examples/large-upload` — bounded-memory streaming demonstration
+
+- New workspace-member example crate around a minimal two-path OpenAPI 3.1.0 document
+  (`PUT /blobs/{id}` with `application/octet-stream`, `PUT /audio/{id}` with `audio/wav` —
+  the generator classifies both identically as raw streaming bodies): each answers a small
+  JSON `UploadReceipt` ({bytes_received, sha256}) so full-payload handling is proven
+  without re-downloading.
+- Committed deterministic generated artifacts + determinism test
+  (`LARGE_UPLOAD_GENERATED_UPDATE=1` refreshes), mirroring the kitchen-sink conventions;
+  the CI determinism job now also regenerates `-p large-upload`.
+- Runnable demos with TWO server modes: DISK mode (request body persisted chunk-by-chunk
+  under a temp dir while an incremental SHA-256 digests it) and PROXY mode (`--proxy-url`
+  forwards the inbound stream verbatim via `reqwest::Body::wrap_stream` — zero buffering);
+  the client synthesizes a deterministic WAV file (default 1024 MiB) and streams it through
+  BOTH media types, verifying both receipts. An `#[ignore]`-gated smoke test covers the
+  disk round trip and a two-hop proxy chain over real TCP.
+- In-process memory evidence: a shared monitor module samples process RSS every 50 ms
+  (`memory-stats`) and reads the kernel high-water mark at exit (getrusage `ru_maxrss`);
+  both binaries print paired progress/RSS lines during transfers and fail non-zero when
+  peak − baseline exceeds 32 MiB (override via `LARGE_UPLOAD_MAX_RSS_DELTA_MIB`).
+  Measured on macOS: 2 GiB transferred per run with peak deltas of ~1.5 MiB (client) and
+  ~3–4 MiB (server/proxy).
+
 ### `examples/kitchen-sink` — end-to-end example package
 
 - New workspace-member example crate built around ONE OpenAPI 3.1.0 union document

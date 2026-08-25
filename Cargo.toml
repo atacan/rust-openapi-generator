@@ -5,6 +5,7 @@ members = [
     "crates/generator",
     "crates/conformance",
     "examples/kitchen-sink",
+    "examples/large-upload",
 ]
 
 [workspace.package]

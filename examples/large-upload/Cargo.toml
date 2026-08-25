@@ -1,0 +1,51 @@
+[package]
+name = "large-upload"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints.rust]
+# `deny` rather than the workspace example's `forbid`: the memory monitor
+# needs ONE getrusage(2) FFI call for the kernel high-water-mark RSS; it
+# opts back in with a scoped #[allow] + justification (src/memmon.rs).
+# Everything else in the crate stays unsafe-free.
+unsafe_code = "deny"
+
+[dependencies]
+# Both transport halves of the generated API (§3 feature shape); the
+# generated code is include!d into this lib unmodified, so these mirror the
+# emitted manifest's dependency set minus the codec crates (all OFF here,
+# main spec §45).
+openapi-support = { path = "../../crates/support", features = ["client", "server"] }
+async-trait = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+mime = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "time"] }
+tokio-util = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+# Demo-only measurement dependencies (not part of any emitted manifest):
+#   sha2         — incremental digest proving the full payload was handled
+#   memory-stats — cross-platform sampled RSS of the own process
+#   libc         — getrusage(2) kernel high-water mark (ru_maxrss)
+sha2 = "0.10"
+memory-stats = "1.2"
+libc = "0.2"
+
+[[bin]]
+name = "large-upload-server"
+path = "server/main.rs"
+
+[[bin]]
+name = "large-upload-client"
+path = "client/main.rs"
+
+[dev-dependencies]
+openapi-to-rust-generator = { path = "../../crates/generator" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
