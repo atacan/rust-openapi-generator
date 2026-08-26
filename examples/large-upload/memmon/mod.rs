@@ -24,9 +24,10 @@
 //! This module lives ONCE as plain source under `memmon/mod.rs` — not a
 //! Cargo crate — and is included by BOTH transport crates
 //! (`large-upload-client` and `large-upload-server` via
-//! `#[path = "../memmon/mod.rs"]`) precisely so neither depends on the
-//! other; it pulls in no axum/reqwest of its own. The host manifests carry
-//! its three dependencies (tokio time, memory-stats, libc) directly.
+//! `#[path = "../../memmon/mod.rs"]`, relative to each crate's `src/lib.rs`)
+//! precisely so neither depends on the other; it pulls in no axum/reqwest
+//! of its own. The host manifests carry its three dependencies (tokio time,
+//! memory-stats, libc) directly.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
