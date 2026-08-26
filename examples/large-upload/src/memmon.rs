@@ -74,7 +74,7 @@ fn kernel_max_rss() -> Option<u64> {
     #[cfg(target_os = "macos")]
     let bytes = usage.ru_maxrss as u64;
     #[cfg(not(target_os = "macos"))]
-    let bytes = usage.ru_maxrss * 1024;
+    let bytes = u64::try_from(usage.ru_maxrss).ok()?.saturating_mul(1024);
     Some(bytes)
 }
 
