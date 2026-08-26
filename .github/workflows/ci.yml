@@ -136,10 +136,12 @@ jobs:
       # (plain `cargo` invocations below therefore run under MSRV, no `+1.85`
       # override needed, avoiding rustup partial-version resolution issues).
       # This revision dropped the `toolchain` input (ignored with a warning)
-      # and no longer bundles clippy, so request the component explicitly.
+      # and no longer bundles clippy or rustfmt, so request both explicitly
+      # (the artifact_selection suite shells out to rustfmt; its rustup
+      # proxy shim otherwise resolves but exits "not installed").
       - uses: dtolnay/rust-toolchain@bc540ba06a4ccee415bb241490e0b25ee8e7d315
         with:
-          components: clippy
+          components: clippy, rustfmt
       # rust-cache keys include the rustc version, so this cache is separate
       # from the stable ones automatically.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
