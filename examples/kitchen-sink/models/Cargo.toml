@@ -1,0 +1,19 @@
+[package]
+name = "kitchen-sink-models"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# Shared schema surface only (`--generate types`): serde derive plus the
+# dependency-light support crate — no transport stacks compile here.
+[dependencies]
+openapi-support = { path = "../../../crates/support" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+openapi-to-rust-generator = { path = "../../../crates/generator" }

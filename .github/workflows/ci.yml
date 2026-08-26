@@ -102,15 +102,17 @@ jobs:
           for pass in 1 2 3; do
             # Literal proof that update mode stays OFF: unset every
             # snapshot-update switch (CLIENT_/SERVER_/MODELS_/VIEWS_/
-            # OPENAPI_/CODEC_) before each pass so regeneration can never
-            # silently rewrite committed files.
+            # OPENAPI_/CODEC_) plus the example regeneration switches before
+            # each pass so regeneration can never silently rewrite committed
+            # files.
             unset CLIENT_SNAPSHOT_UPDATE SERVER_SNAPSHOT_UPDATE \
                   MODELS_SNAPSHOT_UPDATE VIEWS_SNAPSHOT_UPDATE \
                   OPENAPI_SNAPSHOT_UPDATE CODEC_SNAPSHOT_UPDATE \
-                  MANIFEST_SNAPSHOT_UPDATE
+                  MANIFEST_SNAPSHOT_UPDATE \
+                  KITCHEN_SINK_GENERATED_UPDATE LARGE_UPLOAD_GENERATED_UPDATE
 
             echo "::group::generation pass ${pass}"
-            cargo test -p openapi-to-rust-generator -p openapi-conformance -p kitchen-sink -p large-upload --locked
+            cargo test -p openapi-to-rust-generator -p openapi-conformance -p kitchen-sink-models -p large-upload-models --locked
             echo '::endgroup::'
 
             dirty="$(git status --porcelain crates/generator/tests/snapshots crates/conformance examples/kitchen-sink examples/large-upload)"

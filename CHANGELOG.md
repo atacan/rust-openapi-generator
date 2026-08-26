@@ -45,6 +45,41 @@
   assertions and `cargo tree` proofs that each crate carries only its own
   transport stack.
 
+### Examples migrated to the split-crate layout (D-impl-selective-artifacts)
+
+- Both examples are now canonical demonstrations of the selective-generation
+  workflow: each former single package became three production crates —
+  shared models (`--generate types`), a Reqwest client
+  (`--generate client --types-path <models_crate>`), and an Axum server
+  (`--generate server --types-path <models_crate>`) — as direct workspace
+  members. Every schema type keeps exactly ONE Rust identity; the committed
+  artifacts live under each crate's `generated/` directory and stay
+  byte-deterministic (the CI determinism job now regenerates
+  `-p kitchen-sink-models -p large-upload-models`, which re-verifies all six
+  committed files across both examples). `models.rs`/`views.rs` regenerated
+  byte-identically; `client.rs`/`server.rs` differ from the old all-in-one
+  output only in the shared-types import base.
+- Normal generation writes NO Cargo.toml: the generated-manifest artifact is
+  gone from both examples, replaced by small hand-maintained manifests that
+  carry only what each crate's generated code genuinely uses — the models
+  crates compile without any transport stack, the client crates never pull
+  axum, the server crates never pull reqwest (large-upload's server demo
+  opts into reqwest explicitly for proxy-mode forwarding; the GENERATED
+  module needs none of it).
+- Hand-written demo code split along the transport line: kitchen-sink's
+  `demo.rs` became `client/src/sweep.rs` + `server/src/app.rs`; large-upload's
+  became `client/src/transfers.rs` + `server/src/app.rs`. Large-upload's
+  memory monitor moved into its own dependency-free helper crate
+  (`large-upload-memmon`) so both transports can measure themselves without
+  depending on each other.
+- Tests relocated with their subjects: determinism gates live in each
+  `models/tests/determinism.rs` (same update switches:
+  `KITCHEN_SINK_GENERATED_UPDATE=1`, `LARGE_UPLOAD_GENERATED_UPDATE=1`) and
+  verify all three crates' committed files per example; real-TCP smoke tests
+  live in each `client/tests/smoke.rs` and spawn the sibling server crate as
+  a dev-dependency only. Binaries, sweep itineraries, run commands, and
+  bounded-memory behavior are unchanged.
+
 ### `examples/large-upload` — bounded-memory streaming demonstration
 
 - New workspace-member example crate around a minimal two-path OpenAPI 3.1.0 document

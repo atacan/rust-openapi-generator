@@ -701,18 +701,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "kitchen-sink"
+name = "kitchen-sink-client"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "axum",
  "bytes",
  "futures-core",
  "futures-util",
  "http",
+ "kitchen-sink-models",
+ "kitchen-sink-server",
  "mime",
  "openapi-support",
- "openapi-to-rust-generator",
  "reqwest",
  "serde",
  "serde_json",
@@ -721,7 +721,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "large-upload"
+name = "kitchen-sink-models"
+version = "0.1.0"
+dependencies = [
+ "openapi-support",
+ "openapi-to-rust-generator",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "kitchen-sink-server"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -730,17 +740,70 @@ dependencies = [
  "futures-core",
  "futures-util",
  "http",
- "libc",
- "memory-stats",
+ "kitchen-sink-models",
  "mime",
  "openapi-support",
- "openapi-to-rust-generator",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "large-upload-client"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "futures-core",
+ "http",
+ "large-upload-memmon",
+ "large-upload-models",
+ "large-upload-server",
+ "mime",
+ "openapi-support",
  "reqwest",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "large-upload-memmon"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "memory-stats",
+ "tokio",
+]
+
+[[package]]
+name = "large-upload-models"
+version = "0.1.0"
+dependencies = [
+ "openapi-to-rust-generator",
+ "serde",
+]
+
+[[package]]
+name = "large-upload-server"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "futures-core",
+ "futures-util",
+ "http",
+ "large-upload-memmon",
+ "large-upload-models",
+ "openapi-support",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
 ]
 
 [[package]]

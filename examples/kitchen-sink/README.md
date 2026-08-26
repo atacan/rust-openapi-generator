@@ -3,9 +3,11 @@
 One OpenAPI 3.1.0 document (`openapi.yaml`) exercising every feature class of
 the openapi-to-rust generator — each operation copied from a proven fixture
 shape under `crates/generator/fixtures/`, cross-referenced to main-spec
-sections in its header comment (feature classes a–m). The generated client,
-server, models, and views are COMMITTED under `generated/` and compiled
-UNMODIFIED via `include!` (`src/lib.rs`). Two runnable demos prove
+sections in its header comment (feature classes a–m). The example is split
+into THREE crates — shared models, Reqwest client, Axum server — so every
+schema type has exactly ONE Rust identity and neither transport compiles the
+other. The generated artifacts are COMMITTED under each crate's `generated/`
+directory and compiled UNMODIFIED via `include!`. Two runnable demos prove
 end-to-end behavior over real TCP: an Axum server implementing all 22
 operations and a reqwest client driving a full-operation sweep against it.
 
@@ -14,27 +16,27 @@ operations and a reqwest client driving a full-operation sweep against it.
 | Path | Contents |
 | --- | --- |
 | `openapi.yaml` | The 22-operation union document; its header comment indexes feature classes a–m. |
-| `Cargo.toml` | The crate's real, hand-maintained manifest. |
-| `src/lib.rs` | `include!`s the four generated `.rs` files unmodified into `crate::api::{models,views,client,server}`. |
-| `src/demo.rs` | Hand-written demo app (`KitchenSinkApp`, every operation) plus the full-operation sweep driver shared verbatim by the binaries and smoke test. |
-| `server/main.rs` | Thin bootstrap: binds 127.0.0.1 on `--port <N>` (default 8099). |
-| `client/main.rs` | Sweep driver: takes `--base-url <url>` (default `http://127.0.0.1:8099`). |
-| `tests/determinism.rs` | Regeneration contract (see below). |
-| `tests/smoke.rs` | Ignored-by-default end-to-end smoke test. |
-| `generated/` | Committed generator artifacts. NOTE: the `Cargo.toml` here is the generator's emitted-manifest ARTIFACT (main spec §3.1), shown for inspection — the crate builds from the hand-maintained manifest above. |
+| `models/` | Shared schema surface crate (`kitchen-sink-models`, `--generate types`). `generated/models.rs` + `generated/views.rs` are committed generator output; `src/lib.rs` include!s them unmodified. Deps: serde, serde_json, dependency-light `openapi-support` — no transport stacks. |
+| `client/` | Client crate (`kitchen-sink-client`, `--generate client --types-path kitchen_sink_models`). `generated/client.rs` is committed generator output; `src/lib.rs` include!s it; `src/sweep.rs` is the hand-written sweep driver; `src/main.rs` the binary; `tests/smoke.rs` the ignored real-TCP smoke test. Deps: models crate + reqwest-side support features ONLY. |
+| `server/` | Server crate (`kitchen-sink-server`, `--generate server --types-path kitchen_sink_models`). `generated/server.rs` is committed generator output; `src/lib.rs` include!s it; `src/app.rs` is the hand-written demo application (`KitchenSinkApp`) + router wiring; `src/main.rs` the binary. Deps: models crate + axum-side support features ONLY (reqwest absent). |
+| `models/tests/determinism.rs` | Regeneration contract for ALL committed artifacts across the three crates (see below). |
+
+Normal generation writes NO Cargo.toml: every manifest above is
+hand-maintained, carrying only the dependencies its generated code genuinely
+uses.
 
 ## Run it manually
 
 Terminal 1 (server):
 
 ```sh
-cargo run -p kitchen-sink --bin kitchen-sink-server          # or: --port 8123
+cargo run -p kitchen-sink-server            # or: -- --port 8123
 ```
 
 Terminal 2 (client):
 
 ```sh
-cargo run -p kitchen-sink --bin kitchen-sink-client          # or: --base-url http://127.0.0.1:8123
+cargo run -p kitchen-sink-client            # or: -- --base-url http://127.0.0.1:8123
 ```
 
 The client prints one line per sweep step (`op   ok   summary`, `FAIL`
@@ -73,34 +75,50 @@ Lettering follows the `openapi.yaml` header comment.
 ## Smoke test
 
 ```sh
-cargo test -p kitchen-sink -- --ignored
+cargo test -p kitchen-sink-client -- --ignored
 ```
 
-Spawns the SAME demo router on an ephemeral loopback port over real TCP,
-drives the identical sweep the client binary runs, and asserts: every step
-passes AND every documented operation ran exactly as often as intended
-(`getThumbnail` twice, `probeStatus` four times, `echoNote` three times for
-absent/null/value, everything else once — a fixed 28-step itinerary).
-Gated behind `#[ignore]` so plain `cargo test` stays hermetic.
+Spawns the SAME demo router (from the server crate, wired in as a
+dev-dependency of the smoke test only) on an ephemeral loopback port over
+real TCP, drives the identical sweep the client binary runs, and asserts:
+every step passes AND every documented operation ran exactly as often as
+intended (`getThumbnail` twice, `probeStatus` four times, `echoNote` three
+times for absent/null/value, everything else once — a fixed 28-step
+itinerary). Gated behind `#[ignore]` so plain `cargo test` stays hermetic.
 
 ## Regeneration
 
 Generated artifacts are committed and MUST stay byte-stable: CI's determinism
-job re-runs the full pipeline twice and byte-compares both runs against each
-other AND against every committed `generated/` file (main spec §50 tests
-38–39); ANY drift fails. Any diagnostic — even a Warning — fails too, since
-none are expected for this document.
+job re-runs the full pipeline repeatedly and byte-compares every run against
+each other AND against every committed file across the three crates (main
+spec §50 tests 38–39); ANY drift fails. Any diagnostic — even a Warning —
+fails too, since none are expected for this document.
 
-After editing `openapi.yaml`, regenerate with:
+After editing `openapi.yaml`, either refresh the snapshots:
 
 ```sh
-KITCHEN_SINK_GENERATED_UPDATE=1 cargo test -p kitchen-sink --test determinism
+KITCHEN_SINK_GENERATED_UPDATE=1 cargo test -p kitchen-sink-models --test determinism
 ```
 
-which rewrites the committed files instead of comparing (same update-switch
-convention as the generator's golden harness). Generated files must NEVER be
-hand-edited: problems in generator behavior get reported and fixed in the
-generator, never patched around in the artifacts.
+or regenerate them exactly as committed, with the normal CLI (source-only;
+manifests stay hand-maintained):
+
+```sh
+openapi-to-rust examples/kitchen-sink/openapi.yaml \
+  --generate types \
+  --output-dir examples/kitchen-sink/models/generated
+
+openapi-to-rust examples/kitchen-sink/openapi.yaml \
+  --generate client --types-path kitchen_sink_models \
+  --output-dir examples/kitchen-sink/client/generated
+
+openapi-to-rust examples/kitchen-sink/openapi.yaml \
+  --generate server --types-path kitchen_sink_models \
+  --output-dir examples/kitchen-sink/server/generated
+```
+
+Generated files must NEVER be hand-edited: problems in generator behavior get
+reported and fixed in the generator, never patched around in the artifacts.
 
 ## Streaming and boundedness guarantees on display
 
