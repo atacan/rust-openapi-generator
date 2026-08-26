@@ -7,8 +7,13 @@
 //! - argument-order independence of emitted bytes,
 //! - the validation rules (`client`/`server` without `types` require
 //!   `--types-path`; `--types-path` together with `types` is ambiguous;
-//!   unknown artifacts and invalid Rust paths exit 2), and
-//! - the preserved `--dump` mode.
+//!   unknown artifacts and invalid Rust paths exit 2),
+//! - the single-value option policy (`--output-dir` canonical with `--out-dir`
+//!   as a byte-identical alias; repeated/conflicting values for
+//!   `--output-dir`/`--out-dir`/`--types-path` exit 2 instead of silently
+//!   taking the last value), and
+//! - the preserved `--dump` mode (including rejection of generation
+//!   arguments in both output-directory spellings).
 
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -150,7 +155,7 @@ fn library_artifacts(fixture: &str) -> Vec<(String, String)> {
 fn default_selection_generates_all_four_source_artifacts() {
     let scratch = Scratch::new("default");
     let out = scratch.path.to_string_lossy().into_owned();
-    let output = run_cli(&[document(FIXTURE_01).to_str().unwrap(), "--out-dir", &out]);
+    let output = run_cli(&[document(FIXTURE_01).to_str().unwrap(), "--output-dir", &out]);
     assert_exit_success(&output, "default generation");
 
     for (name, text) in library_artifacts(FIXTURE_01) {
@@ -158,6 +163,132 @@ fn default_selection_generates_all_four_source_artifacts() {
             scratch.read(&name),
             text,
             "{name}: default CLI generation diverges from the library pipeline"
+        );
+    }
+}
+
+// ----------------------------------------------------------------------
+// Canonical --output-dir / alias --out-dir
+// ----------------------------------------------------------------------
+
+#[test]
+fn output_dir_and_out_dir_alias_are_byte_identical() {
+    let canonical = Scratch::new("alias-canonical");
+    let alias = Scratch::new("alias-shorthand");
+    let doc_flag = document(FIXTURE_08).to_str().unwrap().to_owned();
+
+    assert_exit_success(
+        &run_cli(&[&doc_flag, "--output-dir", canonical.path.to_str().unwrap()]),
+        "canonical --output-dir",
+    );
+    assert_exit_success(
+        &run_cli(&[&doc_flag, "--out-dir", alias.path.to_str().unwrap()]),
+        "aliased --out-dir",
+    );
+    // Identical semantics: the exact same bytes land in either directory.
+    for name in ["models.rs", "views.rs", "client.rs", "server.rs"] {
+        assert_eq!(
+            canonical.read(name),
+            alias.read(name),
+            "{name}: --output-dir and --out-dir diverge"
+        );
+    }
+}
+
+#[test]
+fn conflicting_output_dir_spellings_are_rejected() {
+    let stderr = assert_exit_code(
+        &run_cli(&[
+            document(FIXTURE_01).to_str().unwrap(),
+            "--output-dir",
+            "/tmp/o2r-alias-a",
+            "--out-dir",
+            "/tmp/o2r-alias-b",
+        ]),
+        2,
+        "--output-dir plus --out-dir",
+    );
+    assert!(
+        stderr.contains("duplicate output directory argument"),
+        "\n{stderr}"
+    );
+}
+
+#[test]
+fn repeated_output_dir_values_are_rejected_even_when_identical() {
+    // Policy: single-value options accept exactly ONE occurrence — identical
+    // repeats are rejected too, because they usually hide build-script
+    // mistakes rather than express intent.
+    for flag in ["--output-dir", "--out-dir"] {
+        let value = "/tmp/o2r-repeat-same";
+        let stderr = assert_exit_code(
+            &run_cli(&[
+                document(FIXTURE_01).to_str().unwrap(),
+                flag,
+                value,
+                flag,
+                value,
+            ]),
+            2,
+            &format!("repeated {flag} with an identical value"),
+        );
+        assert!(
+            stderr.contains("duplicate output directory argument"),
+            "{flag}:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn repeated_types_path_values_are_rejected_even_when_identical() {
+    let differing = assert_exit_code(
+        &run_cli(&[
+            document(FIXTURE_01).to_str().unwrap(),
+            "--generate",
+            "client",
+            "--types-path",
+            "foo",
+            "--types-path",
+            "bar",
+        ]),
+        2,
+        "repeated --types-path with differing values",
+    );
+    assert!(
+        differing.contains("duplicate `--types-path`"),
+        "\n{differing}"
+    );
+
+    let identical = assert_exit_code(
+        &run_cli(&[
+            document(FIXTURE_01).to_str().unwrap(),
+            "--generate",
+            "client",
+            "--types-path",
+            "api_types",
+            "--types-path",
+            "api_types",
+        ]),
+        2,
+        "repeated --types-path with an identical value",
+    );
+    assert!(
+        identical.contains("duplicate `--types-path`"),
+        "\n{identical}"
+    );
+}
+
+#[test]
+fn output_dir_flag_requires_a_value() {
+    for flag in ["--output-dir", "--out-dir"] {
+        let stderr = assert_exit_code(
+            &run_cli(&[document(FIXTURE_01).to_str().unwrap(), flag]),
+            2,
+            &format!("{flag} without a value"),
+        );
+        assert!(
+            stderr.contains("requires a directory path"),
+            "{flag}:\n{stderr}"
         );
     }
 }
@@ -222,6 +353,31 @@ fn types_selection_writes_models_and_views_only() {
     // views.rs belongs to the types surface and imports its models sibling.
     let views = scratch.read("views.rs");
     assert!(views.contains("use super::models::"), "\n{views}");
+}
+
+#[test]
+fn local_types_with_server_keep_sibling_imports() {
+    let scratch = Scratch::new("types+server");
+    assert_exit_success(
+        &run_cli(&[
+            document(FIXTURE_08).to_str().unwrap(),
+            "--generate",
+            "types,server",
+            "--out-dir",
+            scratch.path.to_str().unwrap(),
+        ]),
+        "local types + server generation",
+    );
+    // All three files of the two selected surfaces land together…
+    for name in ["models.rs", "views.rs", "server.rs"] {
+        assert!(scratch.exists(name), "{name} must be written");
+    }
+    assert!(!scratch.exists("client.rs"));
+    // …and the server keeps SIBLING imports because the types were generated
+    // locally in the same invocation.
+    let server = scratch.read("server.rs");
+    assert!(server.contains("use super::models::"), "\n{server}");
+    assert!(server.contains("use super::views::"), "\n{server}");
 }
 
 #[test]
@@ -484,6 +640,23 @@ fn dump_mode_rejects_generation_arguments() {
 }
 
 #[test]
+fn dump_mode_rejects_output_dir_in_both_spellings() {
+    for flag in ["--output-dir", "--out-dir"] {
+        let stderr = assert_exit_code(
+            &run_cli(&[
+                "--dump",
+                document(FIXTURE_01).to_str().unwrap(),
+                flag,
+                "somewhere",
+            ]),
+            2,
+            &format!("--dump plus {flag}"),
+        );
+        assert!(stderr.contains("cannot be combined"), "{flag}:\n{stderr}");
+    }
+}
+
+#[test]
 fn help_exits_successfully() {
     for flag in ["-h", "--help"] {
         let output = run_cli(&[flag]);
@@ -491,5 +664,7 @@ fn help_exits_successfully() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("--generate"), "\n{stdout}");
         assert!(stdout.contains("--types-path"), "\n{stdout}");
+        // The canonical long form is what help advertises.
+        assert!(stdout.contains("--output-dir <DIR>"), "\n{stdout}");
     }
 }

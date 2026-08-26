@@ -5,12 +5,15 @@
 ### Selective artifact generation (`--generate` / `--types-path`, D-impl-selective-artifacts)
 
 - New user-facing generation mode in the `openapi-to-rust` CLI:
-  `openapi-to-rust <document> [--generate …] [--types-path …] [--out-dir …]`
+  `openapi-to-rust <document> [--generate …] [--types-path …] [--output-dir …]`
   writes source artifacts into a directory without any configuration file.
   `--generate` accepts `types`, `client`, `server` (repeated and
   comma-separated forms are equivalent; `all` is shorthand for the three);
   omitting it preserves the historical all-in-one output byte-for-byte.
-  The existing `--dump` mode is unchanged.
+  The output directory is spelled canonically as `--output-dir <DIR>`, with
+  `--out-dir` accepted as a compatibility alias with identical semantics
+  (the two spellings may not be combined). The existing `--dump` mode is
+  unchanged and rejects generation arguments in both spellings.
 - `types` is the WHOLE shared schema surface: both `models.rs` and the
   directional read/write views of `views.rs` (companion §5) — there are no
   separate public selections for the two modules.
@@ -30,6 +33,17 @@
   replacement). The sibling default keeps every existing caller and snapshot
   byte-identical; the import sort key now mirrors rustfmt's full ordering
   (keyword paths, then `::`-prefixed extern paths, then plain paths).
+- Review hardening (still D-impl-selective-artifacts): `validate_rust_path`
+  is now a small real grammar — repeated `super` chains (`super::super`,
+  `self::super`) validate, absolute `::…` paths reject all path keywords,
+  and raw identifiers cannot escape `crate`/`self`/`super`/`Self`; single-
+  value options (`--types-path`, `--output-dir`/`--out-dir`) reject repeated
+  or conflicting occurrences instead of silently taking the last value; and
+  a new split-workspace integration test compiles the actual three-crate
+  layout (`cargo check --workspace --locked` over generated
+  types/client/server crates) with compiler-enforced shared-type identity
+  assertions and `cargo tree` proofs that each crate carries only its own
+  transport stack.
 
 ### `examples/large-upload` — bounded-memory streaming demonstration
 

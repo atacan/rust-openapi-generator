@@ -473,3 +473,51 @@ rewriting) preserves the deterministic-emission architecture of
 D-impl-codegen-emission, keeps §50 test 39/40 guarantees intact for both
 modes, and leaves the artifact namespace open for future values (tests,
 mocks, docs) without new top-level flags.
+
+### D-impl-selective-artifacts (review hardening) output-dir naming, single-value policy, and the compile-proven split workspace
+
+**Decision.** Three follow-ups to the selection feature, settled during PR
+review before merge.
+
+1. The output directory flag is canonically `--output-dir <DIR>`; `--out-dir`
+   remains accepted as a compatibility/convenience alias with IDENTICAL
+   semantics (one parser slot, so the spellings can never disagree). Help
+   advertises the canonical form and names the alias. Both spellings are
+   rejected together with `--dump`, like every generation argument.
+2. Single-value options accept exactly ONE occurrence: a second
+   `--types-path`, `--output-dir`, or `--out-dir` — same spelling or mixed,
+   identical value or conflicting — is a usage error rather than a silently
+   won last-value race. Identical repeats are rejected too, because they
+   usually hide build-script mistakes instead of expressing intent.
+   (`--generate` stays intentionally repeatable.) `validate_rust_path` is
+   likewise tightened into a small real grammar: repeated `super` chains
+   (`super::super::x`, `self::super::x`) validate; an absolute `::…` path
+   rejects all path keywords; raw identifiers cannot escape
+   `crate`/`self`/`super`/`Self`.
+3. The split-workspace contract is proven by a COMPILING integration test,
+   not string matching. The test drives the real binary through the README's
+   exact commands into a three-crate scratch workspace (`api-types`,
+   `api-client`, `api-server`), where handwritten manifests wire
+   `openapi-support` with ONLY the `client` features on the client side and
+   ONLY the `server` features on the server side, and compile-only
+   assertions pin shared-type identity: implementing the generated `Api`
+   trait with parameters annotated as `api_types::models::Account` /
+   `api_types::views::SyncedRecordWrite` and calling the generated client
+   method through a binding typed as `api_types::views::AccountWrite` would
+   stop compiling if either emitter produced structurally duplicated types.
+   `cargo check --workspace --locked` plus inverted `cargo tree` lookups
+   prove the edges and absences (`reqwest`/`axum`/`hyper`/`tower` out of
+   `api-types`; `axum` out of `api-client`; `reqwest` out of `api-server`;
+   matching single-feature support builds), and a second scenario compiles
+   the nested in-crate spelling `crate::generated::types`. Dependency
+   versions stay pinned via committed fixture lockfiles; normal generation
+   remains source-only — these scratch manifests are test fixtures, never
+   generator output, and no Cargo.toml merge engine is introduced.
+
+**Rationale.** Canonical-plus-alias keeps early adopters of `--out-dir`
+working while giving documentation and help one intentional spelling; the
+one-occurrence rule trades zero convenience for catching real invocation
+mistakes at exit 2; and the compiling workspace converts the architectural
+promise ("client and server share ONE Rust model identity, each crate
+compiles only its own transport stack") from prose into something CI fails
+on when it drifts.

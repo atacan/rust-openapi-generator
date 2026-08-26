@@ -6,7 +6,7 @@
 //!
 //! - `openapi-to-rust --dump <path>` prints the deterministic normalized
 //!   dump to stdout (unchanged behavior).
-//! - `openapi-to-rust <path> [--generate …] [--types-path …] [--out-dir …]`
+//! - `openapi-to-rust <path> [--generate …] [--types-path …] [--output-dir …]`
 //!   generates source artifacts into a directory. Artifacts are selected
 //!   through the extensible `--generate` namespace (`types`, `client`,
 //!   `server`, `all`; repeated and comma-separated forms are equivalent);
@@ -147,14 +147,34 @@ fn run(args: &[String]) -> Result<(), std::process::ExitCode> {
                     );
                     return Err(std::process::ExitCode::from(2));
                 };
+                if types_path.is_some() {
+                    eprintln!(
+                        "error: duplicate `--types-path` argument; a single \
+                         invocation accepts exactly one shared-types path"
+                    );
+                    return Err(std::process::ExitCode::from(2));
+                }
                 types_path = Some(value.as_str());
             }
-            "--out-dir" => {
+            // Canonical long form plus compatibility alias: one slot, so the
+            // two spellings can never disagree and ANY second occurrence
+            // (same or mixed spelling, same or different value) is a usage
+            // error instead of a silently-won last-value race
+            // (D-impl-selective-artifacts).
+            "--output-dir" | "--out-dir" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
-                    eprintln!("error: `--out-dir` requires a directory path");
+                    eprintln!("error: `{}` requires a directory path", args[index - 1]);
                     return Err(std::process::ExitCode::from(2));
                 };
+                if out_dir.is_some() {
+                    eprintln!(
+                        "error: duplicate output directory argument \
+                         (`--output-dir` / alias `--out-dir`); pass it exactly \
+                         once"
+                    );
+                    return Err(std::process::ExitCode::from(2));
+                }
                 out_dir = Some(value.as_str());
             }
             "-h" | "--help" => {
@@ -407,8 +427,10 @@ OPTIONS:
           `--types-path api_types`. Examples: `api_types`,
           `crate::types`, `crate::generated::types`, `company_api::v2`.
 
-  --out-dir <dir>
-          Directory receiving the generated files (default: `.`).
+   --output-dir <DIR>
+           Directory receiving the generated files (default: `.`).
+           alias: --out-dir (accepted for convenience; identical semantics,
+           and the two spellings may not be combined).
 
   -h, --help
           Print this help."

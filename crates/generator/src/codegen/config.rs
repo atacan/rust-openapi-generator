@@ -89,14 +89,25 @@ impl Default for CodegenConfig {
     }
 }
 
-/// Validates a user-supplied Rust path for `--types-path`: an optional
-/// leading `::`, then `::`-separated segments where the first may be
-/// `crate`/`self`/`super` and every other segment must be a (possibly raw)
-/// identifier that is not a Rust keyword.
+/// Validates a user-supplied Rust path for `--types-path`.
 ///
-/// Deliberately small and deterministic (no parser dependency): it exists to
-/// catch obvious mistakes — kebab-case package names, filesystem separators,
-/// dangling separators — before they become confusing compile errors.
+/// The grammar mirrors the paths generated `use` statements can actually
+/// spell (main spec §3), without a parser dependency:
+///
+/// - an optional LEADING `::` marks an external/absolute path; such a path
+///   must not contain the path keywords at all (`::crate::foo` is not Rust);
+/// - otherwise the FIRST segment may be the relative qualifier `crate`,
+///   `self`, or `super`;
+/// - after `self` or `super`, further `super`s are permitted
+///   (`super::super::shared`, `self::super::shared`); every other keyword
+///   position is rejected (`crate::self`, `foo::super`);
+/// - every remaining segment must be a plain identifier that is not a Rust
+///   keyword, or a RAW identifier (`r#type`) — and raw identifiers cannot
+///   escape `crate`, `self`, `super`, or `Self`.
+///
+/// Deliberately small and deterministic: it exists to catch obvious mistakes
+/// — kebab-case package names, filesystem separators, dangling separators,
+/// keyword abuse — before they become confusing compile errors.
 ///
 /// # Errors
 ///
@@ -107,6 +118,7 @@ pub fn validate_rust_path(path: &str) -> Result<(), String> {
     if trimmed.is_empty() {
         return Err("the path is empty".to_owned());
     }
+    let absolute = trimmed.starts_with("::");
     let body = trimmed.strip_prefix("::").unwrap_or(trimmed);
     let segments: Vec<&str> = body.split("::").collect();
     if segments.iter().any(|segment| segment.is_empty()) {
@@ -114,33 +126,58 @@ pub fn validate_rust_path(path: &str) -> Result<(), String> {
             "`{trimmed}` has an empty segment (dangling or repeated `::`)"
         ));
     }
+    // Whether the PREVIOUS segment permits a following `super` (Rust allows
+    // exactly this one keyword chain: `self::super`, `super::super`).
+    let mut super_chain_allowed = false;
     for (index, segment) in segments.iter().enumerate() {
-        match *segment {
-            "crate" | "self" | "super" if index == 0 => continue,
-            "crate" | "self" | "super" => {
+        let (raw, name) = match segment.strip_prefix("r#") {
+            Some(name) => (true, name),
+            None => (false, *segment),
+        };
+        if !raw && matches!(name, "crate" | "self" | "super") {
+            if absolute {
                 return Err(format!(
-                    "`{segment}` may only appear as the FIRST segment of \
-                     `{trimmed}`"
-                ))
+                    "`{trimmed}` is an external/absolute path and cannot \
+                     contain the path keyword `{name}`"
+                ));
             }
-            other => {
-                let (raw, name) = match other.strip_prefix("r#") {
-                    Some(name) => (true, name),
-                    None => (false, other),
-                };
-                if !is_identifier(name) {
-                    return Err(format!(
-                        "`{other}` is not a valid Rust identifier in `{trimmed}`"
-                    ));
-                }
-                if !raw && is_keyword(name) {
-                    return Err(format!(
-                        "`{name}` is a Rust keyword and cannot be used as a \
-                         path segment in `{trimmed}`"
-                    ));
-                }
+            let legal = match name {
+                "crate" | "self" => index == 0,
+                _ => index == 0 || super_chain_allowed,
+            };
+            if !legal {
+                return Err(match name {
+                    "super" => format!(
+                        "`super` inside `{trimmed}` may follow only `self` or \
+                         another `super`"
+                    ),
+                    _ => format!(
+                        "`{name}` may appear only as the FIRST segment of \
+                         `{trimmed}`"
+                    ),
+                });
             }
+            super_chain_allowed = matches!(name, "self" | "super");
+            continue;
         }
+        if raw && matches!(name, "crate" | "self" | "super" | "Self") {
+            return Err(format!(
+                "`{segment}` cannot escape the reserved keyword `{name}` \
+                 with a raw identifier in `{trimmed}`"
+            ));
+        }
+        if !is_identifier(name) {
+            return Err(format!(
+                "`{segment}` is not a valid Rust identifier in `{trimmed}`"
+            ));
+        }
+        if !raw && is_keyword(name) {
+            return Err(format!(
+                "`{name}` is a Rust keyword and cannot be used as a path \
+                 segment in `{trimmed}`"
+            ));
+        }
+        super_chain_allowed = false;
     }
     Ok(())
 }
@@ -157,10 +194,15 @@ fn is_identifier(name: &str) -> bool {
 }
 
 /// Strict + reserved keywords that cannot appear as a plain path segment.
+/// Includes the path keywords themselves so ABSOLUTE paths (`::crate`) and
+/// raw-escape checks reject them uniformly; relative positions are handled
+/// by the grammar above before this list is consulted.
 fn is_keyword(name: &str) -> bool {
     matches!(
         name,
-        "as" | "break"
+        "Self"
+            | "as"
+            | "break"
             | "const"
             | "continue"
             | "else"
@@ -242,9 +284,14 @@ mod tests {
             "crate::generated::types",
             "self::types",
             "super::shared",
+            "super::super::shared",
+            "self::super::shared",
             "::absolutecrate",
+            "::api_types",
+            "::company_api::v2",
             "company_api::v2",
             "r#type",
+            "foo::r#type",
             "crate",
             "A1_b2::x",
         ] {
@@ -263,15 +310,72 @@ mod tests {
             "::foo::",
             "a::::b",
             "1abc",
-            "foo::type",
-            "crate::self",
-            "self::crate",
             "foo bar",
+            "foo::type",
+            "Self",
+            ":",
+            ":foo",
+            "foo:bar",
+            "r#",
+            "foo::r#",
+            "r#1abc",
         ] {
             assert!(
                 validate_rust_path(path).is_err(),
                 "`{path}` must be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn validator_rejects_misplaced_path_keywords() {
+        // `crate`/`self` only ever start a relative path; `super` may chain
+        // only after `self`/`super`.
+        for path in [
+            "crate::self",
+            "crate::crate",
+            "crate::super",
+            "self::crate",
+            "self::self",
+            "super::crate",
+            "super::self",
+            "shared::super::types",
+            "foo::super::bar",
+            "foo::crate",
+            "foo::self",
+            "crate::types::super",
+        ] {
+            assert!(
+                validate_rust_path(path).is_err(),
+                "`{path}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validator_rejects_keywords_after_leading_colons() {
+        for path in ["::crate::foo", "::self::foo", "::super::foo", "::crate"] {
+            assert!(
+                validate_rust_path(path).is_err(),
+                "`{path}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validator_rejects_raw_keyword_escapes() {
+        for path in ["r#self", "r#super", "r#crate", "r#Self", "foo::r#self"] {
+            assert!(
+                validate_rust_path(path).is_err(),
+                "`{path}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validator_accepts_raw_non_keyword_identifiers_in_every_position() {
+        for path in ["r#type", "foo::r#type", "crate::r#loop", "::r#async"] {
+            assert!(validate_rust_path(path).is_ok(), "{path} must validate");
         }
     }
 
