@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Selective artifact generation (`--generate` / `--types-path`, D-impl-selective-artifacts)
+
+- New user-facing generation mode in the `openapi-to-rust` CLI:
+  `openapi-to-rust <document> [--generate …] [--types-path …] [--out-dir …]`
+  writes source artifacts into a directory without any configuration file.
+  `--generate` accepts `types`, `client`, `server` (repeated and
+  comma-separated forms are equivalent; `all` is shorthand for the three);
+  omitting it preserves the historical all-in-one output byte-for-byte.
+  The existing `--dump` mode is unchanged.
+- `types` is the WHOLE shared schema surface: both `models.rs` and the
+  directional read/write views of `views.rs` (companion §5) — there are no
+  separate public selections for the two modules.
+- `--types-path <RUST_PATH>` names an externally generated shared-types base
+  namespace (its `models`/`views` modules sit under it), enabling the split
+  workspace layout: one types crate, one Reqwest client crate, one Axum
+  server crate, all referencing a single Rust identity per schema type. It
+  is a Rust path, not a Cargo package name (`api-types` → `api_types`);
+  obvious mistakes (kebab-case, `/`, dangling `::`) are rejected up front.
+  Validation: client/server without local `types` require it; combining it
+  with a same-invocation `types` selection is rejected as ambiguous;
+  repeated selections deduplicate deterministically and argument order never
+  affects emitted bytes.
+- Library: new `codegen::config::{TypesLocation, CodegenConfig}` plus
+  `generate_client_with_config`/`generate_server_with_config`; the emitters
+  render the configured import prefixes directly (no post-generation string
+  replacement). The sibling default keeps every existing caller and snapshot
+  byte-identical; the import sort key now mirrors rustfmt's full ordering
+  (keyword paths, then `::`-prefixed extern paths, then plain paths).
+
 ### `examples/large-upload` — bounded-memory streaming demonstration
 
 - New workspace-member example crate around a minimal two-path OpenAPI 3.1.0 document

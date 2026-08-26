@@ -8,7 +8,10 @@
 //! response enums, nested content enums, streaming status wrappers, request
 //! body enums, and bounded/streaming method bodies. Generated code references
 //! only `::openapi_support`, `::reqwest`, `::http`, `::mime`, `::bytes`,
-//! `::futures_core`, `serde_json`, and `super::models`.
+//! `::futures_core`, `serde_json`, and the shared types surface (`models` +
+//! `views`) at the configured location ([`super::config::TypesLocation`]:
+//! sibling `super::models` by default, or an external base path for split
+//! workspace layouts, D-impl-selective-artifacts).
 //!
 //! Companion §8 server handling: operation-level `servers` override
 //! path-level override root-level, and the first entry of each effective
@@ -32,6 +35,7 @@ use crate::normalize::naming;
 use crate::normalize::NormalizedDocument;
 
 use super::codecs::{default_registry as codec_registry, helper_prefix};
+use super::config::{CodegenConfig, TypesLocation};
 use super::plan::{
     Decompression, PlannedApi, PlannedContent, PlannedMultipart, PlannedMultipartField,
     PlannedMultipartFieldKind, PlannedOperation, PlannedParameter, PlannedStatus, StreamFraming,
@@ -40,10 +44,25 @@ use super::Emitter;
 
 const RUSTFMT_MAX_WIDTH: usize = 100;
 
-/// Renders ONE generated `client.rs` for the planned API (main spec §3,
-/// D-impl-singlefile-layout).
+/// Renders ONE generated `client.rs` for the planned API with the shared
+/// types as SIBLING modules (`super::models`, `super::views`; main spec §3,
+/// D-impl-singlefile-layout). Backward-compatible wrapper over
+/// [`generate_client_with_config`].
 #[must_use]
 pub fn generate_client(doc: &NormalizedDocument, plan: &PlannedApi) -> String {
+    generate_client_with_config(doc, plan, &CodegenConfig::default())
+}
+
+/// Renders ONE generated `client.rs` under an explicit shared-types location
+/// (DECISIONS.md D-impl-selective-artifacts): [`TypesLocation::Sibling`]
+/// keeps the historical sibling imports, [`TypesLocation::External`] points
+/// the model/view imports at an externally generated namespace instead.
+#[must_use]
+pub fn generate_client_with_config(
+    doc: &NormalizedDocument,
+    plan: &PlannedApi,
+    config: &CodegenConfig,
+) -> String {
     let mut flags = Flags::default();
     let mut used_names = reserved_names(doc);
     let layout = Layout::new(plan, &mut used_names);
@@ -53,7 +72,7 @@ pub fn generate_client(doc: &NormalizedDocument, plan: &PlannedApi) -> String {
     }
 
     let mut emitter = Emitter::new();
-    emit_header(&mut emitter, doc, &flags);
+    emit_header(&mut emitter, doc, &flags, &config.types_location);
     let bases = BaseSet::new(plan);
     emit_client(&mut emitter, &bases);
     emit_builder(&mut emitter, &bases, plan.response_decompression);
@@ -521,7 +540,12 @@ fn model_type_names(expr: &str) -> Vec<String> {
 // Module header, imports, Client/ClientBuilder
 // ----------------------------------------------------------------------
 
-fn emit_header(emitter: &mut Emitter, doc: &NormalizedDocument, flags: &Flags) {
+fn emit_header(
+    emitter: &mut Emitter,
+    doc: &NormalizedDocument,
+    flags: &Flags,
+    types: &TypesLocation,
+) {
     let mut docs = vec![
         "Reqwest client generated from the OpenAPI document (main spec §8 \
               Output A)."
@@ -577,14 +601,20 @@ fn emit_header(emitter: &mut Emitter, doc: &NormalizedDocument, flags: &Flags) {
     let mut imports: Vec<String> = Vec::new();
     if !flags.model_types.is_empty() {
         let models: Vec<&str> = flags.model_types.iter().map(String::as_str).collect();
-        imports.push(braced_use("use super::models::", &models));
+        imports.push(braced_use(
+            &format!("use {}::", types.models_path()),
+            &models,
+        ));
     }
-    // Directional views (companion §5): `super::views` sorts directly after
-    // `super::models` under rustfmt's reorder_imports, so this slot keeps the
-    // block byte-stable.
+    // Directional views (companion §5): the views path sorts directly after
+    // the models path under rustfmt's reorder_imports (both share their
+    // first segment), so this slot keeps the block byte-stable.
     if !flags.view_types.is_empty() {
         let view_types: Vec<&str> = flags.view_types.iter().map(String::as_str).collect();
-        imports.push(braced_use("use super::views::", &view_types));
+        imports.push(braced_use(
+            &format!("use {}::", types.views_path()),
+            &view_types,
+        ));
     }
     if flags.needs_body_limit_direction {
         imports.push(

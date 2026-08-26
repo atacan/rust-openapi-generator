@@ -426,3 +426,50 @@ constructor would force ceremony for the common case; the only remaining failure
 value that is not representable as a header value — surfaces at encode time, where the committed
 response cannot be changed, so it lands in the same hook-plus-fallback family as encode overflow
 (§34.1) rather than inventing a second error channel.
+
+---
+
+## H. Selective artifact generation decisions
+
+### D-impl-selective-artifacts `--generate` selection with a single shared-types path
+
+**Decision.** The user-facing CLI selects artifacts through one extensible
+`--generate` namespace (`types`, `client`, `server`; repeated and
+comma-separated forms are equivalent; `all` is shorthand for the three;
+omitting the flag preserves the historical all-in-one output byte-for-byte).
+No configuration file is introduced. There are deliberately NO separate
+`models`/`views` selections: in this repository `types` means BOTH
+`models.rs` and its directional read/write views (`views.rs`, companion §5) —
+one logical shared-type surface, emitted together or not at all.
+
+When `types` is NOT generated in the same invocation as `client`/`server`,
+the emitters need to know where the shared types live. A single semantic
+option, `--types-path <RUST_PATH>`, names that base namespace (its `models`
+and `views` modules sit under it): `api_types`, `crate::generated::types`,
+`company_api::v2`. It is a Rust module/crate PATH, not a Cargo package name
+(package `api-types` → crate identifier `api_types`). Validation rules:
+client/server without local types and without `--types-path` is a usage
+error; `--types-path` together with `types` in ONE invocation is rejected as
+ambiguous rather than silently resolved; repeated selections deduplicate
+deterministically and argument order never affects emitted bytes.
+
+Internally the decision is an explicit codegen concept —
+`codegen::config::TypesLocation` (`Sibling` | `External(base)`) threaded
+through `CodegenConfig` into new `generate_client_with_config`/
+`generate_server_with_config` entry points. The backward-compatible
+`generate_client`/`generate_server` wrappers keep the sibling default so
+every existing caller (snapshot suites, conformance build script, committed
+examples) stays byte-identical without naming the configuration. Emitters
+render the configured import prefixes themselves; no post-generation textual
+replacement runs over the output.
+
+**Rationale.** The motivating layout is a Cargo workspace with the shared
+OpenAPI schema types in their own crate, the Reqwest client in another, and
+the Axum server interface in a third; both transport crates depend on the
+one types crate so every schema type has a single Rust identity and no
+conversion layer between duplicated structs is needed. Keeping the choice as
+a typed emitter input (rather than sibling-only hard-coding plus string
+rewriting) preserves the deterministic-emission architecture of
+D-impl-codegen-emission, keeps §50 test 39/40 guarantees intact for both
+modes, and leaves the artifact namespace open for future values (tests,
+mocks, docs) without new top-level flags.
