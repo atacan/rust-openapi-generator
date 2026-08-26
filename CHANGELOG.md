@@ -69,9 +69,29 @@
 - Hand-written demo code split along the transport line: kitchen-sink's
   `demo.rs` became `client/src/sweep.rs` + `server/src/app.rs`; large-upload's
   became `client/src/transfers.rs` + `server/src/app.rs`. Large-upload's
-  memory monitor moved into its own dependency-free helper crate
-  (`large-upload-memmon`) so both transports can measure themselves without
-  depending on each other.
+  memory monitor stays a SINGLE copy of source (`memmon/mod.rs`) included by
+  both transport crates via `#[path]` — no fourth workspace crate, no
+  client↔server dependency; its three dependencies (tokio `time`,
+  `memory-stats`, `libc`) are carried directly by both manifests.
+- Transport isolation is now enforced automatically in CI: a new `isolation`
+  job runs `scripts/check-transport-isolation.sh`, which proves via
+  `cargo tree -e normal` that both models crates compile neither transport,
+  both clients never compile axum, and both servers never compile reqwest by
+  default — with a positive control proving large-upload's proxy feature is
+  a real reqwest opt-in. Dev-dependency escape hatches (the smoke tests) use
+  only dev edges and cannot mask violations.
+- large-upload's server demo gates PROXY mode behind an explicit
+  `proxy = ["dep:reqwest"]` Cargo feature: the DEFAULT build — including the
+  generated server surface — never compiles reqwest, and the binary rejects
+  `--proxy-url` on such builds instead of silently pulling the client stack.
+- A new generator integration test
+  (`crates/generator/tests/example_regeneration.rs`) replays EXACTLY the
+  regeneration commands documented in both example READMEs through the real
+  CLI binary and byte-compares every emitted file against the committed
+  artifacts, so documentation drift can no longer go unnoticed.
+- The 1 GiB large-upload demonstration is documented as a `--release`
+  workflow in its README (debug builds behave identically but burn CPU at
+  gigabyte scale).
 - Tests relocated with their subjects: determinism gates live in each
   `models/tests/determinism.rs` (same update switches:
   `KITCHEN_SINK_GENERATED_UPDATE=1`, `LARGE_UPLOAD_GENERATED_UPDATE=1`) and

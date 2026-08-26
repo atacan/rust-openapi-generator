@@ -19,8 +19,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use large_upload_client::memmon;
 use large_upload_client::transfers;
-use large_upload_memmon as memmon;
 use large_upload_server::app::{self, LargeUploadApp};
 
 /// Spawns an axum server on an OS-assigned loopback port serving `router`

@@ -7,12 +7,14 @@
 //!   chunk-by-chunk (`into_data_stream()`), appended to a file under a
 //!   UNIQUE `std::env::temp_dir()` directory while an incremental SHA-256
 //!   digests the same chunks — nothing ever aggregates the payload;
-//! * **proxy mode** (`--proxy-url <base>`): the INBOUND body stream is
-//!   wrapped directly into the outbound `reqwest::Body` (`wrap_stream`) and
-//!   forwarded to `{base}/blobs/{id}` / `{base}/audio/{id}`, so bytes pass
-//!   through without buffering; the upstream's JSON receipt flows back.
-//!   Pointing a proxy-mode instance at a disk-mode instance chains three
-//!   streaming processes end-to-end.
+//! * **proxy mode** (`--proxy-url <base>`, requires building THIS crate
+//!   with `--features proxy`): the INBOUND body stream is wrapped directly
+//!   into the outbound `reqwest::Body` (`wrap_stream`) and forwarded to
+//!   `{base}/blobs/{id}` / `{base}/audio/{id}`, so bytes pass through
+//!   without buffering; the upstream's JSON receipt flows back. Pointing a
+//!   proxy-mode instance at a disk-mode instance chains three streaming
+//!   processes end-to-end. The reqwest upstream transport is an explicit
+//!   Cargo-feature opt-in: the DEFAULT server build never compiles it.
 //!
 //! Both operations answer [`large_upload_models::models::UploadReceipt`]
 //! ({bytes_received, sha256}) proving the FULL payload was handled without
@@ -23,10 +25,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use large_upload_memmon as memmon;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
+use crate::memmon;
 use crate::server as sapi;
 use large_upload_models::models::{ProblemDetails, UploadReceipt};
 
@@ -39,9 +41,12 @@ fn problem_details(title: &str) -> ProblemDetails {
 /// Demo application state: the temp-dir store plus optional proxy target.
 pub struct LargeUploadApp {
     store_dir: PathBuf,
-    /// Trailing-slash-trimmed proxy base (`None` = disk mode).
+    /// Trailing-slash-trimmed proxy base (`None` = disk mode). Honored only
+    /// when compiled with the `proxy` feature (see [`Self::new`]).
     proxy_base: Option<String>,
-    /// Reused upstream transport for proxy mode.
+    /// Reused upstream transport for proxy mode (compiled — and therefore
+    /// pulling reqwest into the graph — ONLY under the `proxy` feature).
+    #[cfg(feature = "proxy")]
     upstream: reqwest::Client,
 }
 
@@ -51,11 +56,17 @@ impl LargeUploadApp {
     /// switches to proxy mode, forwarding every body to
     /// `{proxy_base}/blobs|audio/{id}`.
     ///
+    /// Proxy configuration is honored only when compiled with the `proxy`
+    /// feature; the binary rejects `--proxy-url` otherwise, so programmatic
+    /// callers passing `Some(_)` on a default build get DISK behavior while
+    /// [`Self::is_proxy_mode`] keeps reporting honestly.
+    ///
     /// # Panics
     /// Panics when the shared reqwest transport cannot be built (rare
-    /// process-level misconfiguration).
+    /// process-level misconfiguration; `proxy` feature builds only).
     #[must_use]
     pub fn new(store_dir: PathBuf, proxy_base: Option<String>) -> Self {
+        #[cfg(feature = "proxy")]
         let upstream = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -65,14 +76,16 @@ impl LargeUploadApp {
             proxy_base: proxy_base
                 .as_deref()
                 .map(|base| base.trim_end_matches('/').to_owned()),
+            #[cfg(feature = "proxy")]
             upstream,
         }
     }
 
-    /// Whether this instance forwards instead of storing.
+    /// Whether this instance forwards instead of storing. Always `false`
+    /// without the `proxy` feature.
     #[must_use]
     pub fn is_proxy_mode(&self) -> bool {
-        self.proxy_base.is_some()
+        cfg!(feature = "proxy") && self.proxy_base.is_some()
     }
 
     /// Safe join of a resource id onto the store directory: rejects empty
@@ -130,7 +143,9 @@ impl LargeUploadApp {
 
     /// PROXY MODE core: forwards the inbound stream verbatim as the outbound
     /// body to `{base}{path}` (`wrap_stream` over the raw inbound chunks —
-    /// zero buffering), then relays the upstream receipt.
+    /// zero buffering), then relays the upstream receipt. Compiled only
+    /// under the `proxy` feature.
+    #[cfg(feature = "proxy")]
     async fn forward_stream(
         &self,
         path: &str,
@@ -185,6 +200,9 @@ impl sapi::Api for LargeUploadApp {
                 "blob id rejected: {id}"
             )));
         }
+        // Proxy dispatch is compiled only under the `proxy` feature; the
+        // default build always streams to the local store.
+        #[cfg(feature = "proxy")]
         let outcome = match &self.proxy_base {
             Some(_) => {
                 self.forward_stream(&format!("/blobs/{id}"), "application/octet-stream", body)
@@ -195,6 +213,10 @@ impl sapi::Api for LargeUploadApp {
                     .await
             }
         };
+        #[cfg(not(feature = "proxy"))]
+        let outcome = self
+            .stream_body_to_store(&format!("blob-{id}"), format!("recv blob {id}"), body)
+            .await;
         match outcome {
             Ok(receipt) => sapi::PutBlobResponse::Created201(receipt),
             Err(message) => sapi::PutBlobResponse::BadRequest400(problem_details(&message)),
@@ -213,6 +235,7 @@ impl sapi::Api for LargeUploadApp {
                 "track id rejected: {id}"
             )));
         }
+        #[cfg(feature = "proxy")]
         let outcome = match &self.proxy_base {
             Some(_) => {
                 self.forward_stream(&format!("/audio/{id}"), "audio/wav", body)
@@ -223,6 +246,10 @@ impl sapi::Api for LargeUploadApp {
                     .await
             }
         };
+        #[cfg(not(feature = "proxy"))]
+        let outcome = self
+            .stream_body_to_store(&format!("track-{id}"), format!("recv track {id}"), body)
+            .await;
         match outcome {
             Ok(receipt) => sapi::PutAudioTrackResponse::Created201(receipt),
             Err(message) => sapi::PutAudioTrackResponse::BadRequest400(problem_details(&message)),

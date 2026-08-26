@@ -12,6 +12,13 @@ pub mod client {
     include!("../generated/client.rs");
 }
 
+/// Demo-only memory instrumentation (sampled RSS + getrusage high-water
+/// mark, progress printers), included ONCE from the example-root
+/// `memmon/mod.rs` so both transports share it without a fourth crate or a
+/// client↔server dependency.
+#[path = "../../memmon/mod.rs"]
+pub mod memmon;
+
 /// Hand-written streaming-transfer driver ([`transfers::run_transfers`])
 /// plus the generated-client constructor shared verbatim by the binary and
 /// the ignored smoke tests.

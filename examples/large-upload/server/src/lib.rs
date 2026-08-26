@@ -11,6 +11,13 @@ pub mod server {
     include!("../generated/server.rs");
 }
 
+/// Demo-only memory instrumentation (sampled RSS + getrusage high-water
+/// mark, progress printers), included ONCE from the example-root
+/// `memmon/mod.rs` so both transports share it without a fourth crate or a
+/// client↔server dependency.
+#[path = "../../memmon/mod.rs"]
+pub mod memmon;
+
 /// Hand-written demo application ([`app::LargeUploadApp`] implementing the
 /// generated [`crate::server::Api`] trait in two modes — chunk-wise disk
 /// persistence or whole-body proxy forwarding) plus the router wiring shared

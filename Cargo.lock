@@ -757,9 +757,10 @@ dependencies = [
  "bytes",
  "futures-core",
  "http",
- "large-upload-memmon",
  "large-upload-models",
  "large-upload-server",
+ "libc",
+ "memory-stats",
  "mime",
  "openapi-support",
  "reqwest",
@@ -768,15 +769,6 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-util",
-]
-
-[[package]]
-name = "large-upload-memmon"
-version = "0.1.0"
-dependencies = [
- "libc",
- "memory-stats",
- "tokio",
 ]
 
 [[package]]
@@ -796,8 +788,9 @@ dependencies = [
  "futures-core",
  "futures-util",
  "http",
- "large-upload-memmon",
  "large-upload-models",
+ "libc",
+ "memory-stats",
  "openapi-support",
  "reqwest",
  "serde",

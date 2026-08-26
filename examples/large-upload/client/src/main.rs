@@ -11,8 +11,8 @@
 //! print the memory report and exit non-zero if any step failed OR the peak
 //! RSS delta breached the bounded-memory threshold.
 
+use large_upload_client::memmon;
 use large_upload_client::transfers;
-use large_upload_memmon as memmon;
 
 const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8097";
 const DEFAULT_SIZE_MIB: u64 = 1024;

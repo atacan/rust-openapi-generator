@@ -8,7 +8,6 @@ members = [
     "examples/kitchen-sink/client",
     "examples/kitchen-sink/server",
     "examples/large-upload/models",
-    "examples/large-upload/memmon",
     "examples/large-upload/client",
     "examples/large-upload/server",
 ]

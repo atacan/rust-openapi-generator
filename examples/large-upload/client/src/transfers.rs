@@ -4,7 +4,7 @@
 //! size (written chunk-wise, hashed incrementally — never held in memory),
 //! uploads the SAME file through BOTH documented media types via
 //! `reqwest::Body::wrap_stream(ReaderStream…)`, verifies both receipts, and
-//! wraps the uploads in a [`large_upload_memmon::Monitor`] so callers can
+//! wraps the uploads in a [`crate::memmon::Monitor`] so callers can
 //! enforce the bounded-memory threshold. The client binary and the smoke
 //! tests share it verbatim.
 
@@ -17,13 +17,13 @@ use std::sync::{
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use large_upload_memmon as memmon;
 use openapi_support::client_error::ClientError;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tokio_util::io::ReaderStream;
 
 use crate::client::{Client, ClientBuilder, PutAudioTrackResponse, PutBlobResponse};
+use crate::memmon;
 use large_upload_models::models::{ProblemDetails, UploadReceipt};
 
 /// Byte length of one I/O chunk used everywhere (file synthesis, the

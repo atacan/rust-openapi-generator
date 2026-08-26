@@ -6,26 +6,40 @@ rust-version.workspace = true
 publish = false
 
 [lints.rust]
-unsafe_code = "forbid"
+# `deny` rather than `forbid`: the shared memmon module needs ONE
+# getrusage(2) FFI call for the kernel high-water-mark RSS; it opts back in
+# with a scoped #[allow] + justification (../../memmon/mod.rs). Everything
+# else stays unsafe-free.
+unsafe_code = "deny"
+
+[features]
+default = []
+# PROXY mode (`--proxy-url`) forwards the raw inbound stream through a
+# reqwest client. Deliberate OPT-IN: the DEFAULT build — and therefore the
+# generated server surface itself — never compiles the client transport
+# stack (proven by scripts/check-transport-isolation.sh in CI).
+proxy = ["dep:reqwest"]
 
 [dependencies]
 # The generated server consumes the SHARED models crate (`--types-path
 # large_upload_models`). The demo's PROXY mode reuses reqwest as its
-# upstream transport by choice; the GENERATED server module itself needs no
-# client stack (see the split-workspace proofs in crates/generator).
+# upstream transport BY CHOICE and only under the `proxy` feature; the
+# GENERATED server module itself never needs a client stack (see the
+# split-workspace compile proofs in crates/generator).
 large-upload-models = { path = "../models" }
-large-upload-memmon = { path = "../memmon" }
 openapi-support = { path = "../../../crates/support", features = ["server"] }
 async-trait = { workspace = true }
 axum = { workspace = true }
 futures-core = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
-reqwest = { workspace = true }
+libc = { workspace = true }
+memory-stats = { workspace = true }
+reqwest = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "signal"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "time"] }
 
 [[bin]]
 name = "large-upload-server"

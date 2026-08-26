@@ -6,7 +6,8 @@ shape under `crates/generator/fixtures/`, cross-referenced to main-spec
 sections in its header comment (feature classes a–m). The example is split
 into THREE crates — shared models, Reqwest client, Axum server — so every
 schema type has exactly ONE Rust identity and neither transport compiles the
-other. The generated artifacts are COMMITTED under each crate's `generated/`
+other (proven automatically by `scripts/check-transport-isolation.sh` in
+CI). The generated artifacts are COMMITTED under each crate's `generated/`
 directory and compiled UNMODIFIED via `include!`. Two runnable demos prove
 end-to-end behavior over real TCP: an Axum server implementing all 22
 operations and a reqwest client driving a full-operation sweep against it.
@@ -101,7 +102,9 @@ KITCHEN_SINK_GENERATED_UPDATE=1 cargo test -p kitchen-sink-models --test determi
 ```
 
 or regenerate them exactly as committed, with the normal CLI (source-only;
-manifests stay hand-maintained):
+manifests stay hand-maintained). The three commands below are REPLAYED
+VERBATIM by `crates/generator/tests/example_regeneration.rs` in CI — if one
+of them stops reproducing the committed bytes, that test fails:
 
 ```sh
 openapi-to-rust examples/kitchen-sink/openapi.yaml \
