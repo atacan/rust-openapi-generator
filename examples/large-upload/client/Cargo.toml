@@ -1,0 +1,43 @@
+[package]
+name = "large-upload-client"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints.rust]
+# `deny` rather than `forbid`: the shared memmon module needs ONE
+# getrusage(2) FFI call for the kernel high-water-mark RSS; it opts back in
+# with a scoped #[allow] + justification (../../memmon/mod.rs). Everything
+# else stays unsafe-free.
+unsafe_code = "deny"
+
+[dependencies]
+# The generated client consumes the SHARED models crate (`--types-path
+# large_upload_models`) and only the client-side transport stack.
+large-upload-models = { path = "../models" }
+openapi-support = { path = "../../../crates/support", features = ["client"] }
+bytes = { workspace = true }
+futures-core = { workspace = true }
+http = { workspace = true }
+libc = { workspace = true }
+memory-stats = { workspace = true }
+mime = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt-multi-thread", "time"] }
+tokio-util = { workspace = true }
+
+[[bin]]
+name = "large-upload-client"
+path = "src/main.rs"
+
+[dev-dependencies]
+# Smoke tests only: they spawn the server crate's demo routers over real TCP.
+# The proxy-chain smoke forwards through a PROXY-mode frontend, so it opts
+# the dev-graph build of the server into the `proxy` feature explicitly.
+axum = { workspace = true }
+large-upload-server = { path = "../server", features = ["proxy"] }
+tokio = { workspace = true, features = ["net"] }

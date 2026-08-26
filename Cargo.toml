@@ -4,8 +4,12 @@ members = [
     "crates/support",
     "crates/generator",
     "crates/conformance",
-    "examples/kitchen-sink",
-    "examples/large-upload",
+    "examples/kitchen-sink/models",
+    "examples/kitchen-sink/client",
+    "examples/kitchen-sink/server",
+    "examples/large-upload/models",
+    "examples/large-upload/client",
+    "examples/large-upload/server",
 ]
 
 [workspace.package]
@@ -44,3 +48,10 @@ serde_yaml = "0.9"
 quick-xml = { version = "0.41", features = ["serialize"] }
 ciborium = "0.2"
 rmp-serde = "1.3"
+# Demo-only measurement dependencies of the large-upload example (not part
+# of any emitted manifest): sha2 — incremental digest proving the full
+# payload was handled; memory-stats — cross-platform sampled RSS;
+# libc — getrusage(2) kernel high-water mark (ru_maxrss).
+sha2 = "0.10"
+memory-stats = "1.2"
+libc = "0.2"

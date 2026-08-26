@@ -1,0 +1,17 @@
+[package]
+name = "large-upload-models"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# Shared schema surface only (`--generate types`): the generated models use
+# nothing beyond serde derive — no support crate, no transport stacks.
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+openapi-to-rust-generator = { path = "../../../crates/generator" }
