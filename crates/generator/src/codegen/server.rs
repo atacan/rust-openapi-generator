@@ -14,7 +14,10 @@
 //! constructors.
 //!
 //! Generated code references only `::openapi_support`, `::axum`, `::http`,
-//! `::mime`, `::bytes`, `serde_json`, `super::models`, and `super::views`.
+//! `::mime`, `::bytes`, `serde_json`, and the shared types surface
+//! (`models`/`views`) at the configured location — sibling `super::models`
+//! by default, or an external base path for split workspace layouts
+//! ([`super::config::TypesLocation`], D-impl-selective-artifacts).
 //!
 //! # Directional views (companion §5, main spec §50 test 50)
 //!
@@ -46,6 +49,7 @@ use crate::normalize::naming::{self, NameStyle};
 use crate::normalize::NormalizedDocument;
 
 use super::codecs::{default_registry as codec_registry, helper_prefix};
+use super::config::{CodegenConfig, TypesLocation};
 use super::plan::{
     PlannedApi, PlannedBodyValidation, PlannedContent, PlannedMultipartFieldKind, PlannedOperation,
     PlannedParameter, PlannedStatus, StreamFraming,
@@ -61,10 +65,25 @@ const FN_CALL_WIDTH: usize = 60;
 /// (see [`emit_call_arm_expr`]).
 const ARM_BODY_CALL_BUDGET: usize = 77;
 
-/// Renders ONE generated `server.rs` for the planned API (main spec §3,
-/// D-impl-singlefile-layout).
+/// Renders ONE generated `server.rs` for the planned API with the shared
+/// types as SIBLING modules (`super::models`, `super::views`; main spec §3,
+/// D-impl-singlefile-layout). Backward-compatible wrapper over
+/// [`generate_server_with_config`].
 #[must_use]
 pub fn generate_server(doc: &NormalizedDocument, plan: &PlannedApi) -> String {
+    generate_server_with_config(doc, plan, &CodegenConfig::default())
+}
+
+/// Renders ONE generated `server.rs` under an explicit shared-types location
+/// (DECISIONS.md D-impl-selective-artifacts): [`TypesLocation::Sibling`]
+/// keeps the historical sibling imports, [`TypesLocation::External`] points
+/// the model/view imports at an externally generated namespace instead.
+#[must_use]
+pub fn generate_server_with_config(
+    doc: &NormalizedDocument,
+    plan: &PlannedApi,
+    config: &CodegenConfig,
+) -> String {
     let mut flags = Flags::default();
     let api_trait = trait_name(doc);
 
@@ -121,7 +140,7 @@ pub fn generate_server(doc: &NormalizedDocument, plan: &PlannedApi) -> String {
                     })
             })
         });
-    emit_imports(&mut emitter, &flags);
+    emit_imports(&mut emitter, &flags, &config.types_location);
     // Shared boxed-stream alias behind every erased streaming payload and
     // typed request input (§18–§20); kept short so every use site stays on
     // one line.
@@ -924,14 +943,14 @@ fn emit_header(emitter: &mut Emitter, doc: &NormalizedDocument, flags: &Flags) {
     emitter.docs(0, &docs);
 }
 
-fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
+fn emit_imports(emitter: &mut Emitter, flags: &Flags, types: &TypesLocation) {
     let path_extractor = flags.needs_path_extractor;
     // Every import collects into ONE list that ends up crate-sorted the way
     // rustfmt's `reorder_imports` lays contiguous `use` items out; the
     // pre-existing push order already matches that sort, so default-config
     // documents stay byte-identical and codec use-lines simply slot in.
     let mut imports: Vec<String> = Vec::new();
-    // Companion §9 free validators share the super::models import with the
+    // Companion §9 free validators share the models import with the
     // model types — but only when the policy is ON and the calls exist.
     // rustfmt (2021 style) orders brace items LOWERCASE-INITIAL first, so
     // validator fn names precede type names; each run stays byte-sorted.
@@ -948,17 +967,21 @@ fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
     }
     if !model_imports.is_empty() {
         imports.push(braced_use(
-            "use super::models::",
+            &format!("use {}::", types.models_path()),
             &model_imports,
             &["super"],
         ));
     }
-    // Directional views (companion §5): `super::views` sorts directly after
-    // `super::models` under rustfmt's reorder_imports, so this slot keeps the
-    // block byte-stable.
+    // Directional views (companion §5): the views path sorts directly after
+    // the models path under rustfmt's reorder_imports (both share their
+    // first segment), so this slot keeps the block byte-stable.
     if !flags.view_types.is_empty() {
         let view_types: Vec<&str> = flags.view_types.iter().map(String::as_str).collect();
-        imports.push(braced_use("use super::views::", &view_types, &["super"]));
+        imports.push(braced_use(
+            &format!("use {}::", types.views_path()),
+            &view_types,
+            &["super"],
+        ));
     }
 
     if flags.needs_into_response_trait {
@@ -1091,6 +1114,12 @@ fn emit_imports(emitter: &mut Emitter, flags: &Flags) {
                 imports.extend(plugin.emitted_use_lines());
             }
         }
+    }
+    // Sibling types keep the canonical push order above (`super::…` rides
+    // the keyword bucket); an EXTERNAL base path joins the crate-name
+    // bucket, so the same stable import sort re-slots every line exactly as
+    // rustfmt would (main spec §45/§50).
+    if !codec_ids.is_empty() || matches!(types, TypesLocation::External(_)) {
         imports.sort_by_key(|line| super::import_sort_key(line));
     }
     for import in &imports {

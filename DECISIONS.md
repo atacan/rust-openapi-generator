@@ -426,3 +426,98 @@ constructor would force ceremony for the common case; the only remaining failure
 value that is not representable as a header value — surfaces at encode time, where the committed
 response cannot be changed, so it lands in the same hook-plus-fallback family as encode overflow
 (§34.1) rather than inventing a second error channel.
+
+---
+
+## H. Selective artifact generation decisions
+
+### D-impl-selective-artifacts `--generate` selection with a single shared-types path
+
+**Decision.** The user-facing CLI selects artifacts through one extensible
+`--generate` namespace (`types`, `client`, `server`; repeated and
+comma-separated forms are equivalent; `all` is shorthand for the three;
+omitting the flag preserves the historical all-in-one output byte-for-byte).
+No configuration file is introduced. There are deliberately NO separate
+`models`/`views` selections: in this repository `types` means BOTH
+`models.rs` and its directional read/write views (`views.rs`, companion §5) —
+one logical shared-type surface, emitted together or not at all.
+
+When `types` is NOT generated in the same invocation as `client`/`server`,
+the emitters need to know where the shared types live. A single semantic
+option, `--types-path <RUST_PATH>`, names that base namespace (its `models`
+and `views` modules sit under it): `api_types`, `crate::generated::types`,
+`company_api::v2`. It is a Rust module/crate PATH, not a Cargo package name
+(package `api-types` → crate identifier `api_types`). Validation rules:
+client/server without local types and without `--types-path` is a usage
+error; `--types-path` together with `types` in ONE invocation is rejected as
+ambiguous rather than silently resolved; repeated selections deduplicate
+deterministically and argument order never affects emitted bytes.
+
+Internally the decision is an explicit codegen concept —
+`codegen::config::TypesLocation` (`Sibling` | `External(base)`) threaded
+through `CodegenConfig` into new `generate_client_with_config`/
+`generate_server_with_config` entry points. The backward-compatible
+`generate_client`/`generate_server` wrappers keep the sibling default so
+every existing caller (snapshot suites, conformance build script, committed
+examples) stays byte-identical without naming the configuration. Emitters
+render the configured import prefixes themselves; no post-generation textual
+replacement runs over the output.
+
+**Rationale.** The motivating layout is a Cargo workspace with the shared
+OpenAPI schema types in their own crate, the Reqwest client in another, and
+the Axum server interface in a third; both transport crates depend on the
+one types crate so every schema type has a single Rust identity and no
+conversion layer between duplicated structs is needed. Keeping the choice as
+a typed emitter input (rather than sibling-only hard-coding plus string
+rewriting) preserves the deterministic-emission architecture of
+D-impl-codegen-emission, keeps §50 test 39/40 guarantees intact for both
+modes, and leaves the artifact namespace open for future values (tests,
+mocks, docs) without new top-level flags.
+
+### D-impl-selective-artifacts (review hardening) output-dir naming, single-value policy, and the compile-proven split workspace
+
+**Decision.** Three follow-ups to the selection feature, settled during PR
+review before merge.
+
+1. The output directory flag is canonically `--output-dir <DIR>`; `--out-dir`
+   remains accepted as a compatibility/convenience alias with IDENTICAL
+   semantics (one parser slot, so the spellings can never disagree). Help
+   advertises the canonical form and names the alias. Both spellings are
+   rejected together with `--dump`, like every generation argument.
+2. Single-value options accept exactly ONE occurrence: a second
+   `--types-path`, `--output-dir`, or `--out-dir` — same spelling or mixed,
+   identical value or conflicting — is a usage error rather than a silently
+   won last-value race. Identical repeats are rejected too, because they
+   usually hide build-script mistakes instead of expressing intent.
+   (`--generate` stays intentionally repeatable.) `validate_rust_path` is
+   likewise tightened into a small real grammar: repeated `super` chains
+   (`super::super::x`, `self::super::x`) validate; an absolute `::…` path
+   rejects all path keywords; raw identifiers cannot escape
+   `crate`/`self`/`super`/`Self`.
+3. The split-workspace contract is proven by a COMPILING integration test,
+   not string matching. The test drives the real binary through the README's
+   exact commands into a three-crate scratch workspace (`api-types`,
+   `api-client`, `api-server`), where handwritten manifests wire
+   `openapi-support` with ONLY the `client` features on the client side and
+   ONLY the `server` features on the server side, and compile-only
+   assertions pin shared-type identity: implementing the generated `Api`
+   trait with parameters annotated as `api_types::models::Account` /
+   `api_types::views::SyncedRecordWrite` and calling the generated client
+   method through a binding typed as `api_types::views::AccountWrite` would
+   stop compiling if either emitter produced structurally duplicated types.
+   `cargo check --workspace --locked` plus inverted `cargo tree` lookups
+   prove the edges and absences (`reqwest`/`axum`/`hyper`/`tower` out of
+   `api-types`; `axum` out of `api-client`; `reqwest` out of `api-server`;
+   matching single-feature support builds), and a second scenario compiles
+   the nested in-crate spelling `crate::generated::types`. Dependency
+   versions stay pinned via committed fixture lockfiles; normal generation
+   remains source-only — these scratch manifests are test fixtures, never
+   generator output, and no Cargo.toml merge engine is introduced.
+
+**Rationale.** Canonical-plus-alias keeps early adopters of `--out-dir`
+working while giving documentation and help one intentional spelling; the
+one-occurrence rule trades zero convenience for catching real invocation
+mistakes at exit 2; and the compiling workspace converts the architectural
+promise ("client and server share ONE Rust model identity, each crate
+compiles only its own transport stack") from prose into something CI fails
+on when it drifts.

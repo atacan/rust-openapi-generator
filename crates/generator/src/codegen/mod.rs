@@ -13,12 +13,15 @@
 
 pub mod client;
 pub mod codecs;
+pub mod config;
 pub mod manifest;
 pub mod models;
 pub mod plan;
 pub mod server;
 mod validation;
 pub mod views;
+
+pub use config::{CodegenConfig, TypesLocation};
 
 /// Indentation-aware line writer shared by the emitters: fixed four-space
 /// levels, append-only, fully determined by the call sequence.
@@ -70,20 +73,25 @@ impl Emitter {
     }
 }
 
-/// Sort key mirroring rustfmt's `reorder_imports`: keyword paths
-/// (`super::models`) come first, everything else orders by its full
-/// normalized path. The emitters already emit exactly this order for
-/// default-config documents (verified by the committed snapshot suites), so
-/// the stable sort never moves their lines and only slots codec use-lines
-/// into place (main spec §45).
-pub(crate) fn import_sort_key(line: &str) -> (u8, String) {
+/// Sort key mirroring rustfmt's `reorder_imports` (empirically verified
+/// against the pinned toolchain): keyword-first paths rank `self` < `super`
+/// < `crate`; then `::`-prefixed extern paths; then plain external paths —
+/// each group ordered by its full normalized path. The emitters already emit
+/// exactly this order for default-config documents (verified by the committed
+/// snapshot suites), so the stable sort never moves their lines and only
+/// slots codec use-lines and external shared-type imports into place (main
+/// spec §45; D-impl-selective-artifacts).
+pub(crate) fn import_sort_key(line: &str) -> (u8, u8, String) {
     let rest = line.strip_prefix("use ").unwrap_or(line);
-    let rest = rest.strip_prefix("::").unwrap_or(rest);
     let rest = rest.trim_end_matches(';');
+    let absolute = rest.starts_with("::");
+    let rest = rest.strip_prefix("::").unwrap_or(rest);
     let first = rest.split("::").next().unwrap_or("");
-    if matches!(first, "super" | "self" | "crate") {
-        (0_u8, first.to_owned())
-    } else {
-        (1_u8, rest.to_owned())
+    match first {
+        "self" => (0, 0, rest.to_owned()),
+        "super" => (0, 1, rest.to_owned()),
+        "crate" => (0, 2, rest.to_owned()),
+        _ if absolute => (1, 0, rest.to_owned()),
+        _ => (2, 0, rest.to_owned()),
     }
 }
