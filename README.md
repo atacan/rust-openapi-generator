@@ -5,17 +5,29 @@ read/write views, a bounded Reqwest client, and an Axum server interface —
 byte-for-byte reproducible output (no timestamps, no paths, no environment
 sensitivity).
 
-Two CLI modes share one binary (`openapi-to-rust`):
+## Installation
+
+Install the prebuilt `oapi-to-rust` CLI with Homebrew (macOS and Linux, Apple
+Silicon/Intel/ARM64/x86-64 — no Rust toolchain required):
+
+```bash
+brew install atacan/tap/oapi-to-rust
+oapi-to-rust --version
+```
+
+## Usage
+
+Two CLI modes share one binary (`oapi-to-rust`):
 
 ```bash
 # Print the deterministic normalized dump to stdout.
-openapi-to-rust --dump api.yaml
+oapi-to-rust --dump api.yaml
 
 # Generate Rust source artifacts for the document.
-openapi-to-rust <path-to-yaml> [OPTIONS]
+oapi-to-rust <path-to-yaml> [OPTIONS]
 ```
 
-Run `openapi-to-rust --help` for the full option reference.
+Run `oapi-to-rust --help` for the full option reference.
 
 ## Selective generation
 
@@ -51,16 +63,16 @@ workspace/
 Generate each surface:
 
 ```bash
-openapi-to-rust api.yaml \
+oapi-to-rust api.yaml \
   --generate types \
   --output-dir crates/api-types/src
 
-openapi-to-rust api.yaml \
+oapi-to-rust api.yaml \
   --generate client \
   --types-path api_types \
   --output-dir crates/api-client/src
 
-openapi-to-rust api.yaml \
+oapi-to-rust api.yaml \
   --generate server \
   --types-path api_types \
   --output-dir crates/api-server/src

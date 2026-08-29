@@ -4,9 +4,9 @@
 //! reproducibility: no timestamps, no paths; errors print diagnostics to
 //! stderr and exit 1, usage errors exit 2):
 //!
-//! - `openapi-to-rust --dump <path>` prints the deterministic normalized
+//! - `oapi-to-rust --dump <path>` prints the deterministic normalized
 //!   dump to stdout (unchanged behavior).
-//! - `openapi-to-rust <path> [--generate …] [--types-path …] [--output-dir …]`
+//! - `oapi-to-rust <path> [--generate …] [--types-path …] [--output-dir …]`
 //!   generates source artifacts into a directory. Artifacts are selected
 //!   through the extensible `--generate` namespace (`types`, `client`,
 //!   `server`, `all`; repeated and comma-separated forms are equivalent);
@@ -181,11 +181,15 @@ fn run(args: &[String]) -> Result<(), std::process::ExitCode> {
                 print_help();
                 return Ok(());
             }
+            "-V" | "--version" => {
+                print_version();
+                return Ok(());
+            }
             other => {
                 if other.starts_with('-') {
                     eprintln!(
-                        "error: unknown argument `{other}`; usage: openapi-to-rust \
-                         --dump <path> | openapi-to-rust <path> [options]"
+                        "error: unknown argument `{other}`; usage: oapi-to-rust \
+                         --dump <path> | oapi-to-rust <path> [options]"
                     );
                     return Err(std::process::ExitCode::from(2));
                 }
@@ -215,8 +219,8 @@ fn run(args: &[String]) -> Result<(), std::process::ExitCode> {
     }
 
     let Some(document) = document else {
-        eprintln!("usage: openapi-to-rust --dump <path-to-yaml>");
-        eprintln!("       openapi-to-rust <path-to-yaml> [options]");
+        eprintln!("usage: oapi-to-rust --dump <path-to-yaml>");
+        eprintln!("       oapi-to-rust <path-to-yaml> [options]");
         return Err(std::process::ExitCode::from(2));
     };
 
@@ -250,7 +254,7 @@ fn run(args: &[String]) -> Result<(), std::process::ExitCode> {
         eprintln!("error: generating `{names}` without `types` requires --types-path");
         eprintln!();
         eprintln!("example:");
-        eprintln!("  openapi-to-rust api.yaml \\");
+        eprintln!("  oapi-to-rust api.yaml \\");
         eprintln!("    --generate {} \\", transport_without_types[0]);
         eprintln!("    --types-path api_types");
         return Err(std::process::ExitCode::from(2));
@@ -397,16 +401,20 @@ fn fail(diagnostics: Vec<Diagnostic>) -> std::process::ExitCode {
     std::process::ExitCode::from(1)
 }
 
+fn print_version() {
+    println!("oapi-to-rust {}", env!("CARGO_PKG_VERSION"));
+}
+
 fn print_help() {
     println!(
         "\
-openapi-to-rust — deterministic OpenAPI to Rust generator
+oapi-to-rust — deterministic OpenAPI to Rust generator
 
 USAGE:
-  openapi-to-rust --dump <path-to-yaml>
+  oapi-to-rust --dump <path-to-yaml>
       Print the deterministic normalized dump to stdout.
 
-  openapi-to-rust <path-to-yaml> [OPTIONS]
+  oapi-to-rust <path-to-yaml> [OPTIONS]
       Generate Rust source artifacts for the document.
 
 OPTIONS:
@@ -433,7 +441,10 @@ OPTIONS:
            and the two spellings may not be combined).
 
   -h, --help
-          Print this help."
+          Print this help.
+
+  -V, --version
+          Print version information."
     );
 }
 

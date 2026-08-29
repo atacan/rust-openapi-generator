@@ -134,15 +134,15 @@ stay hand-maintained). The three commands below are REPLAYED VERBATIM by
 stops reproducing the committed bytes, that test fails:
 
 ```sh
-openapi-to-rust examples/large-upload/openapi.yaml \
+oapi-to-rust examples/large-upload/openapi.yaml \
   --generate types \
   --output-dir examples/large-upload/models/generated
 
-openapi-to-rust examples/large-upload/openapi.yaml \
+oapi-to-rust examples/large-upload/openapi.yaml \
   --generate client --types-path large_upload_models \
   --output-dir examples/large-upload/client/generated
 
-openapi-to-rust examples/large-upload/openapi.yaml \
+oapi-to-rust examples/large-upload/openapi.yaml \
   --generate server --types-path large_upload_models \
   --output-dir examples/large-upload/server/generated
 ```
