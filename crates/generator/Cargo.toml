@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "openapi-to-rust"
+name = "oapi-to-rust"
 path = "src/main.rs"
 
 [lints.rust]

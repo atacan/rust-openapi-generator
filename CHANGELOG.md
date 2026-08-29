@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Prebuilt releases and Homebrew distribution
+
+- The generator's `[[bin]]` is renamed from `openapi-to-rust` to
+  `oapi-to-rust`; the Cargo package stays `openapi-to-rust-generator`.
+- Added `oapi-to-rust --version` / `-V`, printing `oapi-to-rust
+  <CARGO_PKG_VERSION>`.
+- Added a GitHub Actions release workflow that builds
+  `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`,
+  and `aarch64-unknown-linux-gnu` archives plus `SHA256SUMS` for stable
+  `vX.Y.Z` tags, publishes a GitHub Release, and dispatches
+  `oapi_to_rust_release_published` to `atacan/homebrew-tap` so
+  `brew install atacan/tap/oapi-to-rust` can install prebuilt binaries.
+
 ### Selective artifact generation (`--generate` / `--types-path`, D-impl-selective-artifacts)
 
 - New user-facing generation mode in the `openapi-to-rust` CLI:

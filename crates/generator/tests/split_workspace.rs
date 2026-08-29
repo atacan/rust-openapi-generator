@@ -3,7 +3,7 @@
 //! `--types-path`, verified with a real Rust toolchain rather than string
 //! matching.
 //!
-//! Scenario A drives the actual `openapi-to-rust` binary (the exact commands
+//! Scenario A drives the actual `oapi-to-rust` binary (the exact commands
 //! from README's split-crate workflow) to fill a three-crate scratch
 //! workspace:
 //!
@@ -59,7 +59,7 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-const BIN: &str = env!("CARGO_BIN_EXE_openapi-to-rust");
+const BIN: &str = env!("CARGO_BIN_EXE_oapi-to-rust");
 const FIXTURE_08: &str = "08_views.yaml";
 const FIXTURE_LOCKS_DIR: &str = "tests/fixtures/split_workspace";
 
@@ -185,7 +185,7 @@ impl ScratchWorkspace {
             .arg("--output-dir")
             .arg(self.root.join(out_dir_relative))
             .output()
-            .expect("spawn openapi-to-rust");
+            .expect("spawn oapi-to-rust");
         assert!(
             output.status.success(),
             "{what}: generation must succeed\nstdout:\n{}\nstderr:\n{}",

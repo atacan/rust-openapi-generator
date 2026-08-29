@@ -1,5 +1,5 @@
 //! Replay harness for the DOCUMENTED example-regeneration commands
-//! (D-impl-selective-artifacts): drives the real `openapi-to-rust` binary
+//! (D-impl-selective-artifacts): drives the real `oapi-to-rust` binary
 //! through `CARGO_BIN_EXE` with EXACTLY the invocations printed in
 //! `examples/kitchen-sink/README.md` and `examples/large-upload/README.md`
 //! (§ Regeneration), redirecting only `--output-dir` into a scratch tree,
@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-const BIN: &str = env!("CARGO_BIN_EXE_openapi-to-rust");
+const BIN: &str = env!("CARGO_BIN_EXE_oapi-to-rust");
 
 /// One example's regeneration contract, mirroring its README verbatim.
 struct ExampleSpec {
@@ -79,7 +79,7 @@ impl Drop for Scratch {
     }
 }
 
-/// Runs ONE documented invocation: `openapi-to-rust <example>/openapi.yaml
+/// Runs ONE documented invocation: `oapi-to-rust <example>/openapi.yaml
 /// --generate <artifact> [--types-path <types_path>] --output-dir <out>`.
 /// The READMEs document these commands against the repository-relative
 /// paths shown above; only `--output-dir` is redirected.
@@ -95,11 +95,11 @@ fn run_documented_command(spec: &ExampleSpec, generate: &str, out_dir: &Path) {
     args.push("--output-dir".into());
     args.push(out_dir.to_string_lossy().into_owned());
 
-    let displayed = format!("openapi-to-rust {}", args.join(" "));
+    let displayed = format!("oapi-to-rust {}", args.join(" "));
     let output = Command::new(BIN)
         .args(&args)
         .output()
-        .unwrap_or_else(|err| panic!("spawn openapi-to-rust for `{displayed}`: {err}"));
+        .unwrap_or_else(|err| panic!("spawn oapi-to-rust for `{displayed}`: {err}"));
     assert!(
         output.status.success(),
         "documented command failed: `{displayed}`\nstdout:\n{}\nstderr:\n{}",

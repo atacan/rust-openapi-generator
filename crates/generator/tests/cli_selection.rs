@@ -1,5 +1,5 @@
 //! CLI selection harness (DECISIONS.md D-impl-selective-artifacts): drives
-//! the real `openapi-to-rust` binary through `CARGO_BIN_EXE` and pins
+//! the real `oapi-to-rust` binary through `CARGO_BIN_EXE` and pins
 //!
 //! - the artifact selection grammar (`--generate` repeated and
 //!   comma-separated forms are equivalent; `all`; deterministic dedup),
@@ -31,7 +31,7 @@ use openapi_to_rust_generator::codegen::views::generate_views;
 use openapi_to_rust_generator::normalize::{normalize_with_config, NormalizeConfig};
 use openapi_to_rust_generator::parse::{load_document, LoadConfig};
 
-const BIN: &str = env!("CARGO_BIN_EXE_openapi-to-rust");
+const BIN: &str = env!("CARGO_BIN_EXE_oapi-to-rust");
 const FIXTURE_01: &str = "01_json_roundtrip.yaml";
 const FIXTURE_08: &str = "08_views.yaml";
 
@@ -86,7 +86,7 @@ fn run_cli(args: &[&str]) -> Output {
     std::process::Command::new(BIN)
         .args(args)
         .output()
-        .expect("spawn openapi-to-rust")
+        .expect("spawn oapi-to-rust")
 }
 
 fn assert_exit_success(output: &Output, context: &str) {
@@ -653,6 +653,16 @@ fn dump_mode_rejects_output_dir_in_both_spellings() {
             &format!("--dump plus {flag}"),
         );
         assert!(stderr.contains("cannot be combined"), "{flag}:\n{stderr}");
+    }
+}
+
+#[test]
+fn version_exits_successfully() {
+    let expected = format!("oapi-to-rust {}\n", env!("CARGO_PKG_VERSION"));
+    for flag in ["-V", "--version"] {
+        let output = run_cli(&[flag]);
+        assert_exit_success(&output, flag);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
     }
 }
 

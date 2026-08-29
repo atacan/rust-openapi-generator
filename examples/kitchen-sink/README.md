@@ -107,15 +107,15 @@ VERBATIM by `crates/generator/tests/example_regeneration.rs` in CI — if one
 of them stops reproducing the committed bytes, that test fails:
 
 ```sh
-openapi-to-rust examples/kitchen-sink/openapi.yaml \
+oapi-to-rust examples/kitchen-sink/openapi.yaml \
   --generate types \
   --output-dir examples/kitchen-sink/models/generated
 
-openapi-to-rust examples/kitchen-sink/openapi.yaml \
+oapi-to-rust examples/kitchen-sink/openapi.yaml \
   --generate client --types-path kitchen_sink_models \
   --output-dir examples/kitchen-sink/client/generated
 
-openapi-to-rust examples/kitchen-sink/openapi.yaml \
+oapi-to-rust examples/kitchen-sink/openapi.yaml \
   --generate server --types-path kitchen_sink_models \
   --output-dir examples/kitchen-sink/server/generated
 ```
