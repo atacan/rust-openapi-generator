@@ -183,10 +183,15 @@ jobs:
             expected_assets+=("oapi-to-rust-${tag}-${t}.tar.gz")
           done
           expected="$(printf '%s\n' "${expected_assets[@]}" | LC_ALL=C sort)"
-          actual="$(jq -r '.assets[].name' <<<"$release_json" | LC_ALL=C sort)"
-          if [[ "$actual" != "$expected" ]]; then
+          # Exclude any pre-existing SHA256SUMS before comparing: a run that
+          # failed after uploading it but before publishing would otherwise
+          # leave the draft with five assets, permanently failing every
+          # rerun. SHA256SUMS is regenerated and re-uploaded unconditionally
+          # below regardless of whether one is already present.
+          actual_archives="$(jq -r '.assets[].name' <<<"$release_json" | grep -v '^SHA256SUMS$' | LC_ALL=C sort)"
+          if [[ "$actual_archives" != "$expected" ]]; then
             echo "::error::release ${tag} does not have exactly the expected four archives" >&2
-            printf 'expected:\n%s\nactual:\n%s\n' "$expected" "$actual" >&2
+            printf 'expected:\n%s\nactual (excluding any pre-existing SHA256SUMS):\n%s\n' "$expected" "$actual_archives" >&2
             exit 1
           fi
 
