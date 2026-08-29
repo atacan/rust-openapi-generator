@@ -76,7 +76,15 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ steps.resolve.outputs.tag }}"
-          if release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>/dev/null)"; then
+          # A draft release is NOT resolvable via the "get release by tag"
+          # endpoint (it only returns published releases; a draft shows
+          # under a placeholder "untagged-..." URL until published), so an
+          # existing draft must be found by listing and filtering instead.
+          release_json="$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate |
+              jq --arg tag "$tag" '[.[] | select(.tag_name == $tag)] | first // empty'
+          )"
+          if [[ -n "$release_json" ]]; then
             if [[ "$(jq -r .draft <<<"$release_json")" == "false" ]]; then
               echo "Release ${tag} is already published; this is an idempotent rerun." >&2
               echo "should_build=false" >>"$GITHUB_OUTPUT"
@@ -175,7 +183,17 @@ jobs:
         run: |
           set -euo pipefail
           tag="${{ needs.prepare.outputs.tag }}"
-          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
+          # As in `prepare`: the release is still a draft here, so it must
+          # be found by listing and filtering rather than "get by tag"
+          # (published-only).
+          release_json="$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate |
+              jq --arg tag "$tag" '[.[] | select(.tag_name == $tag)] | first // empty'
+          )"
+          if [[ -z "$release_json" ]]; then
+            echo "::error::draft release ${tag} not found" >&2
+            exit 1
+          fi
 
           targets=(aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu)
           expected_assets=()
