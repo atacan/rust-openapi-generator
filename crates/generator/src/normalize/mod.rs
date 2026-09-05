@@ -19,7 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::diagnostics::{Diagnostic, DocumentPath, Severity};
 use crate::ir::document::{
-    HttpMethod, IrDocument, MediaClass, ParameterIr, RequestBodyIr, ResponseEntryIr, ServerIr,
+    HttpMethod, IrDocument, MediaClass, ParameterIr, RequestBodyIr, ResponseEntryIr,
+    SecurityRequirement, SecuritySchemeIr, ServerIr,
 };
 use crate::ir::schema::{SchemaArena, SchemaId, SchemaKind};
 
@@ -102,6 +103,10 @@ pub struct NormalizedOperation {
     pub tags: Vec<String>,
     pub request_body: Option<RequestBodyIr>,
     pub responses: Vec<ResponseEntryIr>,
+    /// Operation-level `security` (issue #12): `None` when absent (the root
+    /// requirements apply); `Some` (possibly empty — clears auth for this
+    /// operation per OAS) when declared.
+    pub security: Option<Vec<SecurityRequirement>>,
     pub deprecated: bool,
 }
 
@@ -117,6 +122,10 @@ pub struct NormalizedDocument {
     /// Root-level servers verbatim (may be empty → `/` defaults apply per
     /// operation through companion §8 precedence).
     pub root_servers: Vec<ServerIr>,
+    /// `components/securitySchemes` in declaration order (issue #12).
+    pub security_schemes: Vec<(String, SecuritySchemeIr)>,
+    /// Root-level `security` requirements in declaration order (issue #12).
+    pub security: Vec<SecurityRequirement>,
     /// Operations in document order (path declaration order, then method
     /// declaration order within each path item).
     pub operations: Vec<NormalizedOperation>,
@@ -228,6 +237,7 @@ pub fn normalize_with_config(
                 tags: operation.tags.clone(),
                 request_body: operation.request_body.clone(),
                 responses: operation.responses.clone(),
+                security: operation.security.clone(),
                 deprecated: operation.deprecated,
             });
         }
@@ -292,6 +302,8 @@ pub fn normalize_with_config(
         raw_version: doc.raw_version,
         info_title: doc.info_title,
         root_servers: doc.servers,
+        security_schemes: doc.security_schemes,
+        security: doc.security,
         operations,
         schemas,
         arena: doc.arena,

@@ -33,9 +33,10 @@ use serde_yaml::{Mapping, Value as Yaml};
 
 use crate::diagnostics::{Diagnostic, Diagnostics, DocumentPath, Severity};
 use crate::ir::document::{
-    classify_media_type, ContentEntryIr, HeaderSpecIr, HttpMethod, IrDocument, OpenApiVersion,
-    OperationIr, ParameterIr, ParameterLocation, ParameterStyle, PathEntry, RangeClass,
-    RequestBodyIr, ResponseEntryIr, ResponseStatusKey, ServerIr, ServerVariable,
+    classify_media_type, ApiKeyLocation, ContentEntryIr, HeaderSpecIr, HttpMethod, IrDocument,
+    OpenApiVersion, OperationIr, ParameterIr, ParameterLocation, ParameterStyle, PathEntry,
+    RangeClass, RequestBodyIr, ResponseEntryIr, ResponseStatusKey, SecurityRequirement,
+    SecuritySchemeIr, ServerIr, ServerVariable,
 };
 use crate::ir::schema::{
     AdditionalPropertiesPolicy, DiscriminatorIr, EnumValues, Indirection, PropertyIr, SchemaArena,
@@ -2084,6 +2085,7 @@ impl Loader {
             request_body: None,
             responses: Vec::new(),
             servers: None,
+            security: None,
             deprecated: false,
         };
         let Some(mapping) = as_mapping(value) else {
@@ -2131,6 +2133,8 @@ impl Loader {
         };
         let servers = mapping_get(mapping, "servers")
             .map(|servers| self.parse_servers(servers, &path.key("servers")));
+        let security = mapping_get(mapping, "security")
+            .map(|security| self.parse_security(security, &path.key("security")));
         OperationIr {
             operation_id,
             tags,
@@ -2138,7 +2142,207 @@ impl Loader {
             request_body,
             responses,
             servers,
+            security,
             deprecated,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Security schemes and requirements (issue #12)
+    // ------------------------------------------------------------------
+
+    /// Parses one `security` array (root or operation level, issue #12):
+    /// each entry is a requirement mapping scheme name → scope list.
+    /// Malformed entries warn and are skipped; a present-but-empty array
+    /// yields an empty vec (an operation-level `[]` clears auth per OAS).
+    fn parse_security(&mut self, value: &Yaml, path: &DocumentPath) -> Vec<SecurityRequirement> {
+        let Some(entries) = value.as_sequence() else {
+            self.note_warning(
+                path.clone(),
+                "security_invalid",
+                "`security` must be an array of requirement objects",
+            );
+            return Vec::new();
+        };
+        let mut requirements = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.iter().enumerate() {
+            let entry_path = path.index(index);
+            let Some(mapping) = as_mapping(entry) else {
+                self.note_warning(
+                    entry_path,
+                    "security_invalid",
+                    "security requirement must be a mapping of scheme name to scopes",
+                );
+                continue;
+            };
+            let mut schemes = Vec::new();
+            for (name_value, scopes_value) in mapping {
+                let name = name_value
+                    .as_str()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| stringify_scalar(name_value));
+                let scopes = scopes_value
+                    .as_sequence()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                schemes.push((name, scopes));
+            }
+            requirements.push(SecurityRequirement { schemes });
+        }
+        requirements
+    }
+
+    /// Parses `components/securitySchemes` in declaration order (issue #12).
+    /// `$ref` entries resolve through the entity resolver first; unknown
+    /// `type` values and malformed entries warn and become
+    /// [`SecuritySchemeIr::Unsupported`] (never load errors — the general
+    /// `default_headers` escape hatch still covers them).
+    fn parse_security_schemes(
+        &mut self,
+        root: &Yaml,
+        doc: &str,
+    ) -> Vec<(String, SecuritySchemeIr)> {
+        let Some(schemes_mapping) = as_mapping(root)
+            .and_then(|m| mapping_get(m, "components"))
+            .and_then(as_mapping)
+            .and_then(|c| mapping_get(c, "securitySchemes"))
+            .and_then(as_mapping)
+        else {
+            return Vec::new();
+        };
+        let mut schemes = Vec::new();
+        for (name_value, definition) in schemes_mapping {
+            let Some(name) = name_value.as_str() else {
+                self.note_warning(
+                    DocumentPath::root()
+                        .key("components")
+                        .key("securitySchemes"),
+                    "component_name_invalid",
+                    format!(
+                        "security scheme name must be a string, found `{}`",
+                        stringify_scalar(name_value)
+                    ),
+                );
+                continue;
+            };
+            let scheme_path = DocumentPath::root()
+                .key("components")
+                .key("securitySchemes")
+                .key(name);
+            // `$ref` schemes resolve through the entity resolver first.
+            let resolved_target: Option<Yaml> = if is_ref_mapping(definition) {
+                let mapping = as_mapping(definition).expect("ref mapping checked above");
+                self.note_entity_ref_siblings(mapping, &scheme_path);
+                let Some(reference) =
+                    string_field(definition, "$ref").map(ToOwned::to_owned)
+                else {
+                    continue;
+                };
+                match self.resolve_entity_value(&reference, doc, &scheme_path) {
+                    Some(target) => Some(target),
+                    None => continue,
+                }
+            } else {
+                None
+            };
+            let effective = resolved_target.as_ref().unwrap_or(definition);
+            schemes.push((
+                name.to_owned(),
+                self.parse_security_scheme(effective, &scheme_path),
+            ));
+        }
+        schemes
+    }
+
+    /// Parses one Security Scheme Object into [`SecuritySchemeIr`].
+    fn parse_security_scheme(&mut self, value: &Yaml, path: &DocumentPath) -> SecuritySchemeIr {
+        let Some(mapping) = as_mapping(value) else {
+            self.note_warning(
+                path.clone(),
+                "security_scheme_invalid",
+                "security scheme must be a mapping",
+            );
+            return SecuritySchemeIr::Unsupported { type_name: None };
+        };
+        let Some(type_name) = mapping_get(mapping, "type").and_then(Yaml::as_str) else {
+            self.note_warning(
+                path.clone(),
+                "security_scheme_invalid",
+                "security scheme declares no `type`",
+            );
+            return SecuritySchemeIr::Unsupported { type_name: None };
+        };
+        match type_name {
+            "http" => {
+                let Some(scheme) = mapping_get(mapping, "scheme").and_then(Yaml::as_str) else {
+                    self.note_warning(
+                        path.clone(),
+                        "security_scheme_invalid",
+                        "http security scheme declares no `scheme`",
+                    );
+                    return SecuritySchemeIr::Unsupported {
+                        type_name: Some(type_name.to_owned()),
+                    };
+                };
+                SecuritySchemeIr::Http {
+                    scheme: scheme.to_ascii_lowercase(),
+                    bearer_format: mapping_get(mapping, "bearerFormat")
+                        .and_then(Yaml::as_str)
+                        .map(ToOwned::to_owned),
+                }
+            }
+            "apiKey" => {
+                let (Some(location), Some(name)) = (
+                    mapping_get(mapping, "in").and_then(Yaml::as_str),
+                    mapping_get(mapping, "name").and_then(Yaml::as_str),
+                ) else {
+                    self.note_warning(
+                        path.clone(),
+                        "security_scheme_invalid",
+                        "apiKey security scheme requires `in` and `name`",
+                    );
+                    return SecuritySchemeIr::Unsupported {
+                        type_name: Some(type_name.to_owned()),
+                    };
+                };
+                let location = match location {
+                    "header" => ApiKeyLocation::Header,
+                    "query" => ApiKeyLocation::Query,
+                    "cookie" => ApiKeyLocation::Cookie,
+                    _ => {
+                        self.note_warning(
+                            path.clone(),
+                            "security_scheme_invalid",
+                            format!("apiKey security scheme has unknown `in`: `{location}`"),
+                        );
+                        return SecuritySchemeIr::Unsupported {
+                            type_name: Some(type_name.to_owned()),
+                        };
+                    }
+                };
+                SecuritySchemeIr::ApiKey {
+                    location,
+                    name: name.to_owned(),
+                }
+            }
+            _ => {
+                self.note_warning(
+                    path.clone(),
+                    "security_scheme_unsupported",
+                    format!(
+                        "security scheme type `{type_name}` has no typed builder support; \
+                         configure it through `default_headers`"
+                    ),
+                );
+                SecuritySchemeIr::Unsupported {
+                    type_name: Some(type_name.to_owned()),
+                }
+            }
         }
     }
 
@@ -2208,6 +2412,18 @@ impl Loader {
             .and_then(Yaml::as_str)
             .map(ToOwned::to_owned);
 
+        // Issue #12: root `security` plus `components/securitySchemes` in
+        // declaration order (parsed here so `$ref` schemes resolve through
+        // the entity resolver with the loader alive).
+        let root_doc = self.root_doc.clone();
+        let security_schemes = self.parse_security_schemes(&root, &root_doc);
+        let security = as_mapping(&root)
+            .and_then(|m| mapping_get(m, "security"))
+            .map(|value| {
+                self.parse_security(value, &DocumentPath::root().key("security"))
+            })
+            .unwrap_or_default();
+
         let mut paths = Vec::new();
         if let Some(paths_mapping) = as_mapping(&root)
             .and_then(|m| mapping_get(m, "paths"))
@@ -2236,6 +2452,8 @@ impl Loader {
             servers,
             paths,
             schemas,
+            security_schemes,
+            security,
             arena: std::mem::take(&mut self.arena),
         };
         diags.into_result(document)

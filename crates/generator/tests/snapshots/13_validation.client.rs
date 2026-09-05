@@ -71,6 +71,12 @@ impl ClientBuilder {
         self
     }
 
+    /// Merges extra headers into every request sent through the built client (issue #12 escape hatch): covers auth schemes without a typed method plus unrelated needs like `User-Agent`. Typed credentials, when configured, are applied at `build` time on top of these headers.
+    pub fn default_headers(mut self, headers: ::http::HeaderMap) -> Self {
+        self.http = self.http.default_headers(headers);
+        self
+    }
+
     /// Builds the client (main spec §30.1, companion §8): every distinct base resolves independently — builder overrides or declared defaults, validated against their enums — and a non-absolute base without its own override is `ClientError::InvalidUrl` (D-impl-relative-servers).
     pub fn build(self) -> Result<Client, ClientError> {
         let base_url = match self.base_url {

@@ -76,6 +76,12 @@ impl ClientBuilder {
         self
     }
 
+    /// Merges extra headers into every request sent through the built client (issue #12 escape hatch): covers auth schemes without a typed method plus unrelated needs like `User-Agent`. Typed credentials, when configured, are applied at `build` time on top of these headers.
+    pub fn default_headers(mut self, headers: ::http::HeaderMap) -> Self {
+        self.http = self.http.default_headers(headers);
+        self
+    }
+
     /// Overrides ONE secondary base URL by its documented key (companion §8: every distinct effective default server generates its own base).
     /// An explicit `base_url` never affects these bases — it replaces only the primary (recorded decision); a relative secondary URL therefore REQUIRES an absolute value here (D-impl-relative-servers).
     /// Keys are deterministic snake_case derivations of each server URL; declared keys for this client:

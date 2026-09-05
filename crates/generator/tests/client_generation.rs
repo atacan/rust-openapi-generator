@@ -1167,3 +1167,237 @@ fn issue_11_inline_request_body_synthesizes_operation_based_name() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ----------------------------------------------------------------------
+// Issue #12 — security-scheme-aware auth + the default_headers escape hatch
+// ----------------------------------------------------------------------
+
+/// Synthetic bearer/apiKey/basic document: every operation's effective
+/// requirement references a supported scheme, so the builder gains one typed
+/// method per scheme on top of the general escape hatch.
+const AUTH_FIXTURE: &str = r#"openapi: 3.1.0
+info:
+  title: auth api
+  version: "1"
+servers:
+  - url: https://example.test/v1
+security:
+  - bearerAuth: []
+  - apiKey: []
+  - basicAuth: []
+paths:
+  /widgets:
+    get:
+      operationId: listWidgets
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: string
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    basicAuth:
+      type: http
+      scheme: basic
+"#;
+
+/// Renders the synthetic auth document through the full pipeline.
+fn generate_auth_fixture(fixture: &str, tag: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("o2r-client-auth-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create fixture dir");
+    std::fs::write(dir.join("auth.yaml"), fixture).expect("write synthetic fixture");
+
+    let ir = load_document("auth.yaml", &dir, &LoadConfig::default())
+        .unwrap_or_else(|diags| panic!("auth fixture must load: {diags:?}"));
+    let doc = normalize_with_config(ir, &NormalizeConfig::default())
+        .unwrap_or_else(|diags| panic!("auth fixture must normalize: {diags:?}"));
+    let plan =
+        plan_api(&doc).unwrap_or_else(|diags| panic!("auth fixture must plan: {diags:?}"));
+    let output = generate_client(&doc, &plan);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    output
+}
+
+#[test]
+fn issue_12_bearer_api_key_and_basic_gain_typed_builder_methods() {
+    let output = generate_auth_fixture(AUTH_FIXTURE, "typed");
+
+    // The general escape hatch is always present: reqwest has no
+    // middleware API, so `default_headers` is the only transport hook.
+    assert!(
+        output.contains("pub fn default_headers(mut self, headers: ::http::HeaderMap) -> Self {"),
+        "the escape hatch must be emitted:\n{output}"
+    );
+
+    // One typed setter per supported scheme, storing the credential for
+    // build-time materialization.
+    assert!(
+        output.contains("pub fn bearer_auth(mut self, token: impl Into<String>) -> Self {"),
+        "\n{output}"
+    );
+    assert!(
+        output.contains("pub fn api_key(mut self, key: impl Into<String>) -> Self {"),
+        "\n{output}"
+    );
+    assert!(
+        output.contains("pub fn basic_auth("),
+        "\n{output}"
+    );
+    // Basic auth encodes dependency-free (no new manifest entry).
+    assert!(
+        output.contains(
+            "fn encode_basic_auth_value(username: &str, password: Option<&str>) -> String {"
+        ),
+        "\n{output}"
+    );
+
+    // Build-time materialization: bearer and basic land on `authorization`,
+    // the API key on its wire name, invalid values are InvalidHeader.
+    let build = item_block(&output, "pub fn build(self)");
+    assert!(
+        build.contains("let mut auth_headers = ::http::HeaderMap::new();"),
+        "\n{build}"
+    );
+    assert!(
+        build.contains("format!(\"Bearer {token}\")"),
+        "\n{build}"
+    );
+    assert!(
+        build.contains("format!(\"Basic {raw}\")"),
+        "\n{build}"
+    );
+    assert!(
+        build.contains("::http::HeaderName::from_static(\"x-api-key\")"),
+        "\n{build}"
+    );
+    assert!(
+        build.contains("ClientError::InvalidHeader"),
+        "\n{build}"
+    );
+    // The redirect-policy guarantee survives: still pinned off in `new`.
+    assert!(output.contains("Policy::none()"), "\n{output}");
+}
+
+#[test]
+fn issue_12_unsupported_and_unreferenced_schemes_gain_no_typed_methods() {
+    // oauth2, query/cookie keys, and unknown types have no typed method —
+    // `default_headers` still covers them — and schemes no requirement
+    // references stay silent too.
+    let fixture = r#"openapi: 3.1.0
+info:
+  title: partial auth
+  version: "1"
+servers:
+  - url: https://example.test/v1
+security:
+  - bearerAuth: []
+paths:
+  /widgets:
+    get:
+      operationId: listWidgets
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: string
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+    queryKey:
+      type: apiKey
+      in: query
+      name: key
+    oauth:
+      type: oauth2
+      flows: {}
+    unreferenced:
+      type: http
+      scheme: bearer
+"#;
+    let output = generate_auth_fixture(fixture, "partial");
+
+    assert!(
+        output.contains("pub fn bearer_auth(mut self, token: impl Into<String>) -> Self {"),
+        "\n{output}"
+    );
+    for absent in [
+        "fn api_key(",
+        "fn basic_auth(",
+        "fn oauth(",
+        "fn query_key(",
+        "fn unreferenced(",
+        "encode_basic_auth_value",
+    ] {
+        assert!(
+            !output.contains(absent),
+            "no typed method for `{absent}` may exist:\n{output}"
+        );
+    }
+    assert!(
+        output.contains("pub fn default_headers(mut self, headers: ::http::HeaderMap) -> Self {"),
+        "the escape hatch still covers unmodeled schemes:\n{output}"
+    );
+}
+
+#[test]
+fn issue_12_documents_without_security_generate_no_auth_methods() {
+    // Back-compat: schemes without any `security` requirement (and
+    // documents without schemes at all) change only through the general
+    // escape hatch — no typed methods, no credential fields, no helper.
+    let fixture = r#"openapi: 3.1.0
+info:
+  title: no auth
+  version: "1"
+servers:
+  - url: https://example.test/v1
+paths:
+  /widgets:
+    get:
+      operationId: listWidgets
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: string
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+"#;
+    let output = generate_auth_fixture(fixture, "unrequired");
+
+    assert!(
+        output.contains("pub fn default_headers(mut self, headers: ::http::HeaderMap) -> Self {"),
+        "\n{output}"
+    );
+    for absent in [
+        "bearer_auth",
+        "basic_auth",
+        "api_key",
+        "auth_headers",
+        "encode_basic_auth_value",
+        "InvalidHeader",
+    ] {
+        assert!(
+            !output.contains(absent),
+            "no auth surface for `{absent}` may exist without a requirement:\n{output}"
+        );
+    }
+}
