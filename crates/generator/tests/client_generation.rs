@@ -129,6 +129,13 @@ fn every_fixture_plans_and_renders_without_diagnostics() {
     }
 }
 
+#[test]
+fn generated_client_starts_with_inner_module_docs() {
+    let output = generate_fixture("18_no_schemas.yaml");
+    assert!(output.starts_with("//! Reqwest client generated"));
+    assert!(!output.starts_with("///"));
+}
+
 // ----------------------------------------------------------------------
 // rustfmt-clean emission (main spec §50 test 40)
 // ----------------------------------------------------------------------

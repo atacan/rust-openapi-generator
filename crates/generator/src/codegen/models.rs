@@ -1805,8 +1805,11 @@ fn render(generator: &Generator<'_>) -> String {
             emitter.line(0, "use serde::{Deserialize, Serialize};");
         }
     }
-    // One blank line separates the header from the definitions.
-    emitter.blank();
+    // One blank line separates the header/imports from definitions. Avoid a
+    // trailing blank line when a document has no components/schemas.
+    if !generator.defs.is_empty() {
+        emitter.blank();
+    }
 
     for (index, def) in generator.defs.iter().enumerate() {
         if index > 0 {

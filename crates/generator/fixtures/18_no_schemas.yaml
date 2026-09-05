@@ -1,0 +1,13 @@
+# Fixture 18 — an API without components/schemas. The generated models module
+# contains only its module documentation and must still be valid Rust.
+openapi: 3.1.0
+info:
+  title: no schemas
+  version: "1"
+paths:
+  /health:
+    get:
+      operationId: health
+      responses:
+        '204':
+          description: Healthy
