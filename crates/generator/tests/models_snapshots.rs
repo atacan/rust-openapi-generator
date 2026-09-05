@@ -137,6 +137,37 @@ fn generated_models_are_rustfmt_clean() {
     }
 }
 
+#[test]
+fn fixture_18_schema_free_models_are_a_valid_documented_module() {
+    let output = generate_fixture("18_no_schemas.yaml");
+
+    assert!(output.starts_with("//! Shared schema models generated"));
+    assert!(
+        output
+            .lines()
+            .all(|line| line.is_empty() || line.starts_with("//!")),
+        "schema-free models must contain module docs only:\n{output}"
+    );
+
+    let dir = std::env::temp_dir().join(format!("o2r-empty-models-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let source = dir.join("models.rs");
+    std::fs::write(&source, output).expect("write generated models");
+    let compiled = std::process::Command::new("rustc")
+        .args(["--edition", "2021", "--crate-type", "lib"])
+        .arg(&source)
+        .arg("--out-dir")
+        .arg(&dir)
+        .output()
+        .expect("spawn rustc");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        compiled.status.success(),
+        "schema-free generated models must compile:\n{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+}
+
 /// Resolves a usable rustfmt: plain PATH lookup first, then the rustup
 /// shim next to the running toolchain's cargo.
 fn locate_rustfmt() -> Option<PathBuf> {
