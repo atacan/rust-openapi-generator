@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 use openapi_to_rust_generator::codegen::client::generate_client;
+use openapi_to_rust_generator::codegen::models::generate_models;
 use openapi_to_rust_generator::codegen::plan::plan_api;
 use openapi_to_rust_generator::normalize::{
     normalize_with_config, NormalizeConfig, NormalizedDocument,
@@ -1010,4 +1011,82 @@ fn fixture_17_head_variants_carry_typed_headers_without_body_accessor() {
         "HEAD must never buffer a response body:\n{head_fn}"
     );
     assert!(!head_fn.contains("ACCEPT"), "\n{head_fn}");
+}
+
+// ----------------------------------------------------------------------
+// Issue #9 — schema named `<Operation>Response` collides with the response
+// enum (R6)
+// ----------------------------------------------------------------------
+
+/// R6 reproducer for issue #9: a `components/schemas` entry named
+/// `CreateItemResponse` collides with the `createItem` response enum.
+/// `<Operation>Response` is generator-reserved, so the schema keeps the
+/// clean name while the generated enum takes the companion §10 numeric
+/// suffix (`CreateItemResponse_2`, the same rule `models.rs` applies to
+/// nested anonymous collisions). The emitted client must define the name
+/// exactly once, with the variant payload referencing the schema — never a
+/// recursive infinite-size `E0072` self-reference behind an `E0255`
+/// duplicate definition.
+#[test]
+fn issue_09_operation_response_schema_collision_suffixes_the_enum() {
+    let dir = std::env::temp_dir().join(format!("o2r-issue-09-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let r6 = [
+        "openapi: 3.0.0",
+        "info: { title: R6, version: \"1.0.0\" }",
+        "servers: [{ url: \"https://example.test/v1\" }]",
+        "paths:",
+        "  /items:",
+        "    post:",
+        "      operationId: createItem",
+        "      responses:",
+        "        \"201\":",
+        "          description: ok",
+        "          content:",
+        "            application/json: { schema: { $ref: \"#/components/schemas/CreateItemResponse\" } }",
+        "components:",
+        "  schemas:",
+        "    CreateItemResponse:",
+        "      type: object",
+        "      required: [id]",
+        "      properties:",
+        "        id: { type: string }",
+        "",
+    ]
+    .join("\n");
+    std::fs::write(dir.join("r6.yaml"), r6).expect("write R6 fixture");
+    let ir = load_document("r6.yaml", &dir, &LoadConfig::default())
+        .unwrap_or_else(|diags| panic!("R6 must load: {diags:?}"));
+    let doc = normalize_with_config(ir, &NormalizeConfig::default())
+        .unwrap_or_else(|diags| panic!("R6 must normalize: {diags:?}"));
+    assert_eq!(
+        doc.operations[0].response_enum, "CreateItemResponse_2",
+        "the generated enum takes the suffix; the schema keeps the clean name"
+    );
+    let plan = plan_api(&doc).unwrap_or_else(|diags| panic!("R6 must plan: {diags:?}"));
+    assert_eq!(
+        plan.operations[0].response_enum_name, "CreateItemResponse_2",
+    );
+
+    let client = generate_client(&doc, &plan);
+    assert!(
+        client.contains("use super::models::CreateItemResponse;"),
+        "the schema stays imported under its clean name:\n{client}"
+    );
+    let response_enum = enum_block(&client, "CreateItemResponse_2");
+    assert!(
+        response_enum.contains("Created201(CreateItemResponse),"),
+        "the variant payload references the schema, not the enum itself:\n{response_enum}"
+    );
+    assert!(
+        !client.contains("pub enum CreateItemResponse {"),
+        "no bare duplicate enum definition (E0255) may remain:\n{client}"
+    );
+
+    let models = generate_models(&doc);
+    assert!(
+        struct_block(&models, "CreateItemResponse").contains("pub id: String,"),
+        "the schema keeps its clean model definition:\n{models}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

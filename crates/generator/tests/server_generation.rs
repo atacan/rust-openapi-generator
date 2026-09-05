@@ -1288,3 +1288,65 @@ fn fixture_08_server_decodes_write_views_and_converts_lossless_bodies() {
     assert!(output.contains("use super::models::Account;"), "\n{output}");
     assert!(output.contains("use super::views::"), "\n{output}");
 }
+
+// ----------------------------------------------------------------------
+// Issue #9 — schema named `<Operation>Response` collides with the response
+// enum (R6, server side)
+// ----------------------------------------------------------------------
+
+/// Server half of issue #9: the same R6 document must suffix the generated
+/// server response enum (`CreateItemResponse_2`) while the schema keeps its
+/// clean name, so the encoder impl and the trait signature reference the
+/// schema without a duplicate definition.
+#[test]
+fn issue_09_operation_response_schema_collision_suffixes_the_enum() {
+    let dir = std::env::temp_dir().join(format!("o2r-issue-09-srv-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let r6 = [
+        "openapi: 3.0.0",
+        "info: { title: R6, version: \"1.0.0\" }",
+        "servers: [{ url: \"https://example.test/v1\" }]",
+        "paths:",
+        "  /items:",
+        "    post:",
+        "      operationId: createItem",
+        "      responses:",
+        "        \"201\":",
+        "          description: ok",
+        "          content:",
+        "            application/json: { schema: { $ref: \"#/components/schemas/CreateItemResponse\" } }",
+        "components:",
+        "  schemas:",
+        "    CreateItemResponse:",
+        "      type: object",
+        "      required: [id]",
+        "      properties:",
+        "        id: { type: string }",
+        "",
+    ]
+    .join("\n");
+    std::fs::write(dir.join("r6.yaml"), r6).expect("write R6 fixture");
+    let ir = load_document("r6.yaml", &dir, &LoadConfig::default())
+        .unwrap_or_else(|diags| panic!("R6 must load: {diags:?}"));
+    let doc = normalize_with_config(ir, &NormalizeConfig::default())
+        .unwrap_or_else(|diags| panic!("R6 must normalize: {diags:?}"));
+    let plan = plan_api(&doc).unwrap_or_else(|diags| panic!("R6 must plan: {diags:?}"));
+    let output = generate_server(&doc, &plan);
+    assert!(
+        output.contains("use super::models::CreateItemResponse;"),
+        "\n{output}"
+    );
+    assert!(
+        enum_block(&output, "CreateItemResponse_2").contains("Created201(CreateItemResponse),"),
+        "\n{output}"
+    );
+    assert!(
+        output.contains("async fn create_item(&self) -> CreateItemResponse_2;"),
+        "\n{output}"
+    );
+    assert!(
+        !output.contains("pub enum CreateItemResponse {"),
+        "no bare duplicate enum definition may remain:\n{output}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

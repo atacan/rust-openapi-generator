@@ -458,9 +458,20 @@ fn assign_names(
             )
         })
         .collect();
-    // Response enums share no table with schema types (different scopes),
-    // but duplicates among themselves get suffixes deterministically.
+    // Response enums live in the client/server module scope, where the
+    // shared schema types are imported (`use super::models::…`). A schema
+    // named `<Operation>Response` (issue #9) would otherwise define the name
+    // twice and turn the variant payload into a recursive infinite-size
+    // type. `<Operation>Response` is therefore generator-reserved: the
+    // schema keeps the clean name and the generated enum takes the
+    // companion §10 numeric suffix (`CreateItemResponse_2`), the same rule
+    // `models.rs` already applies to nested anonymous collisions.
+    // `<Type>Fallback` shapes are reserved alongside for the same reason.
     let mut used_enums: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for assigned in names.schema_types.values() {
+        used_enums.insert(assigned.clone());
+        used_enums.insert(format!("{assigned}Fallback"));
+    }
     for (operation, request) in operations.iter().zip(enum_requests.iter()) {
         let assigned = unique_joined(request, &mut used_enums);
         names
