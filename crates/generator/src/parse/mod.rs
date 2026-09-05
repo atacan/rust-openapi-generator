@@ -2238,8 +2238,7 @@ impl Loader {
             let resolved_target: Option<Yaml> = if is_ref_mapping(definition) {
                 let mapping = as_mapping(definition).expect("ref mapping checked above");
                 self.note_entity_ref_siblings(mapping, &scheme_path);
-                let Some(reference) =
-                    string_field(definition, "$ref").map(ToOwned::to_owned)
+                let Some(reference) = string_field(definition, "$ref").map(ToOwned::to_owned)
                 else {
                     continue;
                 };
@@ -2419,9 +2418,7 @@ impl Loader {
         let security_schemes = self.parse_security_schemes(&root, &root_doc);
         let security = as_mapping(&root)
             .and_then(|m| mapping_get(m, "security"))
-            .map(|value| {
-                self.parse_security(value, &DocumentPath::root().key("security"))
-            })
+            .map(|value| self.parse_security(value, &DocumentPath::root().key("security")))
             .unwrap_or_default();
 
         let mut paths = Vec::new();

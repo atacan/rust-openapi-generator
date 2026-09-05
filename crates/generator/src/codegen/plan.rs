@@ -673,10 +673,7 @@ fn plan_auth(doc: &NormalizedDocument) -> Vec<PlannedAuthScheme> {
         let base_method = if base_counts.get(&base).copied().unwrap_or(0) == 1 {
             base.to_owned()
         } else {
-            format!(
-                "{base}_{}",
-                naming::ident(name, naming::NameStyle::Snake)
-            )
+            format!("{base}_{}", naming::ident(name, naming::NameStyle::Snake))
         };
         let mut method_name = base_method.clone();
         let mut counter = 1_u32;
@@ -684,10 +681,7 @@ fn plan_auth(doc: &NormalizedDocument) -> Vec<PlannedAuthScheme> {
             counter += 1;
             method_name = naming::sanitize_joined(&format!("{base_method}_{counter}"));
         }
-        let base_field = format!(
-            "auth_{}",
-            naming::ident(name, naming::NameStyle::Snake)
-        );
+        let base_field = format!("auth_{}", naming::ident(name, naming::NameStyle::Snake));
         let mut field_name = base_field.clone();
         let mut field_counter = 1_u32;
         while !used_fields.insert(field_name.clone()) {
@@ -713,8 +707,19 @@ fn is_valid_header_name(name: &str) -> bool {
             byte.is_ascii_alphanumeric()
                 || matches!(
                     byte,
-                    b'!' | b'#' | b'$' | b'&' | b'\'' | b'*' | b'+' | b'-'
-                        | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+                    b'!' | b'#'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
                 )
         })
 }
@@ -1941,9 +1946,7 @@ fn plan_parameters(
                         "an inline enum has no models.rs type to reference; \
                          promote it to components/schemas and `$ref` it"
                     }
-                    _ => {
-                        "use a scalar or array of scalars"
-                    }
+                    _ => "use a scalar or array of scalars",
                 };
                 diags.error(
                     location.key("parameters").key(parameter.name.clone()),

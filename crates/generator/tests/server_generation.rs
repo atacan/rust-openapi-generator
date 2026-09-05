@@ -1403,7 +1403,9 @@ fn issue_11_inline_request_body_synthesizes_operation_based_name() {
         "\n{output}"
     );
     assert!(
-        output.contains("async fn create_item(&self, body: CreateItemRequestBody) -> CreateItemResponse;"),
+        output.contains(
+            "async fn create_item(&self, body: CreateItemRequestBody) -> CreateItemResponse;"
+        ),
         "\n{output}"
     );
     assert!(

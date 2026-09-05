@@ -28,22 +28,8 @@ use ::openapi_support::stream_errors::JsonSeqDecodeError;
 use ::openapi_support::stream_errors::ServerStreamError;
 use ::std::collections::HashMap;
 use kitchen_sink_models::models::{
-    Account,
-    Ack,
-    CreateSessionForm,
-    CreateWidget,
-    Document,
-    DocumentMetadata,
-    Event,
-    FullWidget,
-    MatrixRecord,
-    Metric,
-    Pet,
-    ProblemDetails,
-    Record,
-    Session,
-    SuccessEnvelope,
-    ThumbnailMetadata,
+    Account, Ack, CreateSessionForm, CreateWidget, Document, DocumentMetadata, Event, FullWidget,
+    MatrixRecord, Metric, Pet, ProblemDetails, Record, Session, SuccessEnvelope, ThumbnailMetadata,
     Widget,
 };
 use kitchen_sink_models::views::{

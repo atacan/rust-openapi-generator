@@ -1428,10 +1428,7 @@ mod tests {
             ParamValue::Array(vec![text("a"), ParamValue::Int(1)])
         );
         // Shapes without a parameter form degrade to text, never panic.
-        assert_eq!(
-            ParamValue::from_json(serde_json::Value::Null),
-            text("null")
-        );
+        assert_eq!(ParamValue::from_json(serde_json::Value::Null), text("null"));
     }
 
     #[test]
@@ -1439,11 +1436,12 @@ mod tests {
         // String enums travel as their serde rename (issue #10 wire shape).
         #[derive(serde::Serialize)]
         enum Format {
-            #[serde(rename = "text")]
+            #[serde(rename = "wire-value")]
             Text,
             #[serde(rename = "json")]
             Json,
         }
+        assert_eq!(ParamValue::from_serde(&Format::Text), text("wire-value"));
         assert_eq!(ParamValue::from_serde(&Format::Json), text("json"));
         // Integer enums travel as their discriminant.
         #[derive(serde::Serialize)]
@@ -1452,6 +1450,66 @@ mod tests {
         assert_eq!(ParamValue::from_serde(&PageSize(20)), ParamValue::Int(20));
         // Plain scalars pass through unchanged.
         assert_eq!(ParamValue::from_serde("hi"), text("hi"));
+    }
+
+    #[test]
+    fn serde_scalar_enum_encoding_matches_external_text() {
+        // Scalar enum parameters must use their Serde wire value (the
+        // `serde(rename)`), matching the externally serialized JSON string
+        // shape — not the Rust variant name (issue #10).
+        #[derive(serde::Serialize)]
+        enum Format {
+            #[serde(rename = "wire-value")]
+            Text,
+        }
+        assert_eq!(ParamValue::from_serde(&Format::Text), text("wire-value"));
+        let external = serde_json::to_value(Format::Text).expect("scalar enum serializes");
+        assert_eq!(external, serde_json::json!("wire-value"));
+        assert_eq!(
+            ParamValue::from_serde(&Format::Text),
+            ParamValue::from_json(external)
+        );
+    }
+
+    #[test]
+    fn serde_scalar_option_encoding_is_recursive() {
+        // `Option` enum parameters recurse through the same JSON shape:
+        // `Some` unwraps to the inner wire value.
+        #[derive(serde::Serialize)]
+        enum Format {
+            #[serde(rename = "wire-value")]
+            Text,
+        }
+        assert_eq!(
+            ParamValue::from_serde(&Some(Format::Text)),
+            text("wire-value")
+        );
+        assert_eq!(
+            ParamValue::from_serde(&Some(Format::Text)),
+            ParamValue::from_json(
+                serde_json::to_value(Some(Format::Text)).expect("option serializes")
+            )
+        );
+    }
+
+    #[test]
+    fn serde_array_encoding_preserves_enum_wire_values() {
+        // Array enum parameters preserve each element's Serde wire value.
+        #[derive(serde::Serialize)]
+        enum Format {
+            #[serde(rename = "wire-value")]
+            Text,
+            #[serde(rename = "json")]
+            Json,
+        }
+        assert_eq!(
+            ParamValue::from_serde(&vec![Format::Text, Format::Json]),
+            ParamValue::Array(vec![text("wire-value"), text("json")])
+        );
+        assert_eq!(
+            ParamValue::from_serde(&vec![Format::Text]),
+            ParamValue::Array(vec![text("wire-value")])
+        );
     }
 
     #[test]

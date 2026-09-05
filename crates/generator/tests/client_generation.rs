@@ -1072,7 +1072,8 @@ fn issue_09_operation_response_schema_collision_suffixes_the_enum() {
     );
     let plan = plan_api(&doc).unwrap_or_else(|diags| panic!("R6 must plan: {diags:?}"));
     assert_eq!(
-        plan.operations[0].response_enum_name, "CreateItemResponse_2",
+        plan.operations[0].response_enum_name,
+        "CreateItemResponse_2",
     );
 
     let client = generate_client(&doc, &plan);
@@ -1227,8 +1228,7 @@ fn generate_auth_fixture(fixture: &str, tag: &str) -> String {
         .unwrap_or_else(|diags| panic!("auth fixture must load: {diags:?}"));
     let doc = normalize_with_config(ir, &NormalizeConfig::default())
         .unwrap_or_else(|diags| panic!("auth fixture must normalize: {diags:?}"));
-    let plan =
-        plan_api(&doc).unwrap_or_else(|diags| panic!("auth fixture must plan: {diags:?}"));
+    let plan = plan_api(&doc).unwrap_or_else(|diags| panic!("auth fixture must plan: {diags:?}"));
     let output = generate_client(&doc, &plan);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -1256,10 +1256,7 @@ fn issue_12_bearer_api_key_and_basic_gain_typed_builder_methods() {
         output.contains("pub fn api_key(mut self, key: impl Into<String>) -> Self {"),
         "\n{output}"
     );
-    assert!(
-        output.contains("pub fn basic_auth("),
-        "\n{output}"
-    );
+    assert!(output.contains("pub fn basic_auth("), "\n{output}");
     // Basic auth encodes dependency-free (no new manifest entry).
     assert!(
         output.contains(
@@ -1275,22 +1272,13 @@ fn issue_12_bearer_api_key_and_basic_gain_typed_builder_methods() {
         build.contains("let mut auth_headers = ::http::HeaderMap::new();"),
         "\n{build}"
     );
-    assert!(
-        build.contains("format!(\"Bearer {token}\")"),
-        "\n{build}"
-    );
-    assert!(
-        build.contains("format!(\"Basic {raw}\")"),
-        "\n{build}"
-    );
+    assert!(build.contains("format!(\"Bearer {token}\")"), "\n{build}");
+    assert!(build.contains("format!(\"Basic {raw}\")"), "\n{build}");
     assert!(
         build.contains("::http::HeaderName::from_static(\"x-api-key\")"),
         "\n{build}"
     );
-    assert!(
-        build.contains("ClientError::InvalidHeader"),
-        "\n{build}"
-    );
+    assert!(build.contains("ClientError::InvalidHeader"), "\n{build}");
     // The redirect-policy guarantee survives: still pinned off in `new`.
     assert!(output.contains("Policy::none()"), "\n{output}");
 }

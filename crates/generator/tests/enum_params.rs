@@ -71,10 +71,7 @@ components:
 "##;
 
 fn normalize_spec() -> NormalizedDocument {
-    let dir = std::env::temp_dir().join(format!(
-        "o2r-enum-params-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("o2r-enum-params-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let name = "spec.yaml".to_owned();
     std::fs::write(dir.join(&name), SPEC).expect("write inline spec");
@@ -93,7 +90,11 @@ fn plan_spec(doc: &NormalizedDocument) -> PlannedApi {
 fn enum_typed_parameters_plan_without_diagnostics() {
     let doc = normalize_spec();
     let plan = plan_spec(&doc);
-    let operation = plan.operations.iter().find(|op| op.operation_id.as_deref() == Some("listItems")).expect("listItems planned");
+    let operation = plan
+        .operations
+        .iter()
+        .find(|op| op.operation_id.as_deref() == Some("listItems"))
+        .expect("listItems planned");
     let types: Vec<(&str, &str)> = operation
         .parameters
         .iter()
@@ -129,18 +130,27 @@ fn client_uses_enum_types_through_the_serde_shape() {
         "session_format: Option<Format>,",
         "q: Option<&str>,",
     ] {
-        assert!(client.contains(signature), "missing `{signature}`\n{client}");
+        assert!(
+            client.contains(signature),
+            "missing `{signature}`\n{client}"
+        );
     }
     // Models import plus serde-shape conversion on every enum path.
-    assert!(client.contains("use super::models::{Format, PageSize};"), "\n{client}");
+    assert!(
+        client.contains("use super::models::{Format, PageSize};"),
+        "\n{client}"
+    );
     assert_eq!(
         client.matches("ParamValue::from_serde").count(),
         6,
         "path + query + required-int + array-map + header + cookie conversions\n{client}"
     );
-    assert!(client.contains(
-        "ParamValue::Array(raw.iter().map(ParamValue::from_serde).collect::<Vec<_>>())"
-    ), "\n{client}");
+    assert!(
+        client.contains(
+            "ParamValue::Array(raw.iter().map(ParamValue::from_serde).collect::<Vec<_>>())"
+        ),
+        "\n{client}"
+    );
     // Deterministic across repeated generation (main spec §50 test 39).
     assert_eq!(client, generate_client(&doc, &plan));
 }
@@ -160,15 +170,30 @@ fn server_decodes_enum_text_through_serde_helpers() {
         "x_output: Option<Format>,",
         "session_format: Option<Format>,",
     ] {
-        assert!(server.contains(signature), "missing `{signature}`\n{server}");
+        assert!(
+            server.contains(signature),
+            "missing `{signature}`\n{server}"
+        );
     }
-    assert!(server.contains("use super::models::{Format, PageSize};"), "\n{server}");
+    assert!(
+        server.contains("use super::models::{Format, PageSize};"),
+        "\n{server}"
+    );
     // String enums convert through the JSON string shape (the serde rename),
     // integer enums through the JSON number shape (the discriminant).
-    assert!(server.contains("parse_string_enum::<Format>("), "\n{server}");
+    assert!(
+        server.contains("parse_string_enum::<Format>("),
+        "\n{server}"
+    );
     assert!(server.contains("parse_int_enum::<PageSize>("), "\n{server}");
-    assert!(server.contains("fn parse_string_enum<T: serde::de::DeserializeOwned>("), "\n{server}");
-    assert!(server.contains("fn parse_int_enum<T: serde::de::DeserializeOwned>("), "\n{server}");
+    assert!(
+        server.contains("fn parse_string_enum<T: serde::de::DeserializeOwned>("),
+        "\n{server}"
+    );
+    assert!(
+        server.contains("fn parse_int_enum<T: serde::de::DeserializeOwned>("),
+        "\n{server}"
+    );
     assert_eq!(server, generate_server(&doc, &plan));
 }
 
@@ -195,10 +220,8 @@ fn generated_enum_param_code_is_rustfmt_clean() {
         ("server.rs", generate_server(&doc, &plan)),
         ("models.rs", generate_models(&doc)),
     ] {
-        let dir = std::env::temp_dir().join(format!(
-            "o2r-enum-params-fmt-{}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("o2r-enum-params-fmt-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let source = dir.join(name);
         std::fs::write(&source, &generated).expect("write generated module");
