@@ -24,6 +24,15 @@ pub struct IrDocument {
     pub paths: Vec<PathEntry>,
     /// `components/schemas` names mapped to arena ids.
     pub schemas: BTreeMap<String, SchemaId>,
+    /// `components/securitySchemes` in declaration order (issue #12): name
+    /// plus the parsed scheme. Unknown `type` values are kept as
+    /// [`SecuritySchemeIr::Unsupported`] so later packages can ignore them
+    /// without failing the load.
+    pub security_schemes: Vec<(String, SecuritySchemeIr)>,
+    /// Root-level `security` requirements in declaration order (issue #12):
+    /// each entry maps a scheme name to its declared scopes. Absent when the
+    /// document declares no root `security`.
+    pub security: Vec<SecurityRequirement>,
     /// All interned schema nodes.
     pub arena: SchemaArena,
 }
@@ -137,6 +146,11 @@ pub struct OperationIr {
     pub responses: Vec<ResponseEntryIr>,
     /// Operation-level servers overriding path/root (companion §8.1).
     pub servers: Option<Vec<ServerIr>>,
+    /// Operation-level `security` overriding the root array (issue #12):
+    /// `None` when absent (the root requirements apply); `Some` (possibly
+    /// empty — an empty array clears auth for this operation per OAS) when
+    /// declared.
+    pub security: Option<Vec<SecurityRequirement>>,
     pub deprecated: bool,
 }
 
@@ -290,6 +304,42 @@ pub struct HeaderSpecIr {
     pub description: Option<String>,
 }
 
+/// One `security` requirement entry (issue #12): scheme name → declared
+/// scopes (empty for schemes that take no scopes, e.g. HTTP bearer and API
+/// keys). Declaration order is preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityRequirement {
+    pub schemes: Vec<(String, Vec<String>)>,
+}
+
+/// A parsed `components/securitySchemes` entry (issue #12). Only the shapes
+/// the generated client can apply carry structured data; everything else is
+/// kept as [`SecuritySchemeIr::Unsupported`] so unknown kinds never fail the
+/// load — the general `default_headers` escape hatch still covers them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecuritySchemeIr {
+    /// `type: http` with a `scheme` keyword (`bearer`, `basic`, …; matched
+    /// case-insensitively, stored lowercase). `bearer_format` is documentary
+    /// only.
+    Http {
+        scheme: String,
+        bearer_format: Option<String>,
+    },
+    /// `type: apiKey` with its wire location and name.
+    ApiKey { location: ApiKeyLocation, name: String },
+    /// `type: oauth2`, `type: openIdConnect`, `type: mutualTLS`, unknown
+    /// `type` values, or entries that failed to parse: the raw `type` string
+    /// when one was declared (`None` when absent).
+    Unsupported { type_name: Option<String> },
+}
+
+/// Wire location of an `apiKey` security scheme (issue #12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiKeyLocation {
+    Header,
+    Query,
+    Cookie,
+}
 /// Classifies a media-range key per main spec §5. Returns the semantic class
 /// and whether the key is a wildcard range (`*/*`, `type/*`). Matching is on
 /// the type/subtype only; parameters (`;charset=…`) are stripped.

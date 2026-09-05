@@ -24,7 +24,9 @@ use crate::normalize::composition::{
 use crate::normalize::naming::{self, NameStyle};
 use crate::normalize::{NormalizedDocument, NormalizedSchema};
 
-use super::validation::{analyze, enforceable_with, Analysis, ScalarParamKind};
+use super::validation::{
+    analyze, enforceable_with, is_recognized_format, Analysis, ScalarParamKind,
+};
 use super::Emitter;
 
 /// Cell attribute for required + nullable properties (companion §2.1 row 2):
@@ -92,10 +94,15 @@ pub fn generate_models(doc: &NormalizedDocument) -> String {
 
     // Type names are global to the module: seed with every assigned name so a
     // generated nested name can never collide with a later component (and
-    // vice versa).
+    // vice versa). Issue #11 synthetic body types are reserved BEFORE any
+    // definition is built, so nested anonymous names suffix around the
+    // operation-based body names rather than stealing them.
     let mut used_names: BTreeSet<String> = named.values().cloned().collect();
     for (_, enum_name) in &doc.names.response_enums {
         used_names.insert(enum_name.clone());
+    }
+    for body_name in doc.names.synthetic_body_types.values() {
+        used_names.insert(body_name.clone());
     }
 
     let mut generator = Generator {
@@ -112,6 +119,24 @@ pub fn generate_models(doc: &NormalizedDocument) -> String {
     };
     for (schema, name) in components.iter().zip(names.iter()) {
         generator.define_component(schema, name);
+    }
+    // Issue #11: top-level definitions for anonymous composite bodies under
+    // their operation-based names (`<Op>RequestBody` / `<Op>ResponseBody`).
+    // Nested anonymous schemas discovered inside are named `<Body><Field>`
+    // through the same mechanism as component children. Arena ids are
+    // site-unique, so a body id can never already sit in the anonymous table
+    // (the guard is defensive only).
+    let bodies: Vec<(u32, String)> = doc
+        .names
+        .synthetic_body_types
+        .iter()
+        .map(|(id, name)| (*id, name.clone()))
+        .collect();
+    for (id, name) in &bodies {
+        if generator.anonymous.contains_key(id) {
+            continue;
+        }
+        generator.define_node(SchemaId(*id), name);
     }
 
     render(&generator)
@@ -411,11 +436,11 @@ fn float_literal(value: f64) -> String {
 }
 
 /// The v1 recognized formats; unknown names stay metadata-only (documented).
+/// Delegates to the shared [`is_recognized_format`] verdict so emission and
+/// the validation analysis use the same predicate (issue #8).
 fn known_format(format: Option<&str>) -> Option<&str> {
-    match format? {
-        "date-time" | "date" | "time" | "email" | "hostname" | "uri" | "uuid" => {
-            Some(format.unwrap())
-        }
+    match format {
+        Some(name) if is_recognized_format(Some(name)) => Some(name),
         _ => None,
     }
 }
@@ -1147,7 +1172,9 @@ impl<'a> ValidationStatements<'a> {
         level: usize,
     ) -> Vec<String> {
         // Normalize the receiver: helpers take method-call form
-        // (`self.f.len()`), the item loop borrows explicitly (`&self.f`).
+        // (`self.f.len()`), the item loop borrows via `.iter()` so both
+        // direct (`self.f`, behind `&self`) and already-borrowed (`value`,
+        // bound as `&Vec<T>`) receivers iterate as `&T` without `&&Vec<T>`.
         let base = accessor.strip_prefix('&').unwrap_or(accessor);
         let mut lines = Vec::new();
         if validation.min_items.is_some() || validation.max_items.is_some() {
@@ -1209,7 +1236,7 @@ impl<'a> ValidationStatements<'a> {
         // details label elements `<field>[*]`.
         let item_label = field.map(|field| format!("{field}[*]"));
         let item_lines = self.element_item_lines(element, item_label.as_deref(), level + 1);
-        let loop_head = format!("for item in &{base} {{");
+        let loop_head = format!("for item in {base}.iter() {{");
         if !item_lines.is_empty() {
             lines.push(format!("{}{loop_head}", "    ".repeat(level)));
             lines.extend(item_lines);
@@ -1807,7 +1834,7 @@ fn emit_crate_docs(emitter: &mut Emitter) {
         "by hand.",
     ];
     let owned: Vec<String> = docs.iter().map(|line| (*line).to_owned()).collect();
-    emitter.docs(0, &owned);
+    emitter.inner_docs(0, &owned);
 }
 
 fn emit_def(emitter: &mut Emitter, def: &Def) {

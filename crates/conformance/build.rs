@@ -173,6 +173,10 @@ fn emit_fixture(fixtures_dir: &Path, fixture: &str, out_dir: &Path) {
     // First generation.
     let primary = out_dir.join(stem);
     let artifacts = generate(fixtures_dir, fixture, &primary);
+    // File-module index so `src/lib.rs` includes ONE items-only file per
+    // fixture: the four artifacts compile as real file modules (their `//!`
+    // headers are only legal in that position — never under `include!`).
+    write_module_index(&primary);
 
     // Second generation into an independent directory, byte-compared.
     let verify = out_dir.join(format!("{stem}.determinism-check"));
@@ -189,6 +193,7 @@ fn emit_fixture(fixtures_dir: &Path, fixture: &str, out_dir: &Path) {
 /// four artifacts (plus a byte-identical determinism twin) under `dir`.
 fn emit_with_options(fixtures_dir: &Path, fixture: &str, dir: &Path, config: &PlanConfig) {
     let artifacts = generate_with_config(fixtures_dir, fixture, dir, config);
+    write_module_index(dir);
     let verify = dir.parent().unwrap().join(format!(
         "{}.determinism-check",
         dir.file_name().unwrap().to_string_lossy()
@@ -200,6 +205,22 @@ fn emit_with_options(fixtures_dir: &Path, fixture: &str, dir: &Path, config: &Pl
              generations (main spec §50 test 39)"
         );
     }
+}
+
+/// Writes the file-module index (`mod.rs`) beside the four artifacts: four
+/// `#[path]` declarations so each artifact compiles as a REAL file module.
+/// Generated artifacts carry `//!` module docs (issue #6), which are only
+/// legal at the top of a file module — `include!`ing an artifact directly
+/// under `pub mod … { include!(…) }` rejects them (E0753). The index itself
+/// holds items only, so `src/lib.rs` can `include!` it safely; the
+/// `#[path]` entries then resolve relative to THIS directory.
+fn write_module_index(dir: &Path) {
+    let index = "\
+#[path = \"models.rs\"]\npub mod models;\n\
+#[path = \"views.rs\"]\npub mod views;\n\
+#[path = \"client.rs\"]\npub mod client;\n\
+#[path = \"server.rs\"]\npub mod server;\n";
+    fs::write(dir.join("mod.rs"), index).expect("write module index");
 }
 
 /// Runs the full pipeline once and writes the five artifacts (models, views,

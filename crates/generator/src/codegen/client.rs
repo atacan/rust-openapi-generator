@@ -37,8 +37,9 @@ use crate::normalize::NormalizedDocument;
 use super::codecs::{default_registry as codec_registry, helper_prefix};
 use super::config::{CodegenConfig, TypesLocation};
 use super::plan::{
-    Decompression, PlannedApi, PlannedContent, PlannedMultipart, PlannedMultipartField,
-    PlannedMultipartFieldKind, PlannedOperation, PlannedParameter, PlannedStatus, StreamFraming,
+    Decompression, PlannedApi, PlannedAuthKind, PlannedAuthScheme, PlannedContent,
+    PlannedMultipart, PlannedMultipartField, PlannedMultipartFieldKind, PlannedOperation,
+    PlannedParameter, PlannedStatus, StreamFraming,
 };
 use super::Emitter;
 
@@ -75,18 +76,19 @@ pub fn generate_client_with_config(
     emit_header(&mut emitter, doc, &flags, &config.types_location);
     let bases = BaseSet::new(plan);
     emit_client(&mut emitter, &bases);
-    emit_builder(&mut emitter, &bases, plan.response_decompression);
+    emit_builder(&mut emitter, &bases, plan.response_decompression, &plan.auth);
     for (op_index, operation) in plan.operations.iter().enumerate() {
         emit_operation_definitions(&mut emitter, op_index, operation, &layout);
     }
     emit_methods(&mut emitter, plan, &bases, &layout, &mut flags);
-    emit_module_helpers(&mut emitter, &flags, bases.has_any_variables());
+    emit_module_helpers(&mut emitter, &flags, bases.has_any_variables(), &plan.auth);
     emitter.finish()
 }
 
 /// Names already taken in the module scope: every assigned schema type
-/// (including `<Type>Fallback` shapes) and every response enum. Generated
-/// nested names never collide with them after suffixing.
+/// (including `<Type>Fallback` shapes), every response enum, and every issue
+/// #11 synthetic body type (imported from `super::models`). Generated nested
+/// names never collide with them after suffixing.
 fn reserved_names(doc: &NormalizedDocument) -> BTreeSet<String> {
     let mut used: BTreeSet<String> = BTreeSet::new();
     for schema in doc.schemas.values() {
@@ -95,6 +97,9 @@ fn reserved_names(doc: &NormalizedDocument) -> BTreeSet<String> {
     }
     for (_, enum_name) in &doc.names.response_enums {
         used.insert(enum_name.clone());
+    }
+    for body_name in doc.names.synthetic_body_types.values() {
+        used.insert(body_name.clone());
     }
     used
 }
@@ -339,6 +344,11 @@ impl Flags {
                 ParameterLocation::Query => self.needs_query_pairs = true,
                 ParameterLocation::Header => self.needs_header_value = true,
                 ParameterLocation::Cookie => self.needs_cookie_value = true,
+            }
+            // Named-enum parameters (issue #10) reference their models.rs
+            // type; inline scalars resolve to nothing here.
+            if parameter.enum_kind.is_some() {
+                self.note_payload(&parameter.rust_type, false);
             }
         }
     }
@@ -596,7 +606,7 @@ fn emit_header(
          do not edit by hand."
             .to_owned(),
     );
-    emitter.docs(0, &docs);
+    emitter.inner_docs(0, &docs);
 
     let mut imports: Vec<String> = Vec::new();
     if !flags.model_types.is_empty() {
@@ -761,7 +771,12 @@ fn emit_client(emitter: &mut Emitter, bases: &BaseSet) {
     emitter.line(0, "}");
 }
 
-fn emit_builder(emitter: &mut Emitter, bases: &BaseSet, decompression: Decompression) {
+fn emit_builder(
+    emitter: &mut Emitter,
+    bases: &BaseSet,
+    decompression: Decompression,
+    auth: &[PlannedAuthScheme],
+) {
     let primary = bases.primary();
     emitter.blank();
     let mut builder_docs = vec![
@@ -821,6 +836,13 @@ fn emit_builder(emitter: &mut Emitter, bases: &BaseSet, decompression: Decompres
         1,
         "server_variables: ::std::collections::BTreeMap<String, String>,",
     );
+    // Issue #12: stored credentials, one field per supported scheme. `None`
+    // until the matching builder method runs; materialized into
+    // `default_headers` at `build` time so invalid values surface as
+    // `ClientError::InvalidHeader` instead of panicking or silently dropping.
+    for scheme in auth {
+        emitter.line(1, &format!("{}: {},", scheme.field_name, auth_field_type(&scheme.kind)));
+    }
     emitter.line(0, "}");
     emitter.blank();
 
@@ -903,6 +925,9 @@ fn emit_builder(emitter: &mut Emitter, bases: &BaseSet, decompression: Decompres
         }
     }
     emitter.line(3, "server_variables: ::std::collections::BTreeMap::new(),");
+    for scheme in auth {
+        emitter.line(3, &format!("{}: None,", scheme.field_name));
+    }
     emitter.line(2, "}");
     emitter.line(1, "}");
     emitter.blank();
@@ -951,6 +976,39 @@ fn emit_builder(emitter: &mut Emitter, bases: &BaseSet, decompression: Decompres
     emitter.line(2, "self.http = self.http.redirect(policy);");
     emitter.line(2, "self");
     emitter.line(1, "}");
+    emitter.blank();
+
+    // Issue #12: the general transport escape hatch. Reqwest exposes no
+    // middleware/interceptor API; `default_headers` is the only hook that
+    // survives into the stored `::reqwest::Client`, so the generated builder
+    // surfaces it verbatim. It covers auth schemes the generator does not
+    // model (oauth2, openIdConnect, query/cookie keys) plus unrelated needs
+    // like `User-Agent` and tracing headers. Stored credentials (the typed
+    // auth methods below, when any exist) are applied at `build` time ON TOP
+    // of these headers, so a typed credential wins on name conflicts. The
+    // redirect policy the builder guarantees is untouched.
+    emitter.docs(
+        1,
+        &[
+            "Merges extra headers into every request sent through the built \
+              client (issue #12 escape hatch): covers auth schemes without a \
+              typed method plus unrelated needs like `User-Agent`. Typed \
+              credentials, when configured, are applied at `build` time on \
+              top of these headers."
+                .to_owned(),
+        ],
+    );
+    emitter.line(
+        1,
+        "pub fn default_headers(mut self, headers: ::http::HeaderMap) -> Self {",
+    );
+    emitter.line(2, "self.http = self.http.default_headers(headers);");
+    emitter.line(2, "self");
+    emitter.line(1, "}");
+    for scheme in auth {
+        emitter.blank();
+        emit_auth_method(emitter, scheme);
+    }
     if bases.has_secondaries() {
         emitter.blank();
         let mut docs = vec![
@@ -981,17 +1039,191 @@ fn emit_builder(emitter: &mut Emitter, bases: &BaseSet, decompression: Decompres
         emitter.line(1, "}");
     }
 
-    emit_variable_builders(emitter, bases);
-    emit_build(emitter, bases);
+    emit_variable_builders(emitter, bases, auth);
+    emit_build(emitter, bases, auth);
     emitter.line(0, "}");
 }
 
-fn emit_variable_builders(emitter: &mut Emitter, bases: &BaseSet) {
+/// Storage type of one [`PlannedAuthScheme`] builder field (issue #12):
+/// bearer and header API keys keep the raw credential; basic keeps the
+/// username plus the optional password for base64 encoding at `build` time.
+fn auth_field_type(kind: &PlannedAuthKind) -> &'static str {
+    match kind {
+        PlannedAuthKind::Bearer | PlannedAuthKind::ApiKeyHeader { .. } => "Option<String>",
+        PlannedAuthKind::Basic => "Option<(String, Option<String>)>",
+    }
+}
+
+/// One typed auth setter (issue #12): stores the credential for
+/// `build`-time materialization into `default_headers`. Credentials apply to
+/// every request the built client sends.
+fn emit_auth_method(emitter: &mut Emitter, scheme: &PlannedAuthScheme) {
+    let field = &scheme.field_name;
+    match &scheme.kind {
+        PlannedAuthKind::Bearer => {
+            emitter.docs(
+                1,
+                &[
+                    format!(
+                        "HTTP bearer credentials from security scheme `{}` \
+                         (issue #12): sends `Authorization: Bearer <token>` \
+                         on every request.",
+                        scheme.scheme_name
+                    ),
+                ],
+            );
+            emitter.line(
+                1,
+                &format!(
+                    "pub fn {}(mut self, token: impl Into<String>) -> Self {{",
+                    scheme.method_name
+                ),
+            );
+            emitter.line(2, &format!("self.{field} = Some(token.into());"));
+            emitter.line(2, "self");
+            emitter.line(1, "}");
+        }
+        PlannedAuthKind::Basic => {
+            emitter.docs(
+                1,
+                &[
+                    format!(
+                        "HTTP basic credentials from security scheme `{}` \
+                         (issue #12): sends `Authorization: Basic \
+                         <base64(user:password)>` on every request.",
+                        scheme.scheme_name
+                    ),
+                ],
+            );
+            emitter.line(
+                1,
+                &format!(
+                    "pub fn {}(\n        mut self,\n        username: impl Into<String>,\n        password: Option<impl Into<String>>,\n    ) -> Self {{",
+                    scheme.method_name
+                ),
+            );
+            emitter.line(
+                2,
+                &format!(
+                    "self.{field} = Some((username.into(), password.map(Into::into)));"
+                ),
+            );
+            emitter.line(2, "self");
+            emitter.line(1, "}");
+        }
+        PlannedAuthKind::ApiKeyHeader { header_name } => {
+            emitter.docs(
+                1,
+                &[
+                    format!(
+                        "API-key credentials from security scheme `{}` \
+                         (issue #12): sends `{header_name}: <key>` on every \
+                         request.",
+                        scheme.scheme_name
+                    ),
+                ],
+            );
+            emitter.line(
+                1,
+                &format!(
+                    "pub fn {}(mut self, key: impl Into<String>) -> Self {{",
+                    scheme.method_name
+                ),
+            );
+            emitter.line(2, &format!("self.{field} = Some(key.into());"));
+            emitter.line(2, "self");
+            emitter.line(1, "}");
+        }
+    }
+}
+
+/// Materializes one stored credential into `auth_headers` at `build` time
+/// (issue #12). Every fallible conversion maps to
+/// `ClientError::InvalidHeader` with the wire name attached.
+fn emit_auth_application(emitter: &mut Emitter, scheme: &PlannedAuthScheme) {
+    let field = &scheme.field_name;
+    match &scheme.kind {
+        PlannedAuthKind::Bearer => {
+            emitter.line(2, &format!("if let Some(token) = self.{field} {{"));
+            emitter.line(
+                3,
+                "let value = ::http::HeaderValue::from_str(&format!(\"Bearer {token}\"))",
+            );
+            emit_invalid_header_mapper(emitter, 3, "::http::header::AUTHORIZATION");
+            emitter.line(
+                3,
+                "auth_headers.insert(::http::header::AUTHORIZATION, value);",
+            );
+            emitter.line(2, "}");
+        }
+        PlannedAuthKind::Basic => {
+            emitter.line(
+                2,
+                &format!("if let Some((username, password)) = self.{field} {{"),
+            );
+            emitter.line(
+                3,
+                "let raw = encode_basic_auth_value(&username, password.as_deref());",
+            );
+            emitter.line(
+                3,
+                "let value = ::http::HeaderValue::from_str(&format!(\"Basic {raw}\"))",
+            );
+            emit_invalid_header_mapper(emitter, 3, "::http::header::AUTHORIZATION");
+            emitter.line(
+                3,
+                "auth_headers.insert(::http::header::AUTHORIZATION, value);",
+            );
+            emitter.line(2, "}");
+        }
+        PlannedAuthKind::ApiKeyHeader { header_name } => {
+            let literal = rust_string_literal(&header_name.to_ascii_lowercase());
+            emitter.line(2, &format!("if let Some(key) = self.{field} {{"));
+            emitter.line(
+                3,
+                &format!("let name = ::http::HeaderName::from_static({literal});"),
+            );
+            emitter.line(3, "let value = ::http::HeaderValue::from_str(&key)");
+            emit_invalid_header_mapper(emitter, 3, "name.clone()");
+            emitter.line(3, "auth_headers.insert(name, value);");
+            emitter.line(2, "}");
+        }
+    }
+}
+
+/// The `.map_err(|source| ClientError::InvalidHeader { name, source })?`
+/// tail shared by every credential conversion: `name_expr` is either the
+/// `AUTHORIZATION` path or the bound `name.clone()` for API keys. The parent
+/// call stays on the `let` line (it fits); the chain breaks before
+/// `.map_err` with struct fields vertical — the same canonical shape as the
+/// `serde_json::from_slice(bytes).map_err(...)` tails elsewhere in the
+/// module.
+fn emit_invalid_header_mapper(emitter: &mut Emitter, indent: usize, name_expr: &str) {
+    emitter.line(
+        indent + 1,
+        ".map_err(|source| ClientError::InvalidHeader {",
+    );
+    emitter.line(indent + 2, &format!("name: {name_expr},"));
+    emitter.line(indent + 2, "source: Box::new(source),");
+    emitter.line(indent + 1, "})?;");
+}
+
+fn emit_variable_builders(
+    emitter: &mut Emitter,
+    bases: &BaseSet,
+    auth: &[PlannedAuthScheme],
+) {
     if !bases.has_any_variables() {
         return;
     }
     emitter.blank();
     let mut used_methods: BTreeSet<String> = BTreeSet::new();
+    // Issue #12: server-variable setters must never shadow the auth surface
+    // (or `default_headers`) emitted above.
+    for scheme in auth {
+        used_methods.insert(scheme.method_name.clone());
+    }
+    used_methods.insert("default_headers".to_owned());
     for (wire_name, variable) in bases.variable_registry() {
         let method = bases.variable_method_name(&wire_name, &mut used_methods);
 
@@ -1033,19 +1265,27 @@ fn emit_variable_builders(emitter: &mut Emitter, bases: &BaseSet) {
     }
 }
 
-fn emit_build(emitter: &mut Emitter, bases: &BaseSet) {
+fn emit_build(emitter: &mut Emitter, bases: &BaseSet, auth: &[PlannedAuthScheme]) {
     emitter.blank();
-    emitter.docs(
-        1,
-        &[
-            "Builds the client (main spec §30.1, companion §8): every distinct \
+    let mut build_docs = vec![
+        "Builds the client (main spec §30.1, companion §8): every distinct \
               base resolves independently — builder overrides or declared \
-             defaults, validated against their enums — and a non-absolute \
-             base without its own override is `ClientError::InvalidUrl` \
-             (D-impl-relative-servers)."
+              defaults, validated against their enums — and a non-absolute \
+              base without its own override is `ClientError::InvalidUrl` \
+              (D-impl-relative-servers)."
+            .to_owned(),
+    ];
+    if !auth.is_empty() {
+        // Issue #12: stored credentials land on top of `default_headers`
+        // here, so a typed credential wins on name conflicts.
+        build_docs.push(
+            "Stored credentials (the typed auth methods) are applied on top \
+              of `default_headers` here; a value that cannot become a header \
+              is `ClientError::InvalidHeader`."
                 .to_owned(),
-        ],
-    );
+        );
+    }
+    emitter.docs(1, &build_docs);
     emitter.line(1, "pub fn build(self) -> Result<Client, ClientError> {");
     emitter.line(2, "let base_url = match self.base_url {");
     emitter.line(3, "Some(explicit) => explicit,");
@@ -1128,10 +1368,26 @@ fn emit_build(emitter: &mut Emitter, bases: &BaseSet) {
         emitter.line(3, ")));");
         emitter.line(2, "}");
     }
-    emitter.line(
-        2,
-        "let http = self.http.build().map_err(ClientError::Transport)?;",
-    );
+    // Issue #12: stored credentials materialize into headers HERE — on top
+    // of any `default_headers` the caller merged — so a typed credential
+    // wins on name conflicts. Invalid values are `ClientError::InvalidHeader`
+    // (never a panic, never a silently dropped credential).
+    if !auth.is_empty() {
+        emitter.line(2, "let mut auth_headers = ::http::HeaderMap::new();");
+        for scheme in auth {
+            emit_auth_application(emitter, scheme);
+        }
+        emitter.line(2, "let http = self");
+        emitter.line(3, ".http");
+        emitter.line(3, ".default_headers(auth_headers)");
+        emitter.line(3, ".build()");
+        emitter.line(3, ".map_err(ClientError::Transport)?;");
+    } else {
+        emitter.line(
+            2,
+            "let http = self.http.build().map_err(ClientError::Transport)?;",
+        );
+    }
     emitter.line(2, "Ok(Client {");
     emitter.line(3, "http,");
     emitter.line(3, "base_url: trimmed.to_owned(),");
@@ -1277,6 +1533,10 @@ impl BaseSet {
             "secondary_base_url",
             "limits",
             "follow_redirects",
+            "default_headers",
+            "bearer_auth",
+            "basic_auth",
+            "api_key",
             "build",
         ];
         used.extend(RESERVED.iter().map(|name| (*name).to_owned()));
@@ -3042,8 +3302,7 @@ fn emit_query_extend_body(emitter: &mut Emitter, indent: usize, wire_name: &str)
             wire_name
         ),
     );
-    emitter.line(indent, "))),");
-    emitter.line(indent, "?,");
+    emitter.line(indent, ")))?,");
 }
 
 fn emit_param_spec(emitter: &mut Emitter, indent: usize, parameter: &PlannedParameter) {
@@ -4708,10 +4967,69 @@ fn emit_wrapper_fields_opt(emitter: &mut Emitter, indent: usize, status: &Planne
 // Module helpers emitted into the generated file
 // ----------------------------------------------------------------------
 
-fn emit_module_helpers(emitter: &mut Emitter, flags: &Flags, has_variables: bool) {
+/// Dependency-free base64 encoder (standard alphabet, `=` padding) behind
+/// `basic_auth` materialization (issue #12): the generated crate gains no new
+/// dependency for one header value.
+fn emit_basic_auth_helper(emitter: &mut Emitter) {
+    emitter.docs(
+        0,
+        &[
+            "Encodes `user:password` for the HTTP basic `Authorization` header \
+              (issue #12): standard base64 with `=` padding, no new \
+              dependency. A missing password encodes the bare `user:` form."
+                .to_owned(),
+        ],
+    );
+    emitter.line(0, "fn encode_basic_auth_value(username: &str, password: Option<&str>) -> String {");
+    emitter.line(1, "const ALPHABET: &[u8; 64] =");
+    emitter.line(
+        2,
+        "b\"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/\";",
+    );
+    emitter.line(1, "let mut input = username.as_bytes().to_vec();");
+    emitter.line(1, "input.push(b':');");
+    emitter.line(1, "if let Some(password) = password {");
+    emitter.line(2, "input.extend_from_slice(password.as_bytes());");
+    emitter.line(1, "}");
+    emitter.line(1, "let mut output = String::with_capacity((input.len() + 2) / 3 * 4);");
+    emitter.line(1, "for chunk in input.chunks(3) {");
+    emitter.line(2, "let mut block: u32 = 0;");
+    emitter.line(2, "for (index, byte) in chunk.iter().enumerate() {");
+    emitter.line(3, "block |= (*byte as u32) << (16 - 8 * index);");
+    emitter.line(2, "}");
+    emitter.line(2, "let pad = 3 - chunk.len();");
+    emitter.line(2, "for index in 0..4 - pad {");
+    emitter.line(
+        3,
+        "output.push(ALPHABET[((block >> (18 - 6 * index)) & 0x3F) as usize] as char);",
+    );
+    emitter.line(2, "}");
+    emitter.line(2, "for _ in 0..pad {");
+    emitter.line(3, "output.push('=');");
+    emitter.line(2, "}");
+    emitter.line(1, "}");
+    emitter.line(1, "output");
+    emitter.line(0, "}");
+}
+
+fn emit_module_helpers(
+    emitter: &mut Emitter,
+    flags: &Flags,
+    has_variables: bool,
+    auth: &[PlannedAuthScheme],
+) {
     // §45 codec helpers precede everything else so operation bodies reference
     // generated, rustfmt-canonical call targets instead of inline fragments.
     emit_codec_helpers(emitter, flags);
+    // Issue #12: the dependency-free base64 encoder behind `basic_auth`
+    // materialization (standard alphabet with `=` padding).
+    if auth
+        .iter()
+        .any(|scheme| matches!(scheme.kind, PlannedAuthKind::Basic))
+    {
+        emitter.blank();
+        emit_basic_auth_helper(emitter);
+    }
     // §40 response-direction classifiers precede everything else so each
     // `<Op><Status>Stream` adapter can wrap its decoder.
     if !flags.response_framings.is_empty() {
@@ -5595,6 +5913,17 @@ fn param_style_name(style: ParameterStyle) -> &'static str {
 /// Runtime conversion of one typed parameter into a `ParamValue` for the §6
 /// encoders; `value_expr` is the local binding or `raw` inside option matches.
 fn param_value_expr(parameter: &PlannedParameter, value_expr: String) -> String {
+    // Named-model enum (issue #10): convert through the serde JSON shape so
+    // the wire carries the `serde` rename (string enums) or discriminant
+    // (integer enums) without duplicating the mapping in generated code.
+    if parameter.enum_kind.is_some() {
+        if parameter.rust_type.starts_with("Vec<") {
+            return format!(
+                "ParamValue::Array({value_expr}.iter().map(ParamValue::from_serde).collect::<Vec<_>>())"
+            );
+        }
+        return format!("ParamValue::from_serde(&{value_expr})");
+    }
     match parameter.rust_type.as_str() {
         "String" => format!("ParamValue::Text({value_expr}.to_owned())"),
         "i32" => format!("ParamValue::Int(i64::from({value_expr}))"),

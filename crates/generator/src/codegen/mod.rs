@@ -60,6 +60,22 @@ impl Emitter {
         }
     }
 
+    /// Renders inner (`//!`) module-doc lines for file headers; an empty
+    /// entry becomes a bare `//!`. File headers must use inner docs so they
+    /// document the enclosing module and stay valid in otherwise-empty files
+    /// (outer `///` would attach to the first item and fail to compile when
+    /// there is no item).
+    pub(crate) fn inner_docs(&mut self, indent: usize, lines: &[String]) {
+        for doc_line in lines {
+            if doc_line.is_empty() {
+                self.line(indent, "//!");
+            } else {
+                let rendered = format!("//! {doc_line}");
+                self.line(indent, &rendered);
+            }
+        }
+    }
+
     /// Appends a multi-line plugin fragment, indenting every line.
     pub(crate) fn block(&mut self, indent: usize, text: &str) {
         for fragment_line in text.split('\n') {

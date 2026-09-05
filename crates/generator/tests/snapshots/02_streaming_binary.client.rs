@@ -1,9 +1,9 @@
-/// Reqwest client generated from the OpenAPI document (main spec §8 Output A).
-///
-/// Bounded JSON/form bodies (§34), streaming raw payloads (§32), exhaustive documented-status enums (§2.4), typed documented response headers (§15), redirects off by default (§30.1), and the authoritative `ClientError` (§36). Recorded decision for multi-content statuses WITH documented headers: the typed fields hoist onto the status VARIANT beside the content enum. The source document declares OpenAPI 3.1.0.
-///
-/// Servers (companion §8): operation-level `servers` override path-level, path-level overrides root-level, and within each effective array the first entry is that operation's default base. Every DISTINCT effective default URL becomes its own stored base: `base_url` is the primary (the first operation's first effective server); further bases live in `base_url_<key>` fields whose keys are documented under `ClientBuilder::secondary_base_url`. Recorded decision: an explicit `base_url` replaces ONLY the primary base; each other base needs its own `secondary_base_url` override, so a relative secondary still requires an absolute value there (D-impl-relative-servers).
-/// Generated deterministically byte-for-byte (main spec §50 test 39); do not edit by hand.
+//! Reqwest client generated from the OpenAPI document (main spec §8 Output A).
+//!
+//! Bounded JSON/form bodies (§34), streaming raw payloads (§32), exhaustive documented-status enums (§2.4), typed documented response headers (§15), redirects off by default (§30.1), and the authoritative `ClientError` (§36). Recorded decision for multi-content statuses WITH documented headers: the typed fields hoist onto the status VARIANT beside the content enum. The source document declares OpenAPI 3.1.0.
+//!
+//! Servers (companion §8): operation-level `servers` override path-level, path-level overrides root-level, and within each effective array the first entry is that operation's default base. Every DISTINCT effective default URL becomes its own stored base: `base_url` is the primary (the first operation's first effective server); further bases live in `base_url_<key>` fields whose keys are documented under `ClientBuilder::secondary_base_url`. Recorded decision: an explicit `base_url` replaces ONLY the primary base; each other base needs its own `secondary_base_url` override, so a relative secondary still requires an absolute value there (D-impl-relative-servers).
+//! Generated deterministically byte-for-byte (main spec §50 test 39); do not edit by hand.
 use super::models::ProblemDetails;
 use ::openapi_support::client_error::ClientError;
 use ::openapi_support::collect::collect_reqwest_limited;
@@ -73,6 +73,12 @@ impl ClientBuilder {
     /// Opts into redirect following (§30.1); generated decoding never buffers bodies to enable replay.
     pub fn follow_redirects(mut self, policy: ::reqwest::redirect::Policy) -> Self {
         self.http = self.http.redirect(policy);
+        self
+    }
+
+    /// Merges extra headers into every request sent through the built client (issue #12 escape hatch): covers auth schemes without a typed method plus unrelated needs like `User-Agent`. Typed credentials, when configured, are applied at `build` time on top of these headers.
+    pub fn default_headers(mut self, headers: ::http::HeaderMap) -> Self {
+        self.http = self.http.default_headers(headers);
         self
     }
 

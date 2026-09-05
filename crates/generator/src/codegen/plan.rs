@@ -33,10 +33,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::diagnostics::{Diagnostic, Diagnostics, DocumentPath};
 use crate::ir::document::{
-    ContentEntryIr, HttpMethod, MediaClass, ParameterIr, ParameterLocation, ParameterStyle,
-    RangeClass, ResponseEntryIr, ResponseStatusKey, ServerIr,
+    ApiKeyLocation, ContentEntryIr, HttpMethod, MediaClass, ParameterIr, ParameterLocation,
+    ParameterStyle, RangeClass, ResponseEntryIr, ResponseStatusKey, SecuritySchemeIr, ServerIr,
 };
-use crate::ir::schema::{SchemaId, SchemaKind};
+use crate::ir::schema::{EnumValues, SchemaId, SchemaKind};
 use crate::normalize::composition::ResolvedKind;
 use crate::normalize::naming::{self, NameStyle};
 use crate::normalize::{NormalizedDocument, NormalizedOperation};
@@ -219,6 +219,42 @@ pub struct PlannedApi {
     /// emitted-manifest feature graph both consume the SAME verdict without
     /// re-deriving it.
     pub response_decompression: Decompression,
+    /// Typed auth surface (issue #12): one entry per REFERENCED security
+    /// scheme the builder can apply (`http` bearer/basic, `apiKey` in
+    /// `header`). Empty when no `security` requirement references a
+    /// supported scheme — documents without security generate no extra
+    /// methods. Declaration order of `components/securitySchemes`.
+    pub auth: Vec<PlannedAuthScheme>,
+}
+
+/// One security scheme the generated `ClientBuilder` can apply (issue #12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedAuthScheme {
+    /// `components/securitySchemes` key verbatim.
+    pub scheme_name: String,
+    /// Builder method name (`bearer_auth`, `basic_auth`, `api_key`, or the
+    /// suffixed `<base>_<snake(scheme)>` form on collisions).
+    pub method_name: String,
+    /// Builder storage field name (`auth_<snake(scheme)>`, suffixed on
+    /// collision).
+    pub field_name: String,
+    /// How the credential reaches the wire.
+    pub kind: PlannedAuthKind,
+}
+
+/// Wire mapping of one [`PlannedAuthScheme`] (issue #12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlannedAuthKind {
+    /// `type: http, scheme: bearer`: `Authorization: Bearer <token>`.
+    Bearer,
+    /// `type: http, scheme: basic`: `Authorization: Basic <base64(user:pass)>`
+    /// (base64 is emitted inline — no new dependency).
+    Basic,
+    /// `type: apiKey, in: header`: `<name>: <key>`.
+    ApiKeyHeader {
+        /// Wire header name verbatim.
+        header_name: String,
+    },
 }
 
 /// One operation with every codegen decision precomputed so both emitters
@@ -471,10 +507,28 @@ pub struct PlannedParameter {
     pub explode: bool,
     pub allow_reserved: bool,
     pub required: bool,
-    /// Base scalar type (`String`/`i32`/`i64`/`f64`/`bool`) or `Vec<T>`;
-    /// optionality rides on [`PlannedParameter::required`] and is applied by
-    /// each emitter.
+    /// Base scalar type (`String`/`i32`/`i64`/`f64`/`bool`), a named models.rs
+    /// enum (issue #10), or `Vec<T>` of either; optionality rides on
+    /// [`PlannedParameter::required`] and is applied by each emitter.
     pub rust_type: String,
+    /// Wire shape of the named enum in [`PlannedParameter::rust_type`] (or of
+    /// its element type for `Vec<…>`); `None` for inline primitives. Emitters
+    /// use this to pick the serde-based conversion instead of the `FromStr`
+    /// path: string enums travel as their `serde` rename text, integer enums
+    /// as their discriminant text.
+    pub enum_kind: Option<ParamEnumKind>,
+}
+
+/// Wire shape of a named-model enum usable as a parameter (issue #10): only
+/// homogeneous string/integer enums are scalars on the wire. Mixed-type
+/// enums, `oneOf`/`anyOf` choice enums, and anonymous (inline) enums have no
+/// named models.rs type and stay unsupported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamEnumKind {
+    /// `serde` rename text on the wire; converts via the JSON string shape.
+    String,
+    /// Discriminant on the wire; converts via the JSON number shape.
+    Integer,
 }
 
 /// Plans the whole document with default configuration.
@@ -525,7 +579,144 @@ pub fn plan_api_with_config(
         server_runtime_validation: config.server_runtime_validation,
         enabled_codecs: config.generator_options.enabled_codecs.clone(),
         response_decompression: config.generator_options.response_decompression,
+        auth: plan_auth(doc),
     })
+}
+
+/// Typed auth surface (issue #12): the union of scheme names referenced by
+/// the root `security` array and every operation-level `security` override
+/// (an operation-level `[]` contributes nothing — it clears auth for that
+/// operation per OAS), resolved against `components/securitySchemes` in
+/// declaration order. Only schemes the builder can apply become entries
+/// (`http` bearer/basic, `apiKey` in `header`); anything else (oauth2,
+/// openIdConnect, query/cookie keys, unknown names) is skipped — the general
+/// `default_headers` escape hatch still covers those. A document whose
+/// requirements reference no supported scheme plans an empty vec, so its
+/// client generates no extra methods.
+fn plan_auth(doc: &NormalizedDocument) -> Vec<PlannedAuthScheme> {
+    use std::collections::BTreeSet;
+    let mut referenced: BTreeSet<&str> = BTreeSet::new();
+    for requirement in &doc.security {
+        for (name, _) in &requirement.schemes {
+            referenced.insert(name.as_str());
+        }
+    }
+    for operation in &doc.operations {
+        if let Some(requirements) = &operation.security {
+            for requirement in requirements {
+                for (name, _) in &requirement.schemes {
+                    referenced.insert(name.as_str());
+                }
+            }
+        }
+    }
+    if referenced.is_empty() {
+        return Vec::new();
+    }
+    // Supported candidates in `components/securitySchemes` declaration order
+    // with their generic builder-method base names.
+    let mut candidates: Vec<(&str, PlannedAuthKind, &'static str)> = Vec::new();
+    for (name, scheme) in &doc.security_schemes {
+        if !referenced.contains(name.as_str()) {
+            continue;
+        }
+        let (kind, base) = match scheme {
+            SecuritySchemeIr::Http { scheme, .. } if scheme == "bearer" => {
+                (PlannedAuthKind::Bearer, "bearer_auth")
+            }
+            SecuritySchemeIr::Http { scheme, .. } if scheme == "basic" => {
+                (PlannedAuthKind::Basic, "basic_auth")
+            }
+            SecuritySchemeIr::ApiKey {
+                location: ApiKeyLocation::Header,
+                name,
+            } => {
+                // The generated code registers this name through
+                // `HeaderName::from_static` (lowercased — names are
+                // case-insensitive); a name that cannot become a header name
+                // gets no typed method instead of a panicking one.
+                if !is_valid_header_name(name) {
+                    continue;
+                }
+                (
+                    PlannedAuthKind::ApiKeyHeader {
+                        header_name: name.clone(),
+                    },
+                    "api_key",
+                )
+            }
+            _ => continue,
+        };
+        candidates.push((name.as_str(), kind, base));
+    }
+    // Generic base names stay bare when unambiguous; collisions take the
+    // `<base>_<snake(scheme)>` form (companion §10 numeric suffixes on any
+    // remaining clash), never colliding with the fixed builder surface.
+    const RESERVED: &[&str] = &[
+        "new",
+        "default",
+        "base_url",
+        "secondary_base_url",
+        "limits",
+        "follow_redirects",
+        "default_headers",
+        "build",
+    ];
+    let mut base_counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, _, base) in &candidates {
+        *base_counts.entry(base).or_insert(0) += 1;
+    }
+    let mut used: BTreeSet<String> = RESERVED.iter().map(|name| (*name).to_owned()).collect();
+    let mut used_fields: BTreeSet<String> = BTreeSet::new();
+    let mut auth = Vec::with_capacity(candidates.len());
+    for (name, kind, base) in candidates {
+        let base_method = if base_counts.get(&base).copied().unwrap_or(0) == 1 {
+            base.to_owned()
+        } else {
+            format!(
+                "{base}_{}",
+                naming::ident(name, naming::NameStyle::Snake)
+            )
+        };
+        let mut method_name = base_method.clone();
+        let mut counter = 1_u32;
+        while !used.insert(method_name.clone()) {
+            counter += 1;
+            method_name = naming::sanitize_joined(&format!("{base_method}_{counter}"));
+        }
+        let base_field = format!(
+            "auth_{}",
+            naming::ident(name, naming::NameStyle::Snake)
+        );
+        let mut field_name = base_field.clone();
+        let mut field_counter = 1_u32;
+        while !used_fields.insert(field_name.clone()) {
+            field_counter += 1;
+            field_name = naming::sanitize_joined(&format!("{base_field}_{field_counter}"));
+        }
+        auth.push(PlannedAuthScheme {
+            scheme_name: name.to_owned(),
+            method_name,
+            field_name,
+            kind,
+        });
+    }
+    auth
+}
+
+/// True when `name` can become an `http::HeaderName` (issue #12): a
+/// non-empty RFC 9110 token. Checked at plan time so an invalid API-key name
+/// skips its typed method instead of emitting a panicking `from_static`.
+fn is_valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#' | b'$' | b'&' | b'\'' | b'*' | b'+' | b'-'
+                        | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+                )
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1043,7 +1234,14 @@ fn validation_for(
             analysis
                 .has_validator(effective)
                 .then_some(PlannedBodyValidation::Inherent)
-                .filter(|_| component_name(doc, effective).is_some())
+                // Named components validate through their models.rs inherent
+                // method; issue #11 synthetic bodies do the same through
+                // their generated `<Op>RequestBody`/`<Op>ResponseBody`
+                // definition.
+                .filter(|_| {
+                    component_name(doc, effective).is_some()
+                        || doc.names.synthetic_body_types.contains_key(&effective.0)
+                })
         }
         None => None,
     }
@@ -1252,7 +1450,9 @@ fn plan_multipart_field_kind(
                         "client_anonymous_json_schema",
                         "multipart JSON parts reference JSON bodies through \
                          super::models; this composite schema has no models.rs \
-                         type. Promote it to components/schemas",
+                         type. Promote it to components/schemas under a \
+                         collision-safe name (a bare `<Operation>Response` \
+                         collides with the generated response enum, issue #9)",
                     );
                     return None;
                 }
@@ -1280,7 +1480,9 @@ fn plan_multipart_field_kind(
                             "multipart JSON parts reference JSON bodies \
                              through super::models; an anonymous composite \
                              schema has no models.rs type. Promote it to \
-                             components/schemas",
+                             components/schemas under a collision-safe name \
+                             (a bare `<Operation>Response` collides with the \
+                             generated response enum, issue #9)",
                         );
                         return None;
                     }
@@ -1503,12 +1705,21 @@ fn named_or_diagnostic(
     if let Some(name) = component_name(doc, effective) {
         return name;
     }
+    // Issue #11: anonymous composite bodies carry operation-based models.rs
+    // names (`<Op>RequestBody` / `<Op>ResponseBody`); reference the
+    // synthesized definition instead of stopping.
+    if let Some(name) = doc.names.synthetic_body_types.get(&effective.0) {
+        return name.clone();
+    }
     diags.error(
         location.clone(),
         "client_anonymous_json_schema",
         "Phase 1 client/server codecs reference JSON bodies through \
          super::models; an anonymous composite schema has no models.rs type. \
-         Promote it to components/schemas or inline only scalars/arrays",
+         Promote it to components/schemas under a collision-safe name such \
+         as `<Type>RequestBody` or `<Type>ResponseBody` (a bare \
+         `<Operation>Response` collides with the generated response enum, \
+         issue #9) or inline only scalars/arrays",
     );
     "serde_json::Value".to_owned()
 }
@@ -1718,17 +1929,28 @@ fn plan_parameters(
             naming::sanitize_joined(&format!("{base}_{counter}"))
         };
         let schema = doc.resolve_alias(parameter.schema);
-        let kind = effective_kind(doc, schema);
-        let rust_type = match param_rust_type(doc, &kind) {
-            Some(rust_type) => rust_type,
+        let (rust_type, enum_kind) = match param_rust_type(doc, schema) {
+            Some(representation) => representation,
             None => {
+                // Anonymous (inline) enums reach the same stop-and-report
+                // path as composites, but the fix is different: a NAMED
+                // component enum is a supported scalar parameter (issue
+                // #10), so point at the promotion instead of at widening.
+                let detail = match effective_kind(doc, schema).as_ref() {
+                    SchemaKind::Enum { .. } => {
+                        "an inline enum has no models.rs type to reference; \
+                         promote it to components/schemas and `$ref` it"
+                    }
+                    _ => {
+                        "use a scalar or array of scalars"
+                    }
+                };
                 diags.error(
                     location.key("parameters").key(parameter.name.clone()),
                     "client_param_schema_unsupported",
                     format!(
                         "parameter `{}` needs an object/enum/composite schema, which \
-                         Phase 1 parameter serialization cannot represent; use a \
-                         scalar or array of scalars",
+                         Phase 1 parameter serialization cannot represent; {detail}",
                         parameter.name
                     ),
                 );
@@ -1744,6 +1966,7 @@ fn plan_parameters(
             allow_reserved: parameter.allow_reserved,
             required: parameter.required,
             rust_type,
+            enum_kind,
         });
     }
     planned
@@ -1779,20 +2002,41 @@ fn validate_style_location(
 }
 
 /// Phase 1 parameter representation: string→String, integer int32→i32 else
-/// i64, number→f64, boolean→bool, array<T>→Vec<T>.
-fn param_rust_type(doc: &NormalizedDocument, kind: &SchemaKind) -> Option<String> {
-    Some(match kind {
-        SchemaKind::Boolean => "bool".to_owned(),
-        SchemaKind::Integer { format } => match format.as_deref() {
-            Some("int32") => "i32".to_owned(),
-            _ => "i64".to_owned(),
-        },
-        SchemaKind::Number { .. } => "f64".to_owned(),
-        SchemaKind::String_ { .. } => "String".to_owned(),
+/// i64, number→f64, boolean→bool, array<T>→Vec<T>. Named string/integer
+/// enums (issue #10) map to their models.rs type with the wire shape carried
+/// alongside; anonymous enums have no named type and stay unsupported, as do
+/// mixed-type enums and every composite/choice shape.
+fn param_rust_type(
+    doc: &NormalizedDocument,
+    effective: SchemaId,
+) -> Option<(String, Option<ParamEnumKind>)> {
+    let kind = effective_kind(doc, effective);
+    Some(match kind.as_ref() {
+        SchemaKind::Boolean => ("bool".to_owned(), None),
+        SchemaKind::Integer { format } => (
+            match format.as_deref() {
+                Some("int32") => "i32".to_owned(),
+                _ => "i64".to_owned(),
+            },
+            None,
+        ),
+        SchemaKind::Number { .. } => ("f64".to_owned(), None),
+        SchemaKind::String_ { .. } => ("String".to_owned(), None),
         SchemaKind::Array { items } => {
             let element = doc.resolve_alias(items.target);
-            let inner = param_rust_type(doc, effective_kind(doc, element).as_ref())?;
-            format!("Vec<{inner}>")
+            let (inner, enum_kind) = param_rust_type(doc, element)?;
+            (format!("Vec<{inner}>"), enum_kind)
+        }
+        SchemaKind::Enum { values } => {
+            let enum_kind = match values {
+                EnumValues::Strings(_) => ParamEnumKind::String,
+                EnumValues::Integers(_) => ParamEnumKind::Integer,
+                EnumValues::MixedFallback(_) => return None,
+            };
+            // The models.rs identity of the referenced component; an inline
+            // (anonymous) enum has no named type to reference.
+            let name = component_name(doc, effective)?;
+            (name, Some(enum_kind))
         }
         _ => return None,
     })

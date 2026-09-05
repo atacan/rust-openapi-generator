@@ -53,18 +53,34 @@ pub(crate) struct Analysis {
     scalar_aliases: BTreeMap<u32, ScalarAlias>,
 }
 
+/// The v1 recognized string formats (`validate_format_string` enforces
+/// exactly this set; unknown names stay metadata-only, documented).
+/// Single source of truth shared with the models emitter's
+/// `known_format` so the "does this branch need validating?" verdict and
+/// the "should this type get an impl?" emission always agree (issue #8:
+/// an unrecognized `format` such as `regex` must not mark a shape as
+/// validated when no check will be emitted for it).
+pub(crate) fn is_recognized_format(format: Option<&str>) -> bool {
+    matches!(
+        format,
+        Some("date-time" | "date" | "time" | "email" | "hostname" | "uri" | "uuid")
+    )
+}
+
 /// True when the metadata carries at least one constraint this phase
 /// enforces at runtime on server requests (D-§2 bucket 2 minus the
 /// documented v1 skips: patternProperties/contentEncoding/contentMediaType/
 /// examples stay metadata-only).
 ///
-/// `format` counts ONLY on string shapes (`validate_format_string`); integer/
-/// number formats such as `int32` are type-shaping — already enforced
-/// structurally at Serde decode — so they must never make a node LOOK
-/// validated when the models emitter will not emit checks for it.
-/// True when the metadata carries at least one constraint this phase
-/// enforces at runtime, with an explicit verdict on whether the declared
-/// `format` produces a runtime check in this shape context.
+/// `format` counts ONLY when it names a recognized string format (see
+/// [`is_recognized_format`]) on a string shape (`validate_format_string`);
+/// integer/number formats such as `int32` are type-shaping — already
+/// enforced structurally at Serde decode — and unrecognized string formats
+/// emit no check, so neither must ever make a node LOOK validated when the
+/// models emitter will not emit checks for it (issue #8).
+///
+/// Takes an explicit verdict on whether the declared `format` produces a
+/// runtime check in this shape context.
 pub(crate) fn enforceable_with(format_checked: bool, validation: &ValidationMeta) -> bool {
     let numeric: &NumericValidation = &validation.numeric;
     validation.pattern.is_some()
@@ -76,12 +92,12 @@ pub(crate) fn enforceable_with(format_checked: bool, validation: &ValidationMeta
         || validation.unique_items
         || validation.min_properties.is_some()
         || validation.max_properties.is_some()
-        || validation.contains.is_some()
-        || (format_checked && validation.format.is_some())
+    || validation.contains.is_some()
+    || (format_checked && is_recognized_format(validation.format.as_deref()))
 }
 
 /// Whether `format` enforces at runtime for one resolved shape: string shapes
-/// only (companion §9 v1 policy; see [`enforceable`]).
+/// only (companion §9 v1 policy; see [`enforceable_with`]).
 fn format_checked(doc: &NormalizedDocument, effective: SchemaId) -> bool {
     match doc.resolution(effective).kind.clone() {
         ResolvedKind::IntersectedScalar(scalar) => {

@@ -208,6 +208,14 @@ pub struct NameAssignments {
     pub operation_methods: Vec<(String, String)>,
     /// Operation key → response enum type name (e.g. `GetArtifactResponse`).
     pub response_enums: Vec<(String, String)>,
+    /// Effective anonymous body arena id → generated `models.rs` type name
+    /// (issue #11): inline composite request/response bodies that need a
+    /// nominal type are named after their operation —
+    /// `<Op>RequestBody` / `<Op>ResponseBody` — with the same numeric
+    /// collision suffixes ordered by document position. The `ResponseBody`
+    /// suffix (never the bare `Response`) keeps the issue #9 reservation:
+    /// `<Operation>Response` stays owned by the generated response enum.
+    pub synthetic_body_types: BTreeMap<u32, String>,
     /// Raw tag → snake_case module name (same sanitization rules).
     pub tag_modules: BTreeMap<String, String>,
 }

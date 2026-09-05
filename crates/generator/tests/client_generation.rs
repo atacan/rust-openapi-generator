@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 use openapi_to_rust_generator::codegen::client::generate_client;
+use openapi_to_rust_generator::codegen::models::generate_models;
 use openapi_to_rust_generator::codegen::plan::plan_api;
 use openapi_to_rust_generator::normalize::{
     normalize_with_config, NormalizeConfig, NormalizedDocument,
@@ -1010,4 +1011,393 @@ fn fixture_17_head_variants_carry_typed_headers_without_body_accessor() {
         "HEAD must never buffer a response body:\n{head_fn}"
     );
     assert!(!head_fn.contains("ACCEPT"), "\n{head_fn}");
+}
+
+// ----------------------------------------------------------------------
+// Issue #9 — schema named `<Operation>Response` collides with the response
+// enum (R6)
+// ----------------------------------------------------------------------
+
+/// R6 reproducer for issue #9: a `components/schemas` entry named
+/// `CreateItemResponse` collides with the `createItem` response enum.
+/// `<Operation>Response` is generator-reserved, so the schema keeps the
+/// clean name while the generated enum takes the companion §10 numeric
+/// suffix (`CreateItemResponse_2`, the same rule `models.rs` applies to
+/// nested anonymous collisions). The emitted client must define the name
+/// exactly once, with the variant payload referencing the schema — never a
+/// recursive infinite-size `E0072` self-reference behind an `E0255`
+/// duplicate definition.
+#[test]
+fn issue_09_operation_response_schema_collision_suffixes_the_enum() {
+    let dir = std::env::temp_dir().join(format!("o2r-issue-09-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let r6 = [
+        "openapi: 3.0.0",
+        "info: { title: R6, version: \"1.0.0\" }",
+        "servers: [{ url: \"https://example.test/v1\" }]",
+        "paths:",
+        "  /items:",
+        "    post:",
+        "      operationId: createItem",
+        "      responses:",
+        "        \"201\":",
+        "          description: ok",
+        "          content:",
+        "            application/json: { schema: { $ref: \"#/components/schemas/CreateItemResponse\" } }",
+        "components:",
+        "  schemas:",
+        "    CreateItemResponse:",
+        "      type: object",
+        "      required: [id]",
+        "      properties:",
+        "        id: { type: string }",
+        "",
+    ]
+    .join("\n");
+    std::fs::write(dir.join("r6.yaml"), r6).expect("write R6 fixture");
+    let ir = load_document("r6.yaml", &dir, &LoadConfig::default())
+        .unwrap_or_else(|diags| panic!("R6 must load: {diags:?}"));
+    let doc = normalize_with_config(ir, &NormalizeConfig::default())
+        .unwrap_or_else(|diags| panic!("R6 must normalize: {diags:?}"));
+    assert_eq!(
+        doc.operations[0].response_enum, "CreateItemResponse_2",
+        "the generated enum takes the suffix; the schema keeps the clean name"
+    );
+    let plan = plan_api(&doc).unwrap_or_else(|diags| panic!("R6 must plan: {diags:?}"));
+    assert_eq!(
+        plan.operations[0].response_enum_name, "CreateItemResponse_2",
+    );
+
+    let client = generate_client(&doc, &plan);
+    assert!(
+        client.contains("use super::models::CreateItemResponse;"),
+        "the schema stays imported under its clean name:\n{client}"
+    );
+    let response_enum = enum_block(&client, "CreateItemResponse_2");
+    assert!(
+        response_enum.contains("Created201(CreateItemResponse),"),
+        "the variant payload references the schema, not the enum itself:\n{response_enum}"
+    );
+    assert!(
+        !client.contains("pub enum CreateItemResponse {"),
+        "no bare duplicate enum definition (E0255) may remain:\n{client}"
+    );
+
+    let models = generate_models(&doc);
+    assert!(
+        struct_block(&models, "CreateItemResponse").contains("pub id: String,"),
+        "the schema keeps its clean model definition:\n{models}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ----------------------------------------------------------------------
+// Issue #11 — inline anonymous composite bodies synthesize operation-based
+// names (R5)
+// ----------------------------------------------------------------------
+
+/// R5 reproducer for issue #11: an inline object request body must plan
+/// without `client_anonymous_json_schema` diagnostics by synthesizing
+/// `CreateItemRequestBody` in models.rs. The scalar inline response stays an
+/// inline `String`, and the response enum keeps the bare `CreateItemResponse`
+/// name (the issue #9 reservation: synthesized response bodies would use the
+/// `ResponseBody` suffix, never the bare enum name).
+#[test]
+fn issue_11_inline_request_body_synthesizes_operation_based_name() {
+    let dir = std::env::temp_dir().join(format!("o2r-issue-11-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let r5 = [
+        "openapi: 3.0.0",
+        "info: { title: R5, version: \"1.0.0\" }",
+        "servers: [{ url: \"https://example.test/v1\" }]",
+        "paths:",
+        "  /items:",
+        "    post:",
+        "      operationId: createItem",
+        "      requestBody:",
+        "        required: true",
+        "        content:",
+        "          application/json:",
+        "            schema:",
+        "              type: object",
+        "              required: [name]",
+        "              properties:",
+        "                name: { type: string }",
+        "      responses:",
+        "        \"201\": { description: ok, content: { application/json: { schema: { type: string } } } }",
+        "",
+    ]
+    .join("\n");
+    std::fs::write(dir.join("r5.yaml"), r5).expect("write R5 fixture");
+    let ir = load_document("r5.yaml", &dir, &LoadConfig::default())
+        .unwrap_or_else(|diags| panic!("R5 must load: {diags:?}"));
+    let doc = normalize_with_config(ir, &NormalizeConfig::default())
+        .unwrap_or_else(|diags| panic!("R5 must normalize: {diags:?}"));
+    assert_eq!(
+        doc.names.synthetic_body_types.len(),
+        1,
+        "only the composite request body synthesizes a name: {:?}",
+        doc.names.synthetic_body_types
+    );
+    let plan = plan_api(&doc).unwrap_or_else(|diags| panic!("R5 must plan: {diags:?}"));
+    assert_eq!(
+        plan.operations[0].request_contents[0].model_expr,
+        "CreateItemRequestBody",
+    );
+
+    let models = generate_models(&doc);
+    assert!(
+        struct_block(&models, "CreateItemRequestBody").contains("pub name: String,"),
+        "the synthesized body is defined in models.rs:\n{models}"
+    );
+
+    let client = generate_client(&doc, &plan);
+    assert!(
+        client.contains("use super::models::CreateItemRequestBody;"),
+        "the synthesized body is imported under its operation-based name:\n{client}"
+    );
+    assert!(
+        client.contains("&CreateItemRequestBody"),
+        "the request method carries the synthesized body type:\n{client}"
+    );
+    assert!(
+        enum_block(&client, "CreateItemResponse").contains("Created201(String),"),
+        "the scalar inline response stays inline and the response enum keeps \
+         its bare name (issue #9 reservation):\n{client}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ----------------------------------------------------------------------
+// Issue #12 — security-scheme-aware auth + the default_headers escape hatch
+// ----------------------------------------------------------------------
+
+/// Synthetic bearer/apiKey/basic document: every operation's effective
+/// requirement references a supported scheme, so the builder gains one typed
+/// method per scheme on top of the general escape hatch.
+const AUTH_FIXTURE: &str = r#"openapi: 3.1.0
+info:
+  title: auth api
+  version: "1"
+servers:
+  - url: https://example.test/v1
+security:
+  - bearerAuth: []
+  - apiKey: []
+  - basicAuth: []
+paths:
+  /widgets:
+    get:
+      operationId: listWidgets
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: string
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    basicAuth:
+      type: http
+      scheme: basic
+"#;
+
+/// Renders the synthetic auth document through the full pipeline.
+fn generate_auth_fixture(fixture: &str, tag: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("o2r-client-auth-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create fixture dir");
+    std::fs::write(dir.join("auth.yaml"), fixture).expect("write synthetic fixture");
+
+    let ir = load_document("auth.yaml", &dir, &LoadConfig::default())
+        .unwrap_or_else(|diags| panic!("auth fixture must load: {diags:?}"));
+    let doc = normalize_with_config(ir, &NormalizeConfig::default())
+        .unwrap_or_else(|diags| panic!("auth fixture must normalize: {diags:?}"));
+    let plan =
+        plan_api(&doc).unwrap_or_else(|diags| panic!("auth fixture must plan: {diags:?}"));
+    let output = generate_client(&doc, &plan);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    output
+}
+
+#[test]
+fn issue_12_bearer_api_key_and_basic_gain_typed_builder_methods() {
+    let output = generate_auth_fixture(AUTH_FIXTURE, "typed");
+
+    // The general escape hatch is always present: reqwest has no
+    // middleware API, so `default_headers` is the only transport hook.
+    assert!(
+        output.contains("pub fn default_headers(mut self, headers: ::http::HeaderMap) -> Self {"),
+        "the escape hatch must be emitted:\n{output}"
+    );
+
+    // One typed setter per supported scheme, storing the credential for
+    // build-time materialization.
+    assert!(
+        output.contains("pub fn bearer_auth(mut self, token: impl Into<String>) -> Self {"),
+        "\n{output}"
+    );
+    assert!(
+        output.contains("pub fn api_key(mut self, key: impl Into<String>) -> Self {"),
+        "\n{output}"
+    );
+    assert!(
+        output.contains("pub fn basic_auth("),
+        "\n{output}"
+    );
+    // Basic auth encodes dependency-free (no new manifest entry).
+    assert!(
+        output.contains(
+            "fn encode_basic_auth_value(username: &str, password: Option<&str>) -> String {"
+        ),
+        "\n{output}"
+    );
+
+    // Build-time materialization: bearer and basic land on `authorization`,
+    // the API key on its wire name, invalid values are InvalidHeader.
+    let build = item_block(&output, "pub fn build(self)");
+    assert!(
+        build.contains("let mut auth_headers = ::http::HeaderMap::new();"),
+        "\n{build}"
+    );
+    assert!(
+        build.contains("format!(\"Bearer {token}\")"),
+        "\n{build}"
+    );
+    assert!(
+        build.contains("format!(\"Basic {raw}\")"),
+        "\n{build}"
+    );
+    assert!(
+        build.contains("::http::HeaderName::from_static(\"x-api-key\")"),
+        "\n{build}"
+    );
+    assert!(
+        build.contains("ClientError::InvalidHeader"),
+        "\n{build}"
+    );
+    // The redirect-policy guarantee survives: still pinned off in `new`.
+    assert!(output.contains("Policy::none()"), "\n{output}");
+}
+
+#[test]
+fn issue_12_unsupported_and_unreferenced_schemes_gain_no_typed_methods() {
+    // oauth2, query/cookie keys, and unknown types have no typed method —
+    // `default_headers` still covers them — and schemes no requirement
+    // references stay silent too.
+    let fixture = r#"openapi: 3.1.0
+info:
+  title: partial auth
+  version: "1"
+servers:
+  - url: https://example.test/v1
+security:
+  - bearerAuth: []
+paths:
+  /widgets:
+    get:
+      operationId: listWidgets
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: string
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+    queryKey:
+      type: apiKey
+      in: query
+      name: key
+    oauth:
+      type: oauth2
+      flows: {}
+    unreferenced:
+      type: http
+      scheme: bearer
+"#;
+    let output = generate_auth_fixture(fixture, "partial");
+
+    assert!(
+        output.contains("pub fn bearer_auth(mut self, token: impl Into<String>) -> Self {"),
+        "\n{output}"
+    );
+    for absent in [
+        "fn api_key(",
+        "fn basic_auth(",
+        "fn oauth(",
+        "fn query_key(",
+        "fn unreferenced(",
+        "encode_basic_auth_value",
+    ] {
+        assert!(
+            !output.contains(absent),
+            "no typed method for `{absent}` may exist:\n{output}"
+        );
+    }
+    assert!(
+        output.contains("pub fn default_headers(mut self, headers: ::http::HeaderMap) -> Self {"),
+        "the escape hatch still covers unmodeled schemes:\n{output}"
+    );
+}
+
+#[test]
+fn issue_12_documents_without_security_generate_no_auth_methods() {
+    // Back-compat: schemes without any `security` requirement (and
+    // documents without schemes at all) change only through the general
+    // escape hatch — no typed methods, no credential fields, no helper.
+    let fixture = r#"openapi: 3.1.0
+info:
+  title: no auth
+  version: "1"
+servers:
+  - url: https://example.test/v1
+paths:
+  /widgets:
+    get:
+      operationId: listWidgets
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: string
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+"#;
+    let output = generate_auth_fixture(fixture, "unrequired");
+
+    assert!(
+        output.contains("pub fn default_headers(mut self, headers: ::http::HeaderMap) -> Self {"),
+        "\n{output}"
+    );
+    for absent in [
+        "bearer_auth",
+        "basic_auth",
+        "api_key",
+        "auth_headers",
+        "encode_basic_auth_value",
+        "InvalidHeader",
+    ] {
+        assert!(
+            !output.contains(absent),
+            "no auth surface for `{absent}` may exist without a requirement:\n{output}"
+        );
+    }
 }
