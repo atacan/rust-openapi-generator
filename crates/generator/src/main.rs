@@ -319,8 +319,8 @@ fn run_generation(options: &GenerationOptions<'_>) -> Result<(), std::process::E
     // Parameter/body planning is only needed for transport artifacts. A
     // parameter-serialization limitation must not block `--generate types`,
     // whose modules depend on the normalized document alone (issue #10).
-    let needs_plan =
-        options.selection.contains(&Artifact::Client) || options.selection.contains(&Artifact::Server);
+    let needs_plan = options.selection.contains(&Artifact::Client)
+        || options.selection.contains(&Artifact::Server);
     let plan = if needs_plan {
         match plan_api(&doc) {
             Ok(plan) => Some(plan),
@@ -343,7 +343,13 @@ fn run_generation(options: &GenerationOptions<'_>) -> Result<(), std::process::E
         None => CodegenConfig::default(),
     };
 
-    write_artifacts(options.out_dir, &options.selection, &doc, plan.as_ref(), &config)?;
+    write_artifacts(
+        options.out_dir,
+        &options.selection,
+        &doc,
+        plan.as_ref(),
+        &config,
+    )?;
     Ok(())
 }
 

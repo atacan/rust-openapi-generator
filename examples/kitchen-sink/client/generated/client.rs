@@ -20,21 +20,8 @@ use ::openapi_support::sse::decode_sse_json;
 use ::openapi_support::stream_errors::{JsonSeqDecodeError, NdjsonDecodeError, SseDecodeError};
 use ::reqwest::multipart::{Form, Part};
 use kitchen_sink_models::models::{
-    Ack,
-    CreateSessionForm,
-    CreateWidget,
-    Document,
-    DocumentMetadata,
-    Event,
-    FullWidget,
-    MatrixRecord,
-    Metric,
-    Pet,
-    ProblemDetails,
-    Record,
-    Session,
-    SuccessEnvelope,
-    ThumbnailMetadata,
+    Ack, CreateSessionForm, CreateWidget, Document, DocumentMetadata, Event, FullWidget,
+    MatrixRecord, Metric, Pet, ProblemDetails, Record, Session, SuccessEnvelope, ThumbnailMetadata,
     Widget,
 };
 use kitchen_sink_models::views::{
@@ -1354,9 +1341,11 @@ impl Client {
         response: ::reqwest::Response,
     ) -> Result<PostVendorDocumentResponse, ClientError> {
         match response.status() {
-            ::http::StatusCode::OK => Ok(PostVendorDocumentResponse::Ok200(PostVendorDocument200 {
-                response,
-            })),
+            ::http::StatusCode::OK => {
+                Ok(PostVendorDocumentResponse::Ok200(PostVendorDocument200 {
+                    response,
+                }))
+            }
             ::http::StatusCode::BAD_REQUEST => {
                 let parsed = parse_response_content_type(&response)?;
                 let Some(parsed) = parsed else {

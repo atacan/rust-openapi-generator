@@ -92,8 +92,8 @@ pub(crate) fn enforceable_with(format_checked: bool, validation: &ValidationMeta
         || validation.unique_items
         || validation.min_properties.is_some()
         || validation.max_properties.is_some()
-    || validation.contains.is_some()
-    || (format_checked && is_recognized_format(validation.format.as_deref()))
+        || validation.contains.is_some()
+        || (format_checked && is_recognized_format(validation.format.as_deref()))
 }
 
 /// Whether `format` enforces at runtime for one resolved shape: string shapes

@@ -76,7 +76,12 @@ pub fn generate_client_with_config(
     emit_header(&mut emitter, doc, &flags, &config.types_location);
     let bases = BaseSet::new(plan);
     emit_client(&mut emitter, &bases);
-    emit_builder(&mut emitter, &bases, plan.response_decompression, &plan.auth);
+    emit_builder(
+        &mut emitter,
+        &bases,
+        plan.response_decompression,
+        &plan.auth,
+    );
     for (op_index, operation) in plan.operations.iter().enumerate() {
         emit_operation_definitions(&mut emitter, op_index, operation, &layout);
     }
@@ -490,8 +495,8 @@ impl Flags {
 /// the single-line form exceeds rustfmt's width. Empirical rule (verified
 /// against the pinned toolchain): a braced `use` tree stays on one line only
 /// up to [`RUSTFMT_MAX_WIDTH`] − 2 characters; the canonical broken form
-/// packs the items onto one continuation line when they fit under the same
-/// budget, else lists them one per line.
+/// greedily packs items onto continuation lines (each `    …` within
+/// [`RUSTFMT_MAX_WIDTH`)), matching rustfmt's `imports_layout`.
 fn braced_use(prefix: &str, items: &[&str]) -> String {
     const USE_BUDGET: usize = RUSTFMT_MAX_WIDTH - 2;
     if items.len() == 1 {
@@ -502,14 +507,29 @@ fn braced_use(prefix: &str, items: &[&str]) -> String {
     if prefix.chars().count() + joined.chars().count() + 3 <= USE_BUDGET {
         return format!("{prefix}{{{joined}}};");
     }
-    let mut text = format!("{prefix}{{\n");
-    let packed = format!("{joined},");
-    if 4 + packed.chars().count() <= USE_BUDGET {
-        text.push_str(&format!("    {packed}\n"));
-    } else {
-        for item in items {
-            text.push_str(&format!("    {item},\n"));
+    // Greedy packing across continuation lines: fill each `    …` line up to
+    // the max width before starting the next, exactly as rustfmt does.
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for item in items {
+        let candidate = if current.is_empty() {
+            format!("{item},")
+        } else {
+            format!("{current} {item},")
+        };
+        if 4 + candidate.chars().count() <= RUSTFMT_MAX_WIDTH {
+            current = candidate;
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current = format!("{item},");
         }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    let mut text = format!("{prefix}{{\n");
+    for line in lines {
+        text.push_str(&format!("    {line}\n"));
     }
     text.push_str("};");
     text
@@ -707,9 +727,8 @@ fn emit_header(
         params.push("ParamValue".to_owned());
     }
     if !params.is_empty() {
-        // rustfmt keeps short brace lists on one line.
-        let joined = params.join(", ");
-        imports.push(format!("use ::openapi_support::params::{{{joined}}};"));
+        let refs: Vec<&str> = params.iter().map(String::as_str).collect();
+        imports.push(braced_use("use ::openapi_support::params::", &refs));
     }
     if flags.needs_multipart {
         imports.push("use ::reqwest::multipart::{Form, Part};".to_owned());
@@ -841,7 +860,10 @@ fn emit_builder(
     // `default_headers` at `build` time so invalid values surface as
     // `ClientError::InvalidHeader` instead of panicking or silently dropping.
     for scheme in auth {
-        emitter.line(1, &format!("{}: {},", scheme.field_name, auth_field_type(&scheme.kind)));
+        emitter.line(
+            1,
+            &format!("{}: {},", scheme.field_name, auth_field_type(&scheme.kind)),
+        );
     }
     emitter.line(0, "}");
     emitter.blank();
@@ -1063,14 +1085,12 @@ fn emit_auth_method(emitter: &mut Emitter, scheme: &PlannedAuthScheme) {
         PlannedAuthKind::Bearer => {
             emitter.docs(
                 1,
-                &[
-                    format!(
-                        "HTTP bearer credentials from security scheme `{}` \
+                &[format!(
+                    "HTTP bearer credentials from security scheme `{}` \
                          (issue #12): sends `Authorization: Bearer <token>` \
                          on every request.",
-                        scheme.scheme_name
-                    ),
-                ],
+                    scheme.scheme_name
+                )],
             );
             emitter.line(
                 1,
@@ -1086,14 +1106,12 @@ fn emit_auth_method(emitter: &mut Emitter, scheme: &PlannedAuthScheme) {
         PlannedAuthKind::Basic => {
             emitter.docs(
                 1,
-                &[
-                    format!(
-                        "HTTP basic credentials from security scheme `{}` \
+                &[format!(
+                    "HTTP basic credentials from security scheme `{}` \
                          (issue #12): sends `Authorization: Basic \
                          <base64(user:password)>` on every request.",
-                        scheme.scheme_name
-                    ),
-                ],
+                    scheme.scheme_name
+                )],
             );
             emitter.line(
                 1,
@@ -1104,9 +1122,7 @@ fn emit_auth_method(emitter: &mut Emitter, scheme: &PlannedAuthScheme) {
             );
             emitter.line(
                 2,
-                &format!(
-                    "self.{field} = Some((username.into(), password.map(Into::into)));"
-                ),
+                &format!("self.{field} = Some((username.into(), password.map(Into::into)));"),
             );
             emitter.line(2, "self");
             emitter.line(1, "}");
@@ -1114,14 +1130,12 @@ fn emit_auth_method(emitter: &mut Emitter, scheme: &PlannedAuthScheme) {
         PlannedAuthKind::ApiKeyHeader { header_name } => {
             emitter.docs(
                 1,
-                &[
-                    format!(
-                        "API-key credentials from security scheme `{}` \
+                &[format!(
+                    "API-key credentials from security scheme `{}` \
                          (issue #12): sends `{header_name}: <key>` on every \
                          request.",
-                        scheme.scheme_name
-                    ),
-                ],
+                    scheme.scheme_name
+                )],
             );
             emitter.line(
                 1,
@@ -1199,20 +1213,13 @@ fn emit_auth_application(emitter: &mut Emitter, scheme: &PlannedAuthScheme) {
 /// `serde_json::from_slice(bytes).map_err(...)` tails elsewhere in the
 /// module.
 fn emit_invalid_header_mapper(emitter: &mut Emitter, indent: usize, name_expr: &str) {
-    emitter.line(
-        indent + 1,
-        ".map_err(|source| ClientError::InvalidHeader {",
-    );
+    emitter.line(indent + 1, ".map_err(|source| ClientError::InvalidHeader {");
     emitter.line(indent + 2, &format!("name: {name_expr},"));
     emitter.line(indent + 2, "source: Box::new(source),");
     emitter.line(indent + 1, "})?;");
 }
 
-fn emit_variable_builders(
-    emitter: &mut Emitter,
-    bases: &BaseSet,
-    auth: &[PlannedAuthScheme],
-) {
+fn emit_variable_builders(emitter: &mut Emitter, bases: &BaseSet, auth: &[PlannedAuthScheme]) {
     if !bases.has_any_variables() {
         return;
     }
@@ -2155,6 +2162,7 @@ fn emit_stream_wrapper_literal_fields(
 /// streaming wrapper WITHOUT documented headers (`PATTERN => Ok(Enum::
 /// Variant(Wrapper { response })),`), breaking vertically only when the head
 /// exceeds the width budget (same layouts as [`emit_stream_wrapper_arm`]).
+/// When the head fits but is long, rustfmt prefers the block form.
 fn emit_plain_wrapper_arm(
     emitter: &mut Emitter,
     indent: usize,
@@ -2172,8 +2180,23 @@ fn emit_plain_wrapper_arm(
         return;
     }
     // Tier 2: enum path stays on the arm line, struct fields go vertical.
+    // When the head is long (verified against rustfmt), the expression form
+    // is still flagged — the block form is canonical.
     let head_a = format!("{pattern} Ok({enum_name}::{variant}({wrapper} {{");
     if fits(indent, &head_a) {
+        // rustfmt keeps the expression form until the head nearly fills
+        // `max_width` (verified: 95 stays expression, 99 needs the block).
+        if indent * 4 + head_a.chars().count() > RUSTFMT_MAX_WIDTH - 3 {
+            emitter.line(indent, &format!("{pattern} {{"));
+            emitter.line(
+                indent + 1,
+                &format!("Ok({enum_name}::{variant}({wrapper} {{"),
+            );
+            emitter.line(indent + 2, "response,");
+            emitter.line(indent + 1, "}))");
+            emitter.line(indent, "}");
+            return;
+        }
         emitter.line(indent, &head_a);
         emitter.line(indent + 1, "response,");
         emitter.line(indent, "})),");
@@ -3221,12 +3244,10 @@ fn emit_url_building(
                     });
                 flags.needs_encode_path = true;
                 emit_param_spec(emitter, 2, parameter);
-                emitter.line(
+                emit_let_value(
+                    emitter,
                     2,
-                    &format!(
-                        "let value = {};",
-                        param_value_expr(parameter, parameter.rust_name.clone())
-                    ),
+                    param_value_expr(parameter, parameter.rust_name.clone()),
                 );
                 emitter.line(2, "url.push_str(&encode_path(&spec, &value));");
             }
@@ -3251,28 +3272,16 @@ fn emit_url_building(
         flags.needs_query_pairs = true;
         emit_param_spec(emitter, 2, parameter);
         if parameter.required {
-            emitter.line(
+            emit_let_value(
+                emitter,
                 2,
-                &format!(
-                    "let value = {};",
-                    param_value_expr(parameter, parameter.rust_name.clone())
-                ),
+                param_value_expr(parameter, parameter.rust_name.clone()),
             );
-            emitter.line(2, "query_pairs.extend(");
-            emit_query_extend_body(emitter, 3, &parameter.wire_name);
-            emitter.line(2, ");");
+            emit_query_extend(emitter, 2, &parameter.wire_name);
         } else {
             emitter.line(2, &format!("if let Some(raw) = {} {{", parameter.rust_name));
-            emitter.line(
-                3,
-                &format!(
-                    "let value = {};",
-                    param_value_expr(parameter, "raw".to_owned())
-                ),
-            );
-            emitter.line(3, "query_pairs.extend(");
-            emit_query_extend_body(emitter, 4, &parameter.wire_name);
-            emitter.line(3, ");");
+            emit_let_value(emitter, 3, param_value_expr(parameter, "raw".to_owned()));
+            emit_query_extend(emitter, 3, &parameter.wire_name);
             emitter.line(2, "}");
         }
     }
@@ -3292,17 +3301,41 @@ fn emit_url_building(
     emitter.line(2, "}");
 }
 
-fn emit_query_extend_body(emitter: &mut Emitter, indent: usize, wire_name: &str) {
-    emitter.line(indent, "encode_query_pairs(&spec, &value)");
-    emitter.line(indent, ".map_err(|error| ClientError::InvalidUrl(format!(");
+/// Emits `let value = {expr};`, breaking after `=` when the single line
+/// would exceed rustfmt's width (mirrors rustfmt's canonical `let` wrapping
+/// for the long enum-array `ParamValue::Array(…)` construction).
+fn emit_let_value(emitter: &mut Emitter, indent: usize, expr: String) {
+    let inline = format!("let value = {expr};");
+    if fits(indent, &inline) {
+        emitter.line(indent, &inline);
+    } else {
+        emitter.line(indent, "let value =");
+        emitter.line(indent + 1, &format!("{expr};"));
+    }
+}
+
+fn emit_query_extend(emitter: &mut Emitter, indent: usize, wire_name: &str) {
+    // Canonical rustfmt closure-block form: `extend(…map_err(|error| { … })?);`
+    // keeps the whole `extend` on one head line and the `ClientError` mapping
+    // as its body (verified against rustfmt `--check`).
     emitter.line(
-        indent + 1,
-        &format!(
-            "\"parameter `{}` serialization failed: {{error}}\"",
-            wire_name
-        ),
+        indent,
+        "query_pairs.extend(encode_query_pairs(&spec, &value).map_err(|error| {",
     );
-    emitter.line(indent, ")))?,");
+    let body = format!(
+        "ClientError::InvalidUrl(format!(\"parameter `{wire_name}` serialization failed: {{error}}\"))"
+    );
+    if fits(indent + 1, &body) {
+        emitter.line(indent + 1, &body);
+    } else {
+        emitter.line(indent + 1, "ClientError::InvalidUrl(format!(");
+        emitter.line(
+            indent + 2,
+            &format!("\"parameter `{wire_name}` serialization failed: {{error}}\""),
+        );
+        emitter.line(indent + 1, "))");
+    }
+    emitter.line(indent, "})?);");
 }
 
 fn emit_param_spec(emitter: &mut Emitter, indent: usize, parameter: &PlannedParameter) {
@@ -3567,12 +3600,10 @@ fn emit_header_params(
             );
         };
         if parameter.required {
-            emitter.line(
+            emit_let_value(
+                emitter,
                 indent,
-                &format!(
-                    "let value = {};",
-                    param_value_expr(parameter, parameter.rust_name.clone())
-                ),
+                param_value_expr(parameter, parameter.rust_name.clone()),
             );
             header_call(emitter, indent);
         } else {
@@ -3580,12 +3611,10 @@ fn emit_header_params(
                 indent,
                 &format!("if let Some(raw) = {} {{", parameter.rust_name),
             );
-            emitter.line(
+            emit_let_value(
+                emitter,
                 indent + 1,
-                &format!(
-                    "let value = {};",
-                    param_value_expr(parameter, "raw".to_owned())
-                ),
+                param_value_expr(parameter, "raw".to_owned()),
             );
             header_call(emitter, indent + 1);
             emitter.line(indent, "}");
@@ -3601,12 +3630,10 @@ fn emit_cookie_params(emitter: &mut Emitter, indent: usize, parameters: &[&Plann
     for parameter in parameters {
         emit_param_spec(emitter, indent, parameter);
         if parameter.required {
-            emitter.line(
+            emit_let_value(
+                emitter,
                 indent,
-                &format!(
-                    "let value = {};",
-                    param_value_expr(parameter, parameter.rust_name.clone())
-                ),
+                param_value_expr(parameter, parameter.rust_name.clone()),
             );
             emitter.line(
                 indent,
@@ -3617,12 +3644,10 @@ fn emit_cookie_params(emitter: &mut Emitter, indent: usize, parameters: &[&Plann
                 indent,
                 &format!("if let Some(raw) = {} {{", parameter.rust_name),
             );
-            emitter.line(
+            emit_let_value(
+                emitter,
                 indent + 1,
-                &format!(
-                    "let value = {};",
-                    param_value_expr(parameter, "raw".to_owned())
-                ),
+                param_value_expr(parameter, "raw".to_owned()),
             );
             emitter.line(
                 indent + 1,
@@ -4980,7 +5005,10 @@ fn emit_basic_auth_helper(emitter: &mut Emitter) {
                 .to_owned(),
         ],
     );
-    emitter.line(0, "fn encode_basic_auth_value(username: &str, password: Option<&str>) -> String {");
+    emitter.line(
+        0,
+        "fn encode_basic_auth_value(username: &str, password: Option<&str>) -> String {",
+    );
     emitter.line(1, "const ALPHABET: &[u8; 64] =");
     emitter.line(
         2,
@@ -4991,7 +5019,10 @@ fn emit_basic_auth_helper(emitter: &mut Emitter) {
     emitter.line(1, "if let Some(password) = password {");
     emitter.line(2, "input.extend_from_slice(password.as_bytes());");
     emitter.line(1, "}");
-    emitter.line(1, "let mut output = String::with_capacity((input.len() + 2) / 3 * 4);");
+    emitter.line(
+        1,
+        "let mut output = String::with_capacity((input.len() + 2) / 3 * 4);",
+    );
     emitter.line(1, "for chunk in input.chunks(3) {");
     emitter.line(2, "let mut block: u32 = 0;");
     emitter.line(2, "for (index, byte) in chunk.iter().enumerate() {");

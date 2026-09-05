@@ -1156,8 +1156,8 @@ fn braced_use(prefix: &str, items: &[&str], keyword_first: &[&str]) -> String {
     let _ = keyword_first;
     // Empirical rule (verified against the pinned toolchain): a braced `use`
     // tree stays on one line only up to [`RUSTFMT_MAX_WIDTH`] − 2 characters;
-    // the canonical broken form packs the items onto one continuation line
-    // when they fit under the same budget, else lists them one per line.
+    // the canonical broken form greedily packs items onto continuation lines
+    // (each `    …` within [`RUSTFMT_MAX_WIDTH`)), matching rustfmt.
     const USE_BUDGET: usize = RUSTFMT_MAX_WIDTH - 2;
     if items.len() == 1 {
         // rustfmt drops redundant braces around a single use item.
@@ -1167,14 +1167,27 @@ fn braced_use(prefix: &str, items: &[&str], keyword_first: &[&str]) -> String {
     if prefix.chars().count() + joined.chars().count() + 3 <= USE_BUDGET {
         return format!("{prefix}{{{joined}}};");
     }
-    let mut text = format!("{prefix}{{\n");
-    let packed = format!("{joined},");
-    if 4 + packed.chars().count() <= USE_BUDGET {
-        text.push_str(&format!("    {packed}\n"));
-    } else {
-        for item in items {
-            text.push_str(&format!("    {item},\n"));
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for item in items {
+        let candidate = if current.is_empty() {
+            format!("{item},")
+        } else {
+            format!("{current} {item},")
+        };
+        if 4 + candidate.chars().count() <= RUSTFMT_MAX_WIDTH {
+            current = candidate;
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current = format!("{item},");
         }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    let mut text = format!("{prefix}{{\n");
+    for line in lines {
+        text.push_str(&format!("    {line}\n"));
     }
     text.push_str("};");
     text
@@ -3491,16 +3504,27 @@ fn emit_handler(
     let invoke_args = handler_invoke_args(operation);
     let joined = invoke_args.join(", ");
     let inline = format!("let response = api.{}({joined}).await;", operation.method);
-    if fits(1, &inline) {
+    // rustfmt breaks method chains exceeding its chain width even when the
+    // single line would fit `max_width`: pack args onto one continuation line
+    // when that fits, else fall back to one arg per line.
+    let chain_len = format!("api.{}({joined}).await", operation.method).len();
+    if fits(1, &inline) && chain_len <= 60 {
         emitter.line(1, &inline);
     } else {
-        emitter.line(1, "let response = api");
-        emitter.line(2, &format!(".{}(", operation.method));
-        for argument in &invoke_args {
-            emitter.line(3, &format!("{argument},"));
+        let packed = format!(".{}({joined})", operation.method);
+        if fits(2, &packed) {
+            emitter.line(1, "let response = api");
+            emitter.line(2, &packed);
+            emitter.line(2, ".await;");
+        } else {
+            emitter.line(1, "let response = api");
+            emitter.line(2, &format!(".{}(", operation.method));
+            for argument in &invoke_args {
+                emitter.line(3, &format!("{argument},"));
+            }
+            emitter.line(2, ")");
+            emitter.line(2, ".await;");
         }
-        emitter.line(2, ")");
-        emitter.line(2, ".await;");
     }
     // §40: committed-stream operations thread the router's stream-failure
     // hook into their encoder so mid-production failures are observable
@@ -3686,27 +3710,77 @@ fn emit_pairs_parameter(
     let err_literal = rust_string_literal(&format!("{kind} parameter `{name}` is malformed"));
     emitter.line(1, &param_spec_line(parameter));
     let shape = param_shape(parameter);
-    emitter.line(1, "let decoded = match decode_query_shaped(");
-    emitter.line(2, "&spec,");
-    // Query pairs borrow `&str` slices (`&&(str)` after `iter`, where
-    // `str::as_str` is unavailable on stable), so they copy out; cookie
-    // pairs own their `String`s and borrow them back instead.
-    if kind == "query" {
-        emitter.line(2, &format!("{pairs}.iter().copied(),"));
+    // Canonical rustfmt form: single-line `match` head when it fits
+    // `max_width`; when the trailing ` {` overflows, the brace drops to its
+    // own line; otherwise the multi-line call form (with the cookie chain
+    // split per `chain_width`).
+    let pairs_expr = if kind == "query" {
+        format!("{pairs}.iter().copied()")
     } else {
-        emitter.line(
-            2,
-            &format!("{pairs}.iter().map(|(key, value)| (key.as_str(), value.as_str())),"),
+        format!("{pairs}.iter().map(|(key, value)| (key.as_str(), value.as_str()))")
+    };
+    let head_braced = format!(
+        "let decoded = match decode_query_shaped(&spec, {pairs_expr}, ParamShape::{shape}) {{"
+    );
+    if fits(1, &head_braced) {
+        emitter.line(1, &head_braced);
+    } else {
+        let head = format!(
+            "let decoded = match decode_query_shaped(&spec, {pairs_expr}, ParamShape::{shape})"
         );
+        if fits(1, &head) {
+            emitter.line(1, &head);
+            emitter.line(1, "{");
+        } else {
+            emitter.line(1, "let decoded = match decode_query_shaped(");
+            emitter.line(2, "&spec,");
+            // Query pairs borrow `&str` slices (`&&(str)` after `iter`, where
+            // `str::as_str` is unavailable on stable), so they copy out; cookie
+            // pairs own their `String`s and borrow them back instead.
+            if kind == "query" {
+                emitter.line(2, &format!("{pairs}.iter().copied(),"));
+            } else {
+                // `chain_width` (60): the cookie iterator chain exceeds it,
+                // so rustfmt splits the chain across lines.
+                let single =
+                    format!("{pairs}.iter().map(|(key, value)| (key.as_str(), value.as_str())),");
+                if fits(2, &single)
+                    && format!("{pairs}.iter().map(|(key, value)| (key.as_str(), value.as_str()))")
+                        .len()
+                        <= 60
+                {
+                    emitter.line(2, &single);
+                } else {
+                    emitter.line(2, pairs);
+                    emitter.line(3, ".iter()");
+                    emitter.line(3, ".map(|(key, value)| (key.as_str(), value.as_str())),");
+                }
+            }
+            emitter.line(2, &format!("ParamShape::{shape},"));
+            emitter.line(1, ") {");
+        }
     }
-    emitter.line(2, &format!("ParamShape::{shape},"));
-    emitter.line(1, ") {");
     emitter.line(2, "Ok(value) => value,");
     emitter.line(2, "Err(_) => {");
-    emitter.line(3, &format!("return Err(invalid_parameter({err_literal}));"));
+    emit_invalid_param_return(emitter, 3, &err_literal);
     emitter.line(2, "}");
     emitter.line(1, "};");
     emit_typed_binding(emitter, parameter, "decoded");
+}
+
+/// Emits `return Err(invalid_parameter(…));` in rustfmt's canonical form:
+/// single line when both `max_width` and `fn_call_width` (60) allow, else the
+/// broken call form.
+fn emit_invalid_param_return(emitter: &mut Emitter, indent: usize, err_literal: &str) {
+    let inline = format!("return Err(invalid_parameter({err_literal}));");
+    let inner = format!("invalid_parameter({err_literal})");
+    if fits(indent, &inline) && inner.len() <= 60 {
+        emitter.line(indent, &inline);
+    } else {
+        emitter.line(indent, "return Err(invalid_parameter(");
+        emitter.line(indent + 1, &format!("{err_literal},"));
+        emitter.line(indent, "));");
+    }
 }
 
 fn emit_header_parameter(emitter: &mut Emitter, parameter: &PlannedParameter) {
@@ -7213,13 +7287,12 @@ fn emit_parse_string_enum(emitter: &mut Emitter) {
     emitter.line(0, ") -> Result<T, ProtocolRejection> {");
     emitter.line(
         1,
-        "serde_json::from_value::<T>(serde_json::Value::String(text)).map_err(|_| {",
+        "serde_json::from_value::<T>(serde_json::Value::String(text))",
     );
     emitter.line(
         2,
-        "invalid_parameter(format!(\"parameter `{parameter}` has an invalid value\"))",
+        ".map_err(|_| invalid_parameter(format!(\"parameter `{parameter}` has an invalid value\")))",
     );
-    emitter.line(1, "})");
     emitter.line(0, "}");
 }
 
@@ -7236,12 +7309,11 @@ fn emit_parse_int_enum(emitter: &mut Emitter) {
     emitter.line(1, "parameter: &'static str,");
     emitter.line(1, "text: &str,");
     emitter.line(0, ") -> Result<T, ProtocolRejection> {");
-    emitter.line(1, "serde_json::from_str::<T>(text).map_err(|_| {");
+    emitter.line(1, "serde_json::from_str::<T>(text)");
     emitter.line(
         2,
-        "invalid_parameter(format!(\"parameter `{parameter}` has an invalid value\"))",
+        ".map_err(|_| invalid_parameter(format!(\"parameter `{parameter}` has an invalid value\")))",
     );
-    emitter.line(1, "})");
     emitter.line(0, "}");
 }
 

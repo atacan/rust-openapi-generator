@@ -326,7 +326,10 @@ pub enum SecuritySchemeIr {
         bearer_format: Option<String>,
     },
     /// `type: apiKey` with its wire location and name.
-    ApiKey { location: ApiKeyLocation, name: String },
+    ApiKey {
+        location: ApiKeyLocation,
+        name: String,
+    },
     /// `type: oauth2`, `type: openIdConnect`, `type: mutualTLS`, unknown
     /// `type` values, or entries that failed to parse: the raw `type` string
     /// when one was declared (`None` when absent).
