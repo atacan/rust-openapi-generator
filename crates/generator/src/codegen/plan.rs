@@ -36,7 +36,7 @@ use crate::ir::document::{
     ContentEntryIr, HttpMethod, MediaClass, ParameterIr, ParameterLocation, ParameterStyle,
     RangeClass, ResponseEntryIr, ResponseStatusKey, ServerIr,
 };
-use crate::ir::schema::{SchemaId, SchemaKind};
+use crate::ir::schema::{EnumValues, SchemaId, SchemaKind};
 use crate::normalize::composition::ResolvedKind;
 use crate::normalize::naming::{self, NameStyle};
 use crate::normalize::{NormalizedDocument, NormalizedOperation};
@@ -471,10 +471,28 @@ pub struct PlannedParameter {
     pub explode: bool,
     pub allow_reserved: bool,
     pub required: bool,
-    /// Base scalar type (`String`/`i32`/`i64`/`f64`/`bool`) or `Vec<T>`;
-    /// optionality rides on [`PlannedParameter::required`] and is applied by
-    /// each emitter.
+    /// Base scalar type (`String`/`i32`/`i64`/`f64`/`bool`), a named models.rs
+    /// enum (issue #10), or `Vec<T>` of either; optionality rides on
+    /// [`PlannedParameter::required`] and is applied by each emitter.
     pub rust_type: String,
+    /// Wire shape of the named enum in [`PlannedParameter::rust_type`] (or of
+    /// its element type for `Vec<…>`); `None` for inline primitives. Emitters
+    /// use this to pick the serde-based conversion instead of the `FromStr`
+    /// path: string enums travel as their `serde` rename text, integer enums
+    /// as their discriminant text.
+    pub enum_kind: Option<ParamEnumKind>,
+}
+
+/// Wire shape of a named-model enum usable as a parameter (issue #10): only
+/// homogeneous string/integer enums are scalars on the wire. Mixed-type
+/// enums, `oneOf`/`anyOf` choice enums, and anonymous (inline) enums have no
+/// named models.rs type and stay unsupported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamEnumKind {
+    /// `serde` rename text on the wire; converts via the JSON string shape.
+    String,
+    /// Discriminant on the wire; converts via the JSON number shape.
+    Integer,
 }
 
 /// Plans the whole document with default configuration.
@@ -1718,17 +1736,28 @@ fn plan_parameters(
             naming::sanitize_joined(&format!("{base}_{counter}"))
         };
         let schema = doc.resolve_alias(parameter.schema);
-        let kind = effective_kind(doc, schema);
-        let rust_type = match param_rust_type(doc, &kind) {
-            Some(rust_type) => rust_type,
+        let (rust_type, enum_kind) = match param_rust_type(doc, schema) {
+            Some(representation) => representation,
             None => {
+                // Anonymous (inline) enums reach the same stop-and-report
+                // path as composites, but the fix is different: a NAMED
+                // component enum is a supported scalar parameter (issue
+                // #10), so point at the promotion instead of at widening.
+                let detail = match effective_kind(doc, schema).as_ref() {
+                    SchemaKind::Enum { .. } => {
+                        "an inline enum has no models.rs type to reference; \
+                         promote it to components/schemas and `$ref` it"
+                    }
+                    _ => {
+                        "use a scalar or array of scalars"
+                    }
+                };
                 diags.error(
                     location.key("parameters").key(parameter.name.clone()),
                     "client_param_schema_unsupported",
                     format!(
                         "parameter `{}` needs an object/enum/composite schema, which \
-                         Phase 1 parameter serialization cannot represent; use a \
-                         scalar or array of scalars",
+                         Phase 1 parameter serialization cannot represent; {detail}",
                         parameter.name
                     ),
                 );
@@ -1744,6 +1773,7 @@ fn plan_parameters(
             allow_reserved: parameter.allow_reserved,
             required: parameter.required,
             rust_type,
+            enum_kind,
         });
     }
     planned
@@ -1779,20 +1809,41 @@ fn validate_style_location(
 }
 
 /// Phase 1 parameter representation: string→String, integer int32→i32 else
-/// i64, number→f64, boolean→bool, array<T>→Vec<T>.
-fn param_rust_type(doc: &NormalizedDocument, kind: &SchemaKind) -> Option<String> {
-    Some(match kind {
-        SchemaKind::Boolean => "bool".to_owned(),
-        SchemaKind::Integer { format } => match format.as_deref() {
-            Some("int32") => "i32".to_owned(),
-            _ => "i64".to_owned(),
-        },
-        SchemaKind::Number { .. } => "f64".to_owned(),
-        SchemaKind::String_ { .. } => "String".to_owned(),
+/// i64, number→f64, boolean→bool, array<T>→Vec<T>. Named string/integer
+/// enums (issue #10) map to their models.rs type with the wire shape carried
+/// alongside; anonymous enums have no named type and stay unsupported, as do
+/// mixed-type enums and every composite/choice shape.
+fn param_rust_type(
+    doc: &NormalizedDocument,
+    effective: SchemaId,
+) -> Option<(String, Option<ParamEnumKind>)> {
+    let kind = effective_kind(doc, effective);
+    Some(match kind.as_ref() {
+        SchemaKind::Boolean => ("bool".to_owned(), None),
+        SchemaKind::Integer { format } => (
+            match format.as_deref() {
+                Some("int32") => "i32".to_owned(),
+                _ => "i64".to_owned(),
+            },
+            None,
+        ),
+        SchemaKind::Number { .. } => ("f64".to_owned(), None),
+        SchemaKind::String_ { .. } => ("String".to_owned(), None),
         SchemaKind::Array { items } => {
             let element = doc.resolve_alias(items.target);
-            let inner = param_rust_type(doc, effective_kind(doc, element).as_ref())?;
-            format!("Vec<{inner}>")
+            let (inner, enum_kind) = param_rust_type(doc, element)?;
+            (format!("Vec<{inner}>"), enum_kind)
+        }
+        SchemaKind::Enum { values } => {
+            let enum_kind = match values {
+                EnumValues::Strings(_) => ParamEnumKind::String,
+                EnumValues::Integers(_) => ParamEnumKind::Integer,
+                EnumValues::MixedFallback(_) => return None,
+            };
+            // The models.rs identity of the referenced component; an inline
+            // (anonymous) enum has no named type to reference.
+            let name = component_name(doc, effective)?;
+            (name, Some(enum_kind))
         }
         _ => return None,
     })

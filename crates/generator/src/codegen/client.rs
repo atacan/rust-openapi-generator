@@ -340,6 +340,11 @@ impl Flags {
                 ParameterLocation::Header => self.needs_header_value = true,
                 ParameterLocation::Cookie => self.needs_cookie_value = true,
             }
+            // Named-enum parameters (issue #10) reference their models.rs
+            // type; inline scalars resolve to nothing here.
+            if parameter.enum_kind.is_some() {
+                self.note_payload(&parameter.rust_type, false);
+            }
         }
     }
 
@@ -5594,6 +5599,17 @@ fn param_style_name(style: ParameterStyle) -> &'static str {
 /// Runtime conversion of one typed parameter into a `ParamValue` for the §6
 /// encoders; `value_expr` is the local binding or `raw` inside option matches.
 fn param_value_expr(parameter: &PlannedParameter, value_expr: String) -> String {
+    // Named-model enum (issue #10): convert through the serde JSON shape so
+    // the wire carries the `serde` rename (string enums) or discriminant
+    // (integer enums) without duplicating the mapping in generated code.
+    if parameter.enum_kind.is_some() {
+        if parameter.rust_type.starts_with("Vec<") {
+            return format!(
+                "ParamValue::Array({value_expr}.iter().map(ParamValue::from_serde).collect::<Vec<_>>())"
+            );
+        }
+        return format!("ParamValue::from_serde(&{value_expr})");
+    }
     match parameter.rust_type.as_str() {
         "String" => format!("ParamValue::Text({value_expr}.to_owned())"),
         "i32" => format!("ParamValue::Int(i64::from({value_expr}))"),

@@ -51,8 +51,8 @@ use crate::normalize::NormalizedDocument;
 use super::codecs::{default_registry as codec_registry, helper_prefix};
 use super::config::{CodegenConfig, TypesLocation};
 use super::plan::{
-    PlannedApi, PlannedBodyValidation, PlannedContent, PlannedMultipartFieldKind, PlannedOperation,
-    PlannedParameter, PlannedStatus, StreamFraming,
+    ParamEnumKind, PlannedApi, PlannedBodyValidation, PlannedContent, PlannedMultipartFieldKind,
+    PlannedOperation, PlannedParameter, PlannedStatus, StreamFraming,
 };
 use super::Emitter;
 
@@ -571,6 +571,8 @@ struct Flags {
     needs_expect_texts: bool,
     needs_parse_scalar: bool,
     needs_parse_texts: bool,
+    needs_parse_string_enum: bool,
+    needs_parse_int_enum: bool,
     needs_split_query_pairs: bool,
     needs_path_decode_simple: bool,
     needs_path_decode_shaped: bool,
@@ -837,6 +839,21 @@ impl Flags {
                 self.needs_cookie_decode = true;
                 self.needs_headers_extractor = true;
             }
+        }
+        // Named-enum parameters (issue #10) decode text through serde instead
+        // of `FromStr`, and reference their models.rs type.
+        if let Some(enum_kind) = parameter.enum_kind {
+            self.note_payload(&parameter.rust_type, false);
+            if parameter.rust_type.starts_with("Vec<") {
+                self.needs_expect_texts = true;
+            } else {
+                self.needs_expect_text = true;
+            }
+            match enum_kind {
+                ParamEnumKind::String => self.needs_parse_string_enum = true,
+                ParamEnumKind::Integer => self.needs_parse_int_enum = true,
+            }
+            return;
         }
         if parameter.rust_type.starts_with("Vec<") {
             self.needs_expect_texts = true;
@@ -3557,10 +3574,11 @@ fn emit_handler_parameters(emitter: &mut Emitter, operation: &PlannedOperation) 
         emit_path_parameter(emitter, parameter);
     }
     if !query_parameters.is_empty() {
-        emitter.line(1, "let query_pairs = match __query {");
-        emitter.line(2, "Some(query) => split_query_pairs(&query),");
-        emitter.line(2, "None => Vec::new(),");
-        emitter.line(1, "};");
+        // The pair slices borrow the raw query text, so the owned `String`
+        // stays alive in its own binding (a `match` arm temporary would drop
+        // while borrowed).
+        emitter.line(1, "let __query_string = __query.unwrap_or_default();");
+        emitter.line(1, "let query_pairs = split_query_pairs(&__query_string);");
         for parameter in &query_parameters {
             emit_pairs_parameter(emitter, parameter, "query", "query_pairs");
         }
@@ -3666,10 +3684,17 @@ fn emit_pairs_parameter(
     let shape = param_shape(parameter);
     emitter.line(1, "let decoded = match decode_query_shaped(");
     emitter.line(2, "&spec,");
-    emitter.line(
-        2,
-        &format!("{pairs}.iter().map(|(key, value)| (key.as_str(), value.as_str())),"),
-    );
+    // Query pairs borrow `&str` slices (`&&(str)` after `iter`, where
+    // `str::as_str` is unavailable on stable), so they copy out; cookie
+    // pairs own their `String`s and borrow them back instead.
+    if kind == "query" {
+        emitter.line(2, &format!("{pairs}.iter().copied(),"));
+    } else {
+        emitter.line(
+            2,
+            &format!("{pairs}.iter().map(|(key, value)| (key.as_str(), value.as_str())),"),
+        );
+    }
     emitter.line(2, &format!("ParamShape::{shape},"));
     emitter.line(1, ") {");
     emitter.line(2, "Ok(value) => value,");
@@ -3747,6 +3772,15 @@ fn emit_typed_binding(emitter: &mut Emitter, parameter: &PlannedParameter, decod
     let name = &parameter.rust_name;
     let rust_type = parameter.rust_type.as_str();
     let wire_lit = rust_string_literal(&parameter.wire_name);
+
+    // Named-model enum (issue #10): decoded text converts through serde so
+    // the wire rename (string enums) or discriminant (integer enums) maps
+    // back onto the models.rs variant; unknown values reject with 400 like
+    // every other malformed parameter (§39 row 1).
+    if let Some(enum_kind) = parameter.enum_kind {
+        emit_enum_binding(emitter, parameter, decoded, enum_kind);
+        return;
+    }
 
     if parameter.required {
         match rust_type {
@@ -3838,6 +3872,124 @@ fn emit_typed_binding(emitter: &mut Emitter, parameter: &PlannedParameter, decod
             emitter.line(2, "None => None,");
             emitter.line(1, "};");
         }
+    }
+}
+
+/// Binds one named-enum parameter (issue #10): decoded text converts through
+/// serde — the JSON string shape for string enums (the `serde` rename), the
+/// JSON number shape for integer enums (the discriminant) — so the wire maps
+/// back onto the models.rs variant. Unknown values reject with 400 (§39
+/// row 1), matching every other malformed parameter.
+fn emit_enum_binding(
+    emitter: &mut Emitter,
+    parameter: &PlannedParameter,
+    decoded: &str,
+    enum_kind: ParamEnumKind,
+) {
+    let name = &parameter.rust_name;
+    let rust_type = parameter.rust_type.as_str();
+    let wire_lit = rust_string_literal(&parameter.wire_name);
+    let is_array = rust_type.starts_with("Vec<");
+    let element = if is_array {
+        leaf_type(rust_type)
+    } else {
+        rust_type
+    };
+
+    if parameter.required && !is_array {
+        let text = format!("expect_text({decoded}, {wire_lit})?");
+        let decode = enum_scalar_decode(element, enum_kind, &text, &wire_lit);
+        emit_wrapped(emitter, &format!("let {name}: {element} = {decode};"));
+        return;
+    }
+    if parameter.required {
+        emitter.line(1, &format!("let {name}: {rust_type} = {{"));
+        emitter.line(
+            2,
+            &format!("let texts = expect_texts({decoded}, {wire_lit})?;"),
+        );
+        emitter.line(2, "let mut items = Vec::with_capacity(texts.len());");
+        emitter.line(2, "for text in texts {");
+        let decode = enum_push_decode(element, enum_kind, &wire_lit);
+        emitter.line(3, &decode);
+        emitter.line(2, "}");
+        emitter.line(1, "items");
+        emitter.line(1, "};");
+        return;
+    }
+
+    emitter.line(
+        1,
+        &format!("let {name}: Option<{rust_type}> = match {decoded} {{"),
+    );
+    emitter.line(2, "Some(value) => {");
+    if is_array {
+        emitter.line(
+            3,
+            &format!("let texts = expect_texts(Some(value), {wire_lit})?;"),
+        );
+        emitter.line(3, "let mut items = Vec::with_capacity(texts.len());");
+        emitter.line(3, "for text in texts {");
+        let decode = enum_push_decode(element, enum_kind, &wire_lit);
+        emitter.line(4, &decode);
+        emitter.line(3, "}");
+        emitter.line(3, "Some(items)");
+    } else {
+        emitter.line(
+            3,
+            &format!("let text = expect_text(Some(value), {wire_lit})?;"),
+        );
+        let decode = enum_scalar_decode(element, enum_kind, "text", &wire_lit);
+        emitter.line(3, &format!("Some({decode})"));
+    }
+    emitter.line(2, "}");
+    emitter.line(2, "None => None,");
+    emitter.line(1, "};");
+}
+
+/// Serde decode of one enum parameter text: `text_expr` names an owned
+/// `String` holding the decoded wire text, converted through the
+/// [`parse_string_enum`] helper (string enums, the `serde` rename) or the
+/// [`parse_int_enum`] helper (integer enums, the discriminant).
+fn enum_scalar_decode(
+    element: &str,
+    enum_kind: ParamEnumKind,
+    text_expr: &str,
+    wire_lit: &str,
+) -> String {
+    match enum_kind {
+        ParamEnumKind::String => {
+            format!("parse_string_enum::<{element}>({wire_lit}, {text_expr})?")
+        }
+        ParamEnumKind::Integer => {
+            format!("parse_int_enum::<{element}>({wire_lit}, &{text_expr})?")
+        }
+    }
+}
+
+/// `items.push(…)` line decoding one enum array element (owned `text` from
+/// the `for text in texts` loop).
+fn enum_push_decode(element: &str, enum_kind: ParamEnumKind, wire_lit: &str) -> String {
+    match enum_kind {
+        ParamEnumKind::String => {
+            format!("items.push(parse_string_enum::<{element}>({wire_lit}, text)?);")
+        }
+        ParamEnumKind::Integer => {
+            format!("items.push(parse_int_enum::<{element}>({wire_lit}, &text)?);")
+        }
+    }
+}
+
+/// Emits a `let` binding, breaking the right-hand side onto its own line when
+/// it would overflow the rustfmt width (mirrors the existing scalar arms).
+fn emit_wrapped(emitter: &mut Emitter, inline: &str) {
+    if fits(1, inline) {
+        emitter.line(1, inline);
+    } else if let Some((binding, rhs)) = inline.split_once(" = ") {
+        emitter.line(1, &format!("{binding} ="));
+        emitter.line(2, rhs);
+    } else {
+        emitter.line(1, inline);
     }
 }
 
@@ -6113,6 +6265,14 @@ fn emit_module_helpers(emitter: &mut Emitter, flags: &Flags) {
         emitter.blank();
         emit_parse_texts(emitter);
     }
+    if flags.needs_parse_string_enum {
+        emitter.blank();
+        emit_parse_string_enum(emitter);
+    }
+    if flags.needs_parse_int_enum {
+        emitter.blank();
+        emit_parse_int_enum(emitter);
+    }
     if flags.needs_split_query_pairs {
         emitter.blank();
         emit_split_query_pairs(emitter);
@@ -7031,6 +7191,53 @@ fn emit_parse_texts(emitter: &mut Emitter) {
     emitter.line(2, "out.push(parse_param_text::<T>(parameter, text)?);");
     emitter.line(1, "}");
     emitter.line(1, "Ok(out)");
+    emitter.line(0, "}");
+}
+
+fn emit_parse_string_enum(emitter: &mut Emitter) {
+    emitter.docs(
+        0,
+        &[
+            "Decodes one string-enum parameter text through serde, so the wire".to_owned(),
+            "`serde` rename maps back onto the models.rs variant (§38".to_owned(),
+            "pre-handler validation; unknown values → 400).".to_owned(),
+        ],
+    );
+    emitter.line(0, "fn parse_string_enum<T: serde::de::DeserializeOwned>(");
+    emitter.line(1, "parameter: &'static str,");
+    emitter.line(1, "text: String,");
+    emitter.line(0, ") -> Result<T, ProtocolRejection> {");
+    emitter.line(
+        1,
+        "serde_json::from_value::<T>(serde_json::Value::String(text)).map_err(|_| {",
+    );
+    emitter.line(
+        2,
+        "invalid_parameter(format!(\"parameter `{parameter}` has an invalid value\"))",
+    );
+    emitter.line(1, "})");
+    emitter.line(0, "}");
+}
+
+fn emit_parse_int_enum(emitter: &mut Emitter) {
+    emitter.docs(
+        0,
+        &[
+            "Decodes one integer-enum parameter text through serde, so the wire".to_owned(),
+            "discriminant maps back onto the models.rs variant (§38".to_owned(),
+            "pre-handler validation; unknown values → 400).".to_owned(),
+        ],
+    );
+    emitter.line(0, "fn parse_int_enum<T: serde::de::DeserializeOwned>(");
+    emitter.line(1, "parameter: &'static str,");
+    emitter.line(1, "text: &str,");
+    emitter.line(0, ") -> Result<T, ProtocolRejection> {");
+    emitter.line(1, "serde_json::from_str::<T>(text).map_err(|_| {");
+    emitter.line(
+        2,
+        "invalid_parameter(format!(\"parameter `{parameter}` has an invalid value\"))",
+    );
+    emitter.line(1, "})");
     emitter.line(0, "}");
 }
 

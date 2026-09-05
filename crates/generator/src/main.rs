@@ -316,9 +316,18 @@ fn run_generation(options: &GenerationOptions<'_>) -> Result<(), std::process::E
     {
         return Err(fail(doc.diagnostics.clone()));
     }
-    let plan = match plan_api(&doc) {
-        Ok(plan) => plan,
-        Err(diagnostics) => return Err(fail(diagnostics)),
+    // Parameter/body planning is only needed for transport artifacts. A
+    // parameter-serialization limitation must not block `--generate types`,
+    // whose modules depend on the normalized document alone (issue #10).
+    let needs_plan =
+        options.selection.contains(&Artifact::Client) || options.selection.contains(&Artifact::Server);
+    let plan = if needs_plan {
+        match plan_api(&doc) {
+            Ok(plan) => Some(plan),
+            Err(diagnostics) => return Err(fail(diagnostics)),
+        }
+    } else {
+        None
     };
 
     // The shared-types location: sibling modules when generated in THIS
@@ -334,7 +343,7 @@ fn run_generation(options: &GenerationOptions<'_>) -> Result<(), std::process::E
         None => CodegenConfig::default(),
     };
 
-    write_artifacts(options.out_dir, &options.selection, &doc, &plan, &config)?;
+    write_artifacts(options.out_dir, &options.selection, &doc, plan.as_ref(), &config)?;
     Ok(())
 }
 
@@ -345,7 +354,7 @@ fn write_artifacts(
     out_dir: &Path,
     selection: &BTreeSet<Artifact>,
     doc: &NormalizedDocument,
-    plan: &PlannedApi,
+    plan: Option<&PlannedApi>,
     config: &CodegenConfig,
 ) -> Result<(), std::process::ExitCode> {
     let mut outputs: Vec<(&str, String)> = Vec::new();
@@ -358,9 +367,11 @@ fn write_artifacts(
                 outputs.push(("views.rs", generate_views(doc)));
             }
             Artifact::Client => {
+                let plan = plan.expect("client generation plans unconditionally");
                 outputs.push(("client.rs", generate_client_with_config(doc, plan, config)));
             }
             Artifact::Server => {
+                let plan = plan.expect("server generation plans unconditionally");
                 outputs.push(("server.rs", generate_server_with_config(doc, plan, config)));
             }
         }

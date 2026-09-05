@@ -142,6 +142,51 @@ impl From<bool> for ParamValue {
     }
 }
 
+impl ParamValue {
+    /// Converts a JSON value into the parameter value with the matching
+    /// scalar shape (companion §6): strings → [`ParamValue::Text`], integers
+    /// → [`ParamValue::Int`], other numbers → [`ParamValue::Float`], booleans
+    /// → [`ParamValue::Bool`], arrays → [`ParamValue::Array`] (recursively).
+    /// Objects and null have no parameter shape and render through
+    /// [`ParamValue::to_text`] semantics as text.
+    #[must_use]
+    pub fn from_json(value: serde_json::Value) -> Self {
+        match value {
+            serde_json::Value::String(text) => Self::Text(text),
+            serde_json::Value::Number(number) => {
+                if let Some(int) = number.as_i64() {
+                    Self::Int(int)
+                } else if let Some(float) = number.as_f64() {
+                    Self::Float(float)
+                } else {
+                    Self::Text(number.to_string())
+                }
+            }
+            serde_json::Value::Bool(flag) => Self::Bool(flag),
+            serde_json::Value::Array(items) => {
+                Self::Array(items.into_iter().map(Self::from_json).collect())
+            }
+            other => Self::Text(other.to_string()),
+        }
+    }
+
+    /// Converts a serializable scalar into its parameter value through its
+    /// serde JSON shape. Generated clients use this for named-model enum
+    /// parameters (issue #10): a string enum serializes to its `serde`
+    /// rename, an integer enum to its discriminant — so the wire carries
+    /// exactly the documented value without duplicating the rename table in
+    /// generated code. Serialization of generated scalar enums is
+    /// infallible; an unexpected serialization failure surfaces as JSON
+    /// null text rather than panicking.
+    #[must_use]
+    pub fn from_serde<T: serde::Serialize + ?Sized>(value: &T) -> Self {
+        match serde_json::to_value(value) {
+            Ok(json) => Self::from_json(json),
+            Err(_) => Self::Text("null".to_owned()),
+        }
+    }
+}
+
 /// OAS parameter location (`in`, companion §6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParamLocation {
@@ -1358,6 +1403,55 @@ mod tests {
         // Composite leaves flatten through to_text (module docs).
         let nested = ParamValue::Array(vec![array(&["x"]), ParamValue::Int(3)]);
         assert_eq!(nested.to_text(), "x,3");
+    }
+
+    #[test]
+    fn from_json_maps_json_shapes_to_param_values() {
+        assert_eq!(
+            ParamValue::from_json(serde_json::json!("blue")),
+            text("blue")
+        );
+        assert_eq!(
+            ParamValue::from_json(serde_json::json!(20)),
+            ParamValue::Int(20)
+        );
+        assert_eq!(
+            ParamValue::from_json(serde_json::json!(1.5)),
+            ParamValue::Float(1.5)
+        );
+        assert_eq!(
+            ParamValue::from_json(serde_json::json!(true)),
+            ParamValue::Bool(true)
+        );
+        assert_eq!(
+            ParamValue::from_json(serde_json::json!(["a", 1])),
+            ParamValue::Array(vec![text("a"), ParamValue::Int(1)])
+        );
+        // Shapes without a parameter form degrade to text, never panic.
+        assert_eq!(
+            ParamValue::from_json(serde_json::Value::Null),
+            text("null")
+        );
+    }
+
+    #[test]
+    fn from_serde_carries_serde_renames_and_discriminants() {
+        // String enums travel as their serde rename (issue #10 wire shape).
+        #[derive(serde::Serialize)]
+        enum Format {
+            #[serde(rename = "text")]
+            Text,
+            #[serde(rename = "json")]
+            Json,
+        }
+        assert_eq!(ParamValue::from_serde(&Format::Json), text("json"));
+        // Integer enums travel as their discriminant.
+        #[derive(serde::Serialize)]
+        #[serde(transparent)]
+        struct PageSize(i64);
+        assert_eq!(ParamValue::from_serde(&PageSize(20)), ParamValue::Int(20));
+        // Plain scalars pass through unchanged.
+        assert_eq!(ParamValue::from_serde("hi"), text("hi"));
     }
 
     #[test]
