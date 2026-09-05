@@ -85,8 +85,9 @@ pub fn generate_client_with_config(
 }
 
 /// Names already taken in the module scope: every assigned schema type
-/// (including `<Type>Fallback` shapes) and every response enum. Generated
-/// nested names never collide with them after suffixing.
+/// (including `<Type>Fallback` shapes), every response enum, and every issue
+/// #11 synthetic body type (imported from `super::models`). Generated nested
+/// names never collide with them after suffixing.
 fn reserved_names(doc: &NormalizedDocument) -> BTreeSet<String> {
     let mut used: BTreeSet<String> = BTreeSet::new();
     for schema in doc.schemas.values() {
@@ -95,6 +96,9 @@ fn reserved_names(doc: &NormalizedDocument) -> BTreeSet<String> {
     }
     for (_, enum_name) in &doc.names.response_enums {
         used.insert(enum_name.clone());
+    }
+    for body_name in doc.names.synthetic_body_types.values() {
+        used.insert(body_name.clone());
     }
     used
 }

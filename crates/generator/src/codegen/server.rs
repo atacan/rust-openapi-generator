@@ -191,7 +191,8 @@ pub fn generate_server_with_config(
 // ----------------------------------------------------------------------
 
 /// Names already taken in the module scope: assigned schema types (including
-/// `<Type>Fallback` shapes), every response/request enum, the API trait name,
+/// `<Type>Fallback` shapes), every response/request enum, every issue #11
+/// synthetic body type (imported from `super::models`), the API trait name,
 /// and the shared checked-constructor error. Generated nested names never
 /// collide after numeric suffixing (companion §10).
 fn reserved_names(
@@ -206,6 +207,9 @@ fn reserved_names(
     }
     for (_, enum_name) in &doc.names.response_enums {
         used.insert(enum_name.clone());
+    }
+    for body_name in doc.names.synthetic_body_types.values() {
+        used.insert(body_name.clone());
     }
     for operation in &plan.operations {
         if let Some(enum_name) = &operation.request_body_enum_name {

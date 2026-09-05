@@ -1350,3 +1350,65 @@ fn issue_09_operation_response_schema_collision_suffixes_the_enum() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ----------------------------------------------------------------------
+// Issue #11 — inline anonymous composite bodies synthesize operation-based
+// names (R5, server side)
+// ----------------------------------------------------------------------
+
+/// Server half of issue #11: the same R5 document must plan without
+/// `client_anonymous_json_schema` diagnostics, with the trait signature and
+/// the request decoder referencing the synthesized `CreateItemRequestBody`
+/// from `super::models`.
+#[test]
+fn issue_11_inline_request_body_synthesizes_operation_based_name() {
+    let dir = std::env::temp_dir().join(format!("o2r-issue-11-srv-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let r5 = [
+        "openapi: 3.0.0",
+        "info: { title: R5, version: \"1.0.0\" }",
+        "servers: [{ url: \"https://example.test/v1\" }]",
+        "paths:",
+        "  /items:",
+        "    post:",
+        "      operationId: createItem",
+        "      requestBody:",
+        "        required: true",
+        "        content:",
+        "          application/json:",
+        "            schema:",
+        "              type: object",
+        "              required: [name]",
+        "              properties:",
+        "                name: { type: string }",
+        "      responses:",
+        "        \"201\": { description: ok, content: { application/json: { schema: { type: string } } } }",
+        "",
+    ]
+    .join("\n");
+    std::fs::write(dir.join("r5.yaml"), r5).expect("write R5 fixture");
+    let ir = load_document("r5.yaml", &dir, &LoadConfig::default())
+        .unwrap_or_else(|diags| panic!("R5 must load: {diags:?}"));
+    let doc = normalize_with_config(ir, &NormalizeConfig::default())
+        .unwrap_or_else(|diags| panic!("R5 must normalize: {diags:?}"));
+    let plan = plan_api(&doc).unwrap_or_else(|diags| panic!("R5 must plan: {diags:?}"));
+    let models = generate_models(&doc);
+    assert!(
+        models.contains("pub struct CreateItemRequestBody {"),
+        "the synthesized body is defined in models.rs:\n{models}"
+    );
+    let output = generate_server(&doc, &plan);
+    assert!(
+        output.contains("use super::models::CreateItemRequestBody;"),
+        "\n{output}"
+    );
+    assert!(
+        output.contains("async fn create_item(&self, body: CreateItemRequestBody) -> CreateItemResponse;"),
+        "\n{output}"
+    );
+    assert!(
+        output.contains("let value: CreateItemRequestBody = decode_json_body(&bytes)?;"),
+        "\n{output}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

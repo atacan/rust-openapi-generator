@@ -94,10 +94,15 @@ pub fn generate_models(doc: &NormalizedDocument) -> String {
 
     // Type names are global to the module: seed with every assigned name so a
     // generated nested name can never collide with a later component (and
-    // vice versa).
+    // vice versa). Issue #11 synthetic body types are reserved BEFORE any
+    // definition is built, so nested anonymous names suffix around the
+    // operation-based body names rather than stealing them.
     let mut used_names: BTreeSet<String> = named.values().cloned().collect();
     for (_, enum_name) in &doc.names.response_enums {
         used_names.insert(enum_name.clone());
+    }
+    for body_name in doc.names.synthetic_body_types.values() {
+        used_names.insert(body_name.clone());
     }
 
     let mut generator = Generator {
@@ -114,6 +119,24 @@ pub fn generate_models(doc: &NormalizedDocument) -> String {
     };
     for (schema, name) in components.iter().zip(names.iter()) {
         generator.define_component(schema, name);
+    }
+    // Issue #11: top-level definitions for anonymous composite bodies under
+    // their operation-based names (`<Op>RequestBody` / `<Op>ResponseBody`).
+    // Nested anonymous schemas discovered inside are named `<Body><Field>`
+    // through the same mechanism as component children. Arena ids are
+    // site-unique, so a body id can never already sit in the anonymous table
+    // (the guard is defensive only).
+    let bodies: Vec<(u32, String)> = doc
+        .names
+        .synthetic_body_types
+        .iter()
+        .map(|(id, name)| (*id, name.clone()))
+        .collect();
+    for (id, name) in &bodies {
+        if generator.anonymous.contains_key(id) {
+            continue;
+        }
+        generator.define_node(SchemaId(*id), name);
     }
 
     render(&generator)

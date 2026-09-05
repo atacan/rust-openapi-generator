@@ -1061,7 +1061,14 @@ fn validation_for(
             analysis
                 .has_validator(effective)
                 .then_some(PlannedBodyValidation::Inherent)
-                .filter(|_| component_name(doc, effective).is_some())
+                // Named components validate through their models.rs inherent
+                // method; issue #11 synthetic bodies do the same through
+                // their generated `<Op>RequestBody`/`<Op>ResponseBody`
+                // definition.
+                .filter(|_| {
+                    component_name(doc, effective).is_some()
+                        || doc.names.synthetic_body_types.contains_key(&effective.0)
+                })
         }
         None => None,
     }
@@ -1270,7 +1277,9 @@ fn plan_multipart_field_kind(
                         "client_anonymous_json_schema",
                         "multipart JSON parts reference JSON bodies through \
                          super::models; this composite schema has no models.rs \
-                         type. Promote it to components/schemas",
+                         type. Promote it to components/schemas under a \
+                         collision-safe name (a bare `<Operation>Response` \
+                         collides with the generated response enum, issue #9)",
                     );
                     return None;
                 }
@@ -1298,7 +1307,9 @@ fn plan_multipart_field_kind(
                             "multipart JSON parts reference JSON bodies \
                              through super::models; an anonymous composite \
                              schema has no models.rs type. Promote it to \
-                             components/schemas",
+                             components/schemas under a collision-safe name \
+                             (a bare `<Operation>Response` collides with the \
+                             generated response enum, issue #9)",
                         );
                         return None;
                     }
@@ -1521,12 +1532,21 @@ fn named_or_diagnostic(
     if let Some(name) = component_name(doc, effective) {
         return name;
     }
+    // Issue #11: anonymous composite bodies carry operation-based models.rs
+    // names (`<Op>RequestBody` / `<Op>ResponseBody`); reference the
+    // synthesized definition instead of stopping.
+    if let Some(name) = doc.names.synthetic_body_types.get(&effective.0) {
+        return name.clone();
+    }
     diags.error(
         location.clone(),
         "client_anonymous_json_schema",
         "Phase 1 client/server codecs reference JSON bodies through \
          super::models; an anonymous composite schema has no models.rs type. \
-         Promote it to components/schemas or inline only scalars/arrays",
+         Promote it to components/schemas under a collision-safe name such \
+         as `<Type>RequestBody` or `<Type>ResponseBody` (a bare \
+         `<Operation>Response` collides with the generated response enum, \
+         issue #9) or inline only scalars/arrays",
     );
     "serde_json::Value".to_owned()
 }

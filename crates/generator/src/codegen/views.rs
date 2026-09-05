@@ -144,7 +144,8 @@ fn build_generator(doc: &NormalizedDocument) -> Generator<'_> {
 
     // Seed the module-wide namespace exactly like models.rs (fallback newtype
     // suffix included) so generated anonymous names can never collide across
-    // the two modules' public items.
+    // the two modules' public items. Issue #11 synthetic body types ride
+    // along for the same reason.
     let mut named: BTreeMap<u32, String> = BTreeMap::new();
     let mut used_names: BTreeSet<String> = BTreeSet::new();
     for schema in &components {
@@ -154,6 +155,9 @@ fn build_generator(doc: &NormalizedDocument) -> Generator<'_> {
     }
     for (_, enum_name) in &doc.names.response_enums {
         used_names.insert(enum_name.clone());
+    }
+    for body_name in doc.names.synthetic_body_types.values() {
+        used_names.insert(body_name.clone());
     }
 
     let mut generator = Generator {

@@ -1090,3 +1090,80 @@ fn issue_09_operation_response_schema_collision_suffixes_the_enum() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ----------------------------------------------------------------------
+// Issue #11 — inline anonymous composite bodies synthesize operation-based
+// names (R5)
+// ----------------------------------------------------------------------
+
+/// R5 reproducer for issue #11: an inline object request body must plan
+/// without `client_anonymous_json_schema` diagnostics by synthesizing
+/// `CreateItemRequestBody` in models.rs. The scalar inline response stays an
+/// inline `String`, and the response enum keeps the bare `CreateItemResponse`
+/// name (the issue #9 reservation: synthesized response bodies would use the
+/// `ResponseBody` suffix, never the bare enum name).
+#[test]
+fn issue_11_inline_request_body_synthesizes_operation_based_name() {
+    let dir = std::env::temp_dir().join(format!("o2r-issue-11-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let r5 = [
+        "openapi: 3.0.0",
+        "info: { title: R5, version: \"1.0.0\" }",
+        "servers: [{ url: \"https://example.test/v1\" }]",
+        "paths:",
+        "  /items:",
+        "    post:",
+        "      operationId: createItem",
+        "      requestBody:",
+        "        required: true",
+        "        content:",
+        "          application/json:",
+        "            schema:",
+        "              type: object",
+        "              required: [name]",
+        "              properties:",
+        "                name: { type: string }",
+        "      responses:",
+        "        \"201\": { description: ok, content: { application/json: { schema: { type: string } } } }",
+        "",
+    ]
+    .join("\n");
+    std::fs::write(dir.join("r5.yaml"), r5).expect("write R5 fixture");
+    let ir = load_document("r5.yaml", &dir, &LoadConfig::default())
+        .unwrap_or_else(|diags| panic!("R5 must load: {diags:?}"));
+    let doc = normalize_with_config(ir, &NormalizeConfig::default())
+        .unwrap_or_else(|diags| panic!("R5 must normalize: {diags:?}"));
+    assert_eq!(
+        doc.names.synthetic_body_types.len(),
+        1,
+        "only the composite request body synthesizes a name: {:?}",
+        doc.names.synthetic_body_types
+    );
+    let plan = plan_api(&doc).unwrap_or_else(|diags| panic!("R5 must plan: {diags:?}"));
+    assert_eq!(
+        plan.operations[0].request_contents[0].model_expr,
+        "CreateItemRequestBody",
+    );
+
+    let models = generate_models(&doc);
+    assert!(
+        struct_block(&models, "CreateItemRequestBody").contains("pub name: String,"),
+        "the synthesized body is defined in models.rs:\n{models}"
+    );
+
+    let client = generate_client(&doc, &plan);
+    assert!(
+        client.contains("use super::models::CreateItemRequestBody;"),
+        "the synthesized body is imported under its operation-based name:\n{client}"
+    );
+    assert!(
+        client.contains("&CreateItemRequestBody"),
+        "the request method carries the synthesized body type:\n{client}"
+    );
+    assert!(
+        enum_block(&client, "CreateItemResponse").contains("Created201(String),"),
+        "the scalar inline response stays inline and the response enum keeps \
+         its bare name (issue #9 reservation):\n{client}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -15,15 +15,15 @@ pub mod composition;
 pub mod dump;
 pub mod naming;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::diagnostics::{Diagnostic, DocumentPath, Severity};
 use crate::ir::document::{
-    HttpMethod, IrDocument, ParameterIr, RequestBodyIr, ResponseEntryIr, ServerIr,
+    HttpMethod, IrDocument, MediaClass, ParameterIr, RequestBodyIr, ResponseEntryIr, ServerIr,
 };
-use crate::ir::schema::{SchemaArena, SchemaId};
+use crate::ir::schema::{SchemaArena, SchemaId, SchemaKind};
 
-use composition::{ResolvedNode, Resolver};
+use composition::{ResolvedKind, ResolvedNode, Resolver};
 use naming::NameAssignments;
 
 /// Fallback policy for unprovable `oneOf` disjointness (companion §4.2;
@@ -279,6 +279,14 @@ pub fn normalize_with_config(
     }
     diagnostics.shrink_to_fit();
 
+    // Issue #11: name anonymous composite bodies after their operations so
+    // inline request/response schemas need no source rewrite. Computed here
+    // (single source of truth) so models.rs, plan.rs, and the emitters agree
+    // byte-for-byte on the assigned names.
+    let mut names = names;
+    names.synthetic_body_types =
+        synthetic_body_types(&operations, &schemas, &names, &doc.arena, &resolutions);
+
     Ok(NormalizedDocument {
         version: doc.version,
         raw_version: doc.raw_version,
@@ -516,6 +524,143 @@ fn unique_joined(base: &str, used: &mut std::collections::BTreeSet<String>) -> S
     }
     used.insert(candidate.clone());
     candidate
+}
+
+/// Issue #11: assigns `models.rs` names to anonymous composite
+/// request/response bodies (JSON family + URL-encoded forms), keyed by the
+/// alias-chased arena id. The hint is operation-based —
+/// `<Op>RequestBody` / `<Op>ResponseBody` where `<Op>` is the PascalCase
+/// operation stem — with companion §10 numeric suffixes ordered by document
+/// position (request before responses, declaration order inside each list),
+/// the same rule `models.rs` applies to nested anonymous collisions.
+///
+/// Issue #9 reservation still holds: response bodies take the `ResponseBody`
+/// suffix, never the bare `<Operation>Response` owned by the generated
+/// response enum. Multi-media request enums (`<Stem>RequestBody`, planned in
+/// `codegen::plan`) live in the client/server scope alongside the models
+/// imports, so their names are reserved up front and a synthesized body type
+/// takes the suffix instead of duplicating the enum.
+fn synthetic_body_types(
+    operations: &[NormalizedOperation],
+    schemas: &BTreeMap<String, NormalizedSchema>,
+    names: &NameAssignments,
+    arena: &SchemaArena,
+    resolutions: &[ResolvedNode],
+) -> BTreeMap<u32, String> {
+    let mut used: BTreeSet<String> = BTreeSet::new();
+    for assigned in names.schema_types.values() {
+        used.insert(assigned.clone());
+        used.insert(format!("{assigned}Fallback"));
+    }
+    for (_, enum_name) in &names.response_enums {
+        used.insert(enum_name.clone());
+    }
+    for operation in operations {
+        if operation
+            .request_body
+            .as_ref()
+            .is_some_and(|body| body.content.len() >= 2)
+        {
+            // Mirrors `codegen::plan`'s enum derivation exactly: the stem is
+            // the (possibly suffixed) response enum minus a trailing
+            // `Response`, so a suffixed enum reserves its own suffixed body
+            // name here too.
+            let stem = operation.response_enum.trim_end_matches("Response");
+            used.insert(format!("{stem}RequestBody"));
+        }
+    }
+    let named_source = |effective: SchemaId| schemas.values().any(|s| s.source == effective);
+    let mut out: BTreeMap<u32, String> = BTreeMap::new();
+    for operation in operations {
+        let pascal = naming::ident(&operation.method_name, naming::NameStyle::Pascal);
+        if let Some(body) = &operation.request_body {
+            for content in &body.content {
+                assign_body_type(
+                    content.schema,
+                    content.media_class,
+                    &format!("{pascal}RequestBody"),
+                    &mut out,
+                    &mut used,
+                    named_source,
+                    arena,
+                    resolutions,
+                );
+            }
+        }
+        for response in &operation.responses {
+            for content in &response.content {
+                assign_body_type(
+                    content.schema,
+                    content.media_class,
+                    &format!("{pascal}ResponseBody"),
+                    &mut out,
+                    &mut used,
+                    named_source,
+                    arena,
+                    resolutions,
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Registers one body schema's synthesized name when it is an anonymous
+/// composite that `codegen::plan` cannot reference inline: a nominal object
+/// or enum shape (merged, closed-choice, intersected-enum, or plain) with no
+/// named component behind it. Scalars, arrays, tuples, free-form maps, raw
+/// JSON, and every streaming/binary class stay inline-expressible and keep
+/// no entry. Already-mapped ids are shared, never renamed.
+#[allow(clippy::too_many_arguments)]
+fn assign_body_type(
+    schema: SchemaId,
+    media_class: MediaClass,
+    hint: &str,
+    out: &mut BTreeMap<u32, String>,
+    used: &mut BTreeSet<String>,
+    named_source: impl Fn(SchemaId) -> bool,
+    arena: &SchemaArena,
+    resolutions: &[ResolvedNode],
+) {
+    if !matches!(
+        media_class,
+        MediaClass::JsonFamily | MediaClass::UrlEncodedForm
+    ) {
+        return;
+    }
+    let mut effective = schema;
+    let mut guard = 0_usize;
+    while let Some(node) = resolutions.get(effective.0 as usize) {
+        guard += 1;
+        if guard > resolutions.len() {
+            break;
+        }
+        match node.kind {
+            ResolvedKind::Alias(target) => effective = target,
+            _ => break,
+        }
+    }
+    if out.contains_key(&effective.0) || named_source(effective) {
+        return;
+    }
+    let Some(node) = resolutions.get(effective.0 as usize) else {
+        return;
+    };
+    let needs_nominal = match &node.kind {
+        ResolvedKind::MergedObject(_) | ResolvedKind::ClosedEnum(_) => true,
+        ResolvedKind::IntersectedScalar(scalar) => {
+            matches!(scalar.base_kind, SchemaKind::Enum { .. })
+        }
+        ResolvedKind::Plain => matches!(
+            arena.get(effective).kind,
+            SchemaKind::Object { .. } | SchemaKind::Enum { .. }
+        ),
+        ResolvedKind::RawValueFallback(_) | ResolvedKind::Alias(_) => false,
+    };
+    if needs_nominal {
+        let assigned = unique_joined(hint, used);
+        out.insert(effective.0, assigned);
+    }
 }
 
 impl NormalizedOperation {
