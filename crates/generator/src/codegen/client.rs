@@ -3042,8 +3042,7 @@ fn emit_query_extend_body(emitter: &mut Emitter, indent: usize, wire_name: &str)
             wire_name
         ),
     );
-    emitter.line(indent, "))),");
-    emitter.line(indent, "?,");
+    emitter.line(indent, ")))?,");
 }
 
 fn emit_param_spec(emitter: &mut Emitter, indent: usize, parameter: &PlannedParameter) {
