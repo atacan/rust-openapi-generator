@@ -596,7 +596,7 @@ fn emit_header(
          do not edit by hand."
             .to_owned(),
     );
-    emitter.docs(0, &docs);
+    emitter.inner_docs(0, &docs);
 
     let mut imports: Vec<String> = Vec::new();
     if !flags.model_types.is_empty() {

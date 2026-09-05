@@ -940,7 +940,7 @@ fn emit_header(emitter: &mut Emitter, doc: &NormalizedDocument, flags: &Flags) {
           39); do not edit by hand."
             .to_owned(),
     );
-    emitter.docs(0, &docs);
+    emitter.inner_docs(0, &docs);
 }
 
 fn emit_imports(emitter: &mut Emitter, flags: &Flags, types: &TypesLocation) {

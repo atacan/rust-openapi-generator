@@ -24,10 +24,10 @@ other.
 | Path | Contents |
 | --- | --- |
 | `openapi.yaml` | The two-operation document. |
-| `models/` | Shared schema surface crate (`large-upload-models`, `--generate types`). `generated/models.rs` + `generated/views.rs` are committed generator output; `src/lib.rs` include!s them unmodified. Deps: serde ONLY — the generated models need nothing else here. |
+| `models/` | Shared schema surface crate (`large-upload-models`, `--generate types`). `generated/models.rs` + `generated/views.rs` are committed generator output; `src/lib.rs` wires them in unmodified as `#[path]` file modules. Deps: serde ONLY — the generated models need nothing else here. |
 | `memmon/mod.rs` | NOT a crate: one copy of demo-only memory instrumentation (sampled RSS + getrusage high-water mark, progress printers), included by BOTH transport crates via `#[path = "../../memmon/mod.rs"]` (relative to each crate's `src/lib.rs`) without coupling them to each other. No axum, no reqwest; its three dependencies live in both host manifests. |
-| `client/` | Client crate (`large-upload-client`, `--generate client --types-path large_upload_models`). `generated/client.rs` is committed generator output; `src/lib.rs` include!s it; `src/transfers.rs` synthesizes + streams the WAV file; `src/main.rs` the binary; `tests/smoke.rs` the ignored real-TCP smoke tests. |
-| `server/` | Server crate (`large-upload-server`, `--generate server --types-path large_upload_models`). `generated/server.rs` is committed generator output; `src/lib.rs` include!s it; `src/app.rs` is the demo application (`LargeUploadApp`, disk + proxy modes); `src/main.rs` the binary. |
+| `client/` | Client crate (`large-upload-client`, `--generate client --types-path large_upload_models`). `generated/client.rs` is committed generator output; `src/lib.rs` wires it in unmodified as a `#[path]` file module; `src/transfers.rs` synthesizes + streams the WAV file; `src/main.rs` the binary; `tests/smoke.rs` the ignored real-TCP smoke tests. |
+| `server/` | Server crate (`large-upload-server`, `--generate server --types-path large_upload_models`). `generated/server.rs` is committed generator output; `src/lib.rs` wires it in unmodified as a `#[path]` file module; `src/app.rs` is the demo application (`LargeUploadApp`, disk + proxy modes); `src/main.rs` the binary. |
 
 Normal generation writes NO Cargo.toml: every manifest above is
 hand-maintained, carrying only the dependencies its generated code genuinely

@@ -8,7 +8,7 @@ into THREE crates — shared models, Reqwest client, Axum server — so every
 schema type has exactly ONE Rust identity and neither transport compiles the
 other (proven automatically by `scripts/check-transport-isolation.sh` in
 CI). The generated artifacts are COMMITTED under each crate's `generated/`
-directory and compiled UNMODIFIED via `include!`. Two runnable demos prove
+directory and compiled UNMODIFIED as `#[path]` file modules. Two runnable demos prove
 end-to-end behavior over real TCP: an Axum server implementing all 22
 operations and a reqwest client driving a full-operation sweep against it.
 
@@ -17,9 +17,9 @@ operations and a reqwest client driving a full-operation sweep against it.
 | Path | Contents |
 | --- | --- |
 | `openapi.yaml` | The 22-operation union document; its header comment indexes feature classes a–m. |
-| `models/` | Shared schema surface crate (`kitchen-sink-models`, `--generate types`). `generated/models.rs` + `generated/views.rs` are committed generator output; `src/lib.rs` include!s them unmodified. Deps: serde, serde_json, dependency-light `openapi-support` — no transport stacks. |
-| `client/` | Client crate (`kitchen-sink-client`, `--generate client --types-path kitchen_sink_models`). `generated/client.rs` is committed generator output; `src/lib.rs` include!s it; `src/sweep.rs` is the hand-written sweep driver; `src/main.rs` the binary; `tests/smoke.rs` the ignored real-TCP smoke test. Deps: models crate + reqwest-side support features ONLY. |
-| `server/` | Server crate (`kitchen-sink-server`, `--generate server --types-path kitchen_sink_models`). `generated/server.rs` is committed generator output; `src/lib.rs` include!s it; `src/app.rs` is the hand-written demo application (`KitchenSinkApp`) + router wiring; `src/main.rs` the binary. Deps: models crate + axum-side support features ONLY (reqwest absent). |
+| `models/` | Shared schema surface crate (`kitchen-sink-models`, `--generate types`). `generated/models.rs` + `generated/views.rs` are committed generator output; `src/lib.rs` wires them in unmodified as `#[path]` file modules. Deps: serde, serde_json, dependency-light `openapi-support` — no transport stacks. |
+| `client/` | Client crate (`kitchen-sink-client`, `--generate client --types-path kitchen_sink_models`). `generated/client.rs` is committed generator output; `src/lib.rs` wires it in unmodified as a `#[path]` file module; `src/sweep.rs` is the hand-written sweep driver; `src/main.rs` the binary; `tests/smoke.rs` the ignored real-TCP smoke test. Deps: models crate + reqwest-side support features ONLY. |
+| `server/` | Server crate (`kitchen-sink-server`, `--generate server --types-path kitchen_sink_models`). `generated/server.rs` is committed generator output; `src/lib.rs` wires it in unmodified as a `#[path]` file module; `src/app.rs` is the hand-written demo application (`KitchenSinkApp`) + router wiring; `src/main.rs` the binary. Deps: models crate + axum-side support features ONLY (reqwest absent). |
 | `models/tests/determinism.rs` | Regeneration contract for ALL committed artifacts across the three crates (see below). |
 
 Normal generation writes NO Cargo.toml: every manifest above is

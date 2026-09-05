@@ -1,11 +1,11 @@
-/// Reqwest client generated from the OpenAPI document (main spec §8 Output A).
-///
-/// Bounded JSON/form bodies (§34), streaming raw payloads (§32), exhaustive documented-status enums (§2.4), typed documented response headers (§15), redirects off by default (§30.1), and the authoritative `ClientError` (§36). Recorded decision for multi-content statuses WITH documented headers: the typed fields hoist onto the status VARIANT beside the content enum. The source document declares OpenAPI 3.1.0.
-///
-/// Servers (companion §8): operation-level `servers` override path-level, path-level overrides root-level, and within each effective array the first entry is that operation's default base. Every DISTINCT effective default URL becomes its own stored base: `base_url` is the primary (the first operation's first effective server); further bases live in `base_url_<key>` fields whose keys are documented under `ClientBuilder::secondary_base_url`. Recorded decision: an explicit `base_url` replaces ONLY the primary base; each other base needs its own `secondary_base_url` override, so a relative secondary still requires an absolute value there (D-impl-relative-servers).
-///
-/// Directional views (companion §5, main spec §50 test 50): request payloads of view-carrying components take `<M>Write` (readOnly fields structurally absent from the wire) and response payloads take `<M>Read` (writeOnly fields absent); components without markers keep their shared models. Decode ignores unrecognized keys unless a schema declares `additionalProperties: false`, so off-direction fields sent out of place never fail decode.
-/// Generated deterministically byte-for-byte (main spec §50 test 39); do not edit by hand.
+//! Reqwest client generated from the OpenAPI document (main spec §8 Output A).
+//!
+//! Bounded JSON/form bodies (§34), streaming raw payloads (§32), exhaustive documented-status enums (§2.4), typed documented response headers (§15), redirects off by default (§30.1), and the authoritative `ClientError` (§36). Recorded decision for multi-content statuses WITH documented headers: the typed fields hoist onto the status VARIANT beside the content enum. The source document declares OpenAPI 3.1.0.
+//!
+//! Servers (companion §8): operation-level `servers` override path-level, path-level overrides root-level, and within each effective array the first entry is that operation's default base. Every DISTINCT effective default URL becomes its own stored base: `base_url` is the primary (the first operation's first effective server); further bases live in `base_url_<key>` fields whose keys are documented under `ClientBuilder::secondary_base_url`. Recorded decision: an explicit `base_url` replaces ONLY the primary base; each other base needs its own `secondary_base_url` override, so a relative secondary still requires an absolute value there (D-impl-relative-servers).
+//!
+//! Directional views (companion §5, main spec §50 test 50): request payloads of view-carrying components take `<M>Write` (readOnly fields structurally absent from the wire) and response payloads take `<M>Read` (writeOnly fields absent); components without markers keep their shared models. Decode ignores unrecognized keys unless a schema declares `additionalProperties: false`, so off-direction fields sent out of place never fail decode.
+//! Generated deterministically byte-for-byte (main spec §50 test 39); do not edit by hand.
 use super::views::{
     AccountRead, AccountWrite, AuditEntryRead, SyncedRecordRead, SyncedRecordWrite,
 };

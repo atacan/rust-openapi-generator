@@ -1523,7 +1523,7 @@ fn emit_crate_docs(emitter: &mut Emitter) {
         "39); do not edit by hand.",
     ];
     let owned: Vec<String> = docs.iter().map(|line| (*line).to_owned()).collect();
-    emitter.docs(0, &owned);
+    emitter.inner_docs(0, &owned);
 }
 
 fn emit_block(emitter: &mut Emitter, block: &Block) {

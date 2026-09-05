@@ -1,9 +1,9 @@
-/// Axum server generated from the OpenAPI document (main spec §8 Output B).
-///
-/// Mode A traits (§37), bounded JSON/form bodies (§34; axum's Form extractor is never used — routes self-decode after the §28 Content-Type dispatch), streaming raw payloads (§32), typed documented response headers (§15: IntoResponse converts stored domain values through the well-defined internal error path of §48, firing the encode hook and emitting the fixed empty 500 on failure), pre-handler protocol rejections outside the documented enums (§39), identity-only inbound content coding (§30.4), and the §28 Content-Type dispatch state machine. Recorded decision for multi-content statuses WITH documented headers: the typed fields hoist onto the status VARIANT beside the content enum. The source document declares OpenAPI 3.1.0.
-///
-/// Directional views (companion §5, main spec §50 test 50): request bodies decode into `<M>Write` (required write-only fields are mandatory there; required read-only fields are structurally absent and surplus keys are ignored unless a schema declares `additionalProperties: false`), response payloads carry `<M>Read` (write-only fields never reach the wire), and decoded request views run `validate_request()` before the handler. Recorded trait contract: when `<M>Write` reconstructs the shared model losslessly the router converts before invoking the trait; otherwise the trait takes the view itself.
-/// Generated deterministically byte-for-byte (main spec §50 test 39); do not edit by hand.
+//! Axum server generated from the OpenAPI document (main spec §8 Output B).
+//!
+//! Mode A traits (§37), bounded JSON/form bodies (§34; axum's Form extractor is never used — routes self-decode after the §28 Content-Type dispatch), streaming raw payloads (§32), typed documented response headers (§15: IntoResponse converts stored domain values through the well-defined internal error path of §48, firing the encode hook and emitting the fixed empty 500 on failure), pre-handler protocol rejections outside the documented enums (§39), identity-only inbound content coding (§30.4), and the §28 Content-Type dispatch state machine. Recorded decision for multi-content statuses WITH documented headers: the typed fields hoist onto the status VARIANT beside the content enum. The source document declares OpenAPI 3.1.0.
+//!
+//! Directional views (companion §5, main spec §50 test 50): request bodies decode into `<M>Write` (required write-only fields are mandatory there; required read-only fields are structurally absent and surplus keys are ignored unless a schema declares `additionalProperties: false`), response payloads carry `<M>Read` (write-only fields never reach the wire), and decoded request views run `validate_request()` before the handler. Recorded trait contract: when `<M>Write` reconstructs the shared model losslessly the router converts before invoking the trait; otherwise the trait takes the view itself.
+//! Generated deterministically byte-for-byte (main spec §50 test 39); do not edit by hand.
 use super::models::Account;
 use super::views::{
     AccountRead, AccountWrite, AuditEntryRead, SyncedRecordRead, SyncedRecordWrite,

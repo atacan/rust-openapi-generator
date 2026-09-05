@@ -24,7 +24,9 @@ use crate::normalize::composition::{
 use crate::normalize::naming::{self, NameStyle};
 use crate::normalize::{NormalizedDocument, NormalizedSchema};
 
-use super::validation::{analyze, enforceable_with, Analysis, ScalarParamKind};
+use super::validation::{
+    analyze, enforceable_with, is_recognized_format, Analysis, ScalarParamKind,
+};
 use super::Emitter;
 
 /// Cell attribute for required + nullable properties (companion §2.1 row 2):
@@ -411,11 +413,11 @@ fn float_literal(value: f64) -> String {
 }
 
 /// The v1 recognized formats; unknown names stay metadata-only (documented).
+/// Delegates to the shared [`is_recognized_format`] verdict so emission and
+/// the validation analysis use the same predicate (issue #8).
 fn known_format(format: Option<&str>) -> Option<&str> {
-    match format? {
-        "date-time" | "date" | "time" | "email" | "hostname" | "uri" | "uuid" => {
-            Some(format.unwrap())
-        }
+    match format {
+        Some(name) if is_recognized_format(Some(name)) => Some(name),
         _ => None,
     }
 }
@@ -1147,7 +1149,9 @@ impl<'a> ValidationStatements<'a> {
         level: usize,
     ) -> Vec<String> {
         // Normalize the receiver: helpers take method-call form
-        // (`self.f.len()`), the item loop borrows explicitly (`&self.f`).
+        // (`self.f.len()`), the item loop borrows via `.iter()` so both
+        // direct (`self.f`, behind `&self`) and already-borrowed (`value`,
+        // bound as `&Vec<T>`) receivers iterate as `&T` without `&&Vec<T>`.
         let base = accessor.strip_prefix('&').unwrap_or(accessor);
         let mut lines = Vec::new();
         if validation.min_items.is_some() || validation.max_items.is_some() {
@@ -1209,7 +1213,7 @@ impl<'a> ValidationStatements<'a> {
         // details label elements `<field>[*]`.
         let item_label = field.map(|field| format!("{field}[*]"));
         let item_lines = self.element_item_lines(element, item_label.as_deref(), level + 1);
-        let loop_head = format!("for item in &{base} {{");
+        let loop_head = format!("for item in {base}.iter() {{");
         if !item_lines.is_empty() {
             lines.push(format!("{}{loop_head}", "    ".repeat(level)));
             lines.extend(item_lines);
@@ -1807,7 +1811,7 @@ fn emit_crate_docs(emitter: &mut Emitter) {
         "by hand.",
     ];
     let owned: Vec<String> = docs.iter().map(|line| (*line).to_owned()).collect();
-    emitter.docs(0, &owned);
+    emitter.inner_docs(0, &owned);
 }
 
 fn emit_def(emitter: &mut Emitter, def: &Def) {
