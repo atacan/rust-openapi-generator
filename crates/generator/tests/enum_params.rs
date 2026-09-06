@@ -8,6 +8,7 @@
 //! snapshot harnesses keep their committed fixture sets untouched.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use openapi_to_rust_generator::codegen::client::generate_client;
 use openapi_to_rust_generator::codegen::models::generate_models;
@@ -71,7 +72,18 @@ components:
 "##;
 
 fn normalize_spec() -> NormalizedDocument {
-    let dir = std::env::temp_dir().join(format!("o2r-enum-params-{}", std::process::id()));
+    // Unique scratch dir per invocation (pid + atomic counter, mirroring the
+    // repo's convention in cli_selection/example_regeneration). The previous
+    // pid-only path (`o2r-enum-params-{pid}`) was shared by all 5 tests in
+    // this binary, which run on parallel threads under one pid: one test's
+    // `remove_dir_all` deleted the spec out from under another test
+    // (`root_unreadable`), and concurrent `write` truncations let a reader
+    // observe an empty file (`version_unsupported: document root must be a
+    // mapping`).
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir =
+        std::env::temp_dir().join(format!("o2r-enum-params-{}-{id}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let name = "spec.yaml".to_owned();
     std::fs::write(dir.join(&name), SPEC).expect("write inline spec");
@@ -220,8 +232,12 @@ fn generated_enum_param_code_is_rustfmt_clean() {
         ("server.rs", generate_server(&doc, &plan)),
         ("models.rs", generate_models(&doc)),
     ] {
-        let dir =
-            std::env::temp_dir().join(format!("o2r-enum-params-fmt-{}-{name}", std::process::id()));
+        static FMT_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let fmt_id = FMT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "o2r-enum-params-fmt-{}-{fmt_id}-{name}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let source = dir.join(name);
         std::fs::write(&source, &generated).expect("write generated module");
