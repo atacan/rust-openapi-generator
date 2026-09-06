@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.2.0 — 2026-09-06
+
 ### Prebuilt releases and Homebrew distribution
 
 - The generator's `[[bin]]` is renamed from `openapi-to-rust` to

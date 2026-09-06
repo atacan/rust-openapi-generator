@@ -65,11 +65,11 @@ const FUTURES_CORE_REQ: &str = "0.3";
 const FUTURES_UTIL_REQ: &str = "0.3";
 const ASYNC_TRAIT_REQ: &str = "0.1";
 const HYPER_REQ: &str = "1";
-/// Generated crates start at 0.1.0; regeneration is expected to overwrite.
-const PACKAGE_VERSION: &str = "0.1.0";
+/// Generated crates start at 0.2.0; regeneration is expected to overwrite.
+const PACKAGE_VERSION: &str = "0.2.0";
 /// Banner identity of THIS generator release (matches
 /// [`EmbeddedToolchain::CURRENT::support_crate_version`]'s line).
-const GENERATOR_VERSION: &str = "0.1";
+const GENERATOR_VERSION: &str = "0.2";
 
 /// Fallback package name when the document declares no usable `info.title`.
 pub const FALLBACK_PACKAGE_NAME: &str = "generated-api";
