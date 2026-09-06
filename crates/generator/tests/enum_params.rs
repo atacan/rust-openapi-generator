@@ -82,8 +82,7 @@ fn normalize_spec() -> NormalizedDocument {
     // mapping`).
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir =
-        std::env::temp_dir().join(format!("o2r-enum-params-{}-{id}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("o2r-enum-params-{}-{id}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let name = "spec.yaml".to_owned();
     std::fs::write(dir.join(&name), SPEC).expect("write inline spec");
