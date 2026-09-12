@@ -144,3 +144,19 @@ stays honest as the generator evolves.
 All output is deterministic: repeated generation of the same document yields
 byte-identical files, argument order cannot affect bytes, and the default
 all-in-one mode remains byte-compatible with earlier releases.
+
+## Releasing
+
+From a clean, up-to-date `main` branch, make a stable release with one command:
+
+```bash
+scripts/release.sh patch  # 0.3.0 → 0.3.1
+scripts/release.sh minor  # 0.3.0 → 0.4.0
+```
+
+The command derives the next version, adds commit subjects since the preceding
+release to `CHANGELOG.md`, updates the package and lockfile versions, then runs
+formatting, the full Clippy feature matrix, and the complete workspace tests.
+Only if every check passes does it commit, tag, and push; the pushed tag
+publishes release binaries and updates the Homebrew formula directly on its
+tap's `main` branch.
