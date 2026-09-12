@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.3.1 — 2026-09-12
+
+### Changes
+
+- chore: automate patch and minor releases
+
 ## v0.3.0 — 2026-09-12
 
 ### Generator behavior
