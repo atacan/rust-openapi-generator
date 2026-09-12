@@ -1424,12 +1424,8 @@ fn plan_multipart_spec(
     // body name when the top-level object itself is synthetic. `None` keeps
     // the legacy stop-and-report for anonymous composites (no models.rs
     // definition exists to reference).
-    let parent_type: Option<String> = component_name(doc, effective).or_else(|| {
-        doc.names
-            .synthetic_body_types
-            .get(&effective.0)
-            .cloned()
-    });
+    let parent_type: Option<String> = component_name(doc, effective)
+        .or_else(|| doc.names.synthetic_body_types.get(&effective.0).cloned());
     let mut fields = Vec::with_capacity(properties.len());
     for property in &properties {
         let base = naming::ident(&property.wire_name, NameStyle::Snake);
@@ -1546,9 +1542,9 @@ fn plan_multipart_field_kind(
         Some(scope.synthesize(effective, hint))
     };
     let mut anonymous_or_error = |effective: SchemaId,
-                              hint: Option<&str>,
-                              location: &DocumentPath,
-                              diags: &mut Diagnostics|
+                                  hint: Option<&str>,
+                                  location: &DocumentPath,
+                                  diags: &mut Diagnostics|
      -> Option<String> {
         if let Some(model) = anonymous_model(effective, hint) {
             return Some(model);
@@ -1595,8 +1591,7 @@ fn plan_multipart_field_kind(
                 None => match other {
                     SchemaKind::Array { items } => {
                         let nested_location = location.clone();
-                        let item_hint: Option<String> =
-                            hint.map(|base| format!("{base}Item"));
+                        let item_hint: Option<String> = hint.map(|base| format!("{base}Item"));
                         let (inner, inner_repeated) = plan_multipart_field_kind(
                             doc,
                             items.target,
