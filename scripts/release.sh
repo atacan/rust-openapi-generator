@@ -110,6 +110,30 @@ git diff -- CHANGELOG.md Cargo.lock crates/generator/Cargo.toml
 git add CHANGELOG.md Cargo.lock crates/generator/Cargo.toml
 git commit -m "chore: prepare ${next_tag} release"
 git push origin main
+
+# Do not create the release tag until the remote branch is proven to contain
+# every release-controlled version update. This protects against a partial or
+# misdirected push and keeps the tag, binary version, lockfile, and changelog
+# tied to the same commit on GitHub.
+git fetch origin main
+remote_generator_version="$(
+  git show origin/main:crates/generator/Cargo.toml |
+    awk -F'"' '/^version = / { print $2; exit }'
+)"
+[[ "$remote_generator_version" == "$next_version" ]] \
+  || fail "origin/main generator version is ${remote_generator_version:-missing}, expected ${next_version}"
+remote_lock_version="$(
+  git show origin/main:Cargo.lock |
+    awk -v package='openapi-to-rust-generator' '
+      $0 == "name = \"" package "\"" { found = 1; next }
+      found && /^version = / { gsub(/\"/, "", $3); print $3; exit }
+    '
+)"
+[[ "$remote_lock_version" == "$next_version" ]] \
+  || fail "origin/main lockfile version is ${remote_lock_version:-missing}, expected ${next_version}"
+git show origin/main:CHANGELOG.md | grep -Fqx "## ${next_tag} — $(date +%F)" \
+  || fail "origin/main changelog has no entry for ${next_tag}"
+
 git tag -a "$next_tag" -m "oapi-to-rust ${next_tag}"
 git push origin "$next_tag"
 
