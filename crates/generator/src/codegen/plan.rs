@@ -1563,10 +1563,8 @@ fn plan_multipart_field_kind(
     let (kind, repeated) = match resolved_kind {
         // Nominal definitions in models.rs.
         ResolvedKind::MergedObject(_) | ResolvedKind::ClosedEnum(_) => {
-            match anonymous_or_error(effective, hint, location, diags) {
-                Some(model) => (wrap_optional(model, nullable), false),
-                None => return None,
-            }
+            let model = anonymous_or_error(effective, hint, location, diags)?;
+            (wrap_optional(model, nullable), false)
         }
         ResolvedKind::IntersectedScalar(scalar) => (
             multipart_scalar_kind(&scalar.base_kind).unwrap_or_else(|| {
@@ -1581,10 +1579,8 @@ fn plan_multipart_field_kind(
         ResolvedKind::Alias(_) => unreachable!("aliases chased by resolve_alias"),
         ResolvedKind::Plain => match doc.arena.get(effective).kind.clone() {
             SchemaKind::Object { .. } | SchemaKind::Enum { .. } => {
-                match anonymous_or_error(effective, hint, location, diags) {
-                    Some(model) => (wrap_optional(model, nullable), false),
-                    None => return None,
-                }
+                let model = anonymous_or_error(effective, hint, location, diags)?;
+                (wrap_optional(model, nullable), false)
             }
             other => match multipart_scalar_kind(&other) {
                 Some(kind) => (kind, false),
