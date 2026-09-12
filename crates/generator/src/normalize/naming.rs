@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Characters that always separate identifier words (companion §10).
-const SEPARATORS: &[char] = &['_', '-', '.', ' ', '$', '/'];
+const SEPARATORS: &[char] = &['_', '-', '.', ' ', '$', '/', '[', ']'];
 
 /// Strict and reserved Rust keywords across editions 2015–2024.
 ///
