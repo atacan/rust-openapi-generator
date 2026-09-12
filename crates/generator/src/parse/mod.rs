@@ -44,8 +44,8 @@ use crate::ir::schema::{
 };
 
 use raw::{
-    as_mapping, detect_version, is_ref_mapping, mapping_get, mapping_has, string_field,
-    stringify_scalar, yaml_to_json,
+    as_mapping, detect_version, excluded_extension_key, is_ref_mapping, mapping_get, mapping_has,
+    string_field, stringify_scalar, value_is_excluded, yaml_to_json,
 };
 use refs::{canonical_pointer_key, display_pointer, split_ref, tokenize_pointer, walk_pointer};
 
@@ -107,6 +107,22 @@ pub struct LoadConfig {
     /// Whether relative external-file references are followed (D-§3: remote
     /// URL references are never fetched).
     pub external_files: bool,
+    /// Additional vendor-extension keys (beyond
+    /// [`EXCLUDED_EXTENSION_ALIASES`]) treated as ignore/internal markers
+    /// when set to boolean `true`. Empty by default.
+    pub extra_ignored_extensions: Vec<String>,
+}
+
+/// Vendor-extension aliases that exclude an OpenAPI object from generated
+/// code when set to boolean `true`. Centralized list backing the
+/// ignore/internal policy; see `raw::EXCLUDED_EXTENSION_KEYS`.
+pub const EXCLUDED_EXTENSION_ALIASES: &[&str] = raw::EXCLUDED_EXTENSION_KEYS;
+
+/// Returns true when `value` is a mapping carrying any configured
+/// ignore/internal extension set to boolean `true`.
+#[must_use]
+pub fn is_excluded(value: &serde_yaml::Value, config: &LoadConfig) -> bool {
+    value_is_excluded(value, &config.extra_ignored_extensions)
 }
 
 impl Default for LoadConfig {
@@ -114,6 +130,7 @@ impl Default for LoadConfig {
         Self {
             max_inline_depth: 64,
             external_files: true,
+            extra_ignored_extensions: Vec::new(),
         }
     }
 }
@@ -428,6 +445,17 @@ impl Loader {
             .intern(SchemaNode::new(SchemaKind::NotSupported { reason }))
     }
 
+    /// Centralized ignore/internal policy: true when `value` carries any
+    /// configured exclusion extension set to boolean `true`.
+    fn is_excluded(&self, value: &Yaml) -> bool {
+        value_is_excluded(value, &self.config.extra_ignored_extensions)
+    }
+
+    /// Name of the matched exclusion extension on `mapping`, if any.
+    fn excluded_key(&self, mapping: &Mapping) -> Option<String> {
+        excluded_extension_key(mapping, &self.config.extra_ignored_extensions)
+    }
+
     // ------------------------------------------------------------------
     // Root opening and file loading
     // ------------------------------------------------------------------
@@ -734,6 +762,28 @@ impl Loader {
                 );
             }
         };
+        // Ignored component schemas are excluded from generated code; a
+        // public reference to one is an explicit error rather than broken
+        // output. Applies equally to 3.0 and 3.1 documents.
+        if let Some(mapping) = as_mapping(&target) {
+            if let Some(matched) = self.excluded_key(mapping) {
+                let schema_label = component_schema_label(&tokens).unwrap_or_else(|| {
+                    format!("`{reference}` (pointer `{}`)", display_pointer(&tokens))
+                });
+                self.note_error(
+                    path.clone(),
+                    "ignored_schema_referenced",
+                    format!(
+                        "references ignored schema {schema_label} (marked `{matched}: true`); \
+                         ignored schemas are excluded from generated code and cannot be \
+                         referenced from the public API surface"
+                    ),
+                );
+                return RefResolution::Fallback(
+                    self.schema_fallback(UnsupportedReason::Other("ignored schema referenced")),
+                );
+            }
+        }
         RefResolution::Target(RefTarget::Ready(self.intern_schema_at(
             &doc_key,
             pointer_key,
@@ -1511,6 +1561,17 @@ impl Loader {
                 // IR exposes a slot (see module documentation for the gap).
                 continue;
             }
+            // Ignore/internal markers are honored by the exclusion policy,
+            // not "ignored siblings": never warn for them here.
+            if raw::EXCLUDED_EXTENSION_KEYS.contains(&key)
+                || self
+                    .config
+                    .extra_ignored_extensions
+                    .iter()
+                    .any(|k| k == key)
+            {
+                continue;
+            }
             ignored.push(key);
         }
         if !ignored.is_empty() {
@@ -2037,11 +2098,21 @@ impl Loader {
                 );
                 return None;
             }
+            // An ignore/internal marker on the referencing Path Item skips
+            // the whole item without following the reference.
+            if self.is_excluded(value) {
+                return None;
+            }
             let mapping = as_mapping(value)?;
             self.note_entity_ref_siblings(mapping, path);
             let reference = string_field(value, "$ref")?.to_owned();
             let target = self.resolve_entity_value(&reference, doc, path)?;
             return self.parse_path_entry(&target, path_template, doc, path, depth + 1);
+        }
+        // Path-level ignore/internal marker: no client methods, server
+        // routes/handlers, or operation models for this item.
+        if self.is_excluded(value) {
+            return None;
         }
         let mapping = as_mapping(value)?;
         let parameters = mapping_get(mapping, "parameters")
@@ -2055,6 +2126,12 @@ impl Loader {
                 continue;
             };
             if let Some(method) = HttpMethod::from_keyword(word) {
+                // Operation-level ignore/internal marker: skip before
+                // parsing so references held only by the ignored operation
+                // never surface as diagnostics.
+                if self.is_excluded(operation_value) {
+                    continue;
+                }
                 let operation = self.parse_operation(operation_value, doc, &path.key(word));
                 operations.push((method, operation));
             } else if !matches!(
@@ -2068,6 +2145,11 @@ impl Loader {
                     format!("unknown path-item key `{word}` ignored"),
                 );
             }
+        }
+        if operations.is_empty() {
+            // Either the item declared no operations or every operation was
+            // excluded: nothing to generate, so drop the entry entirely.
+            return None;
         }
         Some(PathEntry {
             path: path_template.to_owned(),
@@ -2371,6 +2453,12 @@ impl Loader {
                 );
                 continue;
             };
+            // Ignored component schemas produce no Rust types and are
+            // excluded before interning so their contents never enter the
+            // arena. Applies equally to 3.0 and 3.1 documents.
+            if self.is_excluded(definition) {
+                continue;
+            }
             let path = DocumentPath::root()
                 .key("components")
                 .key("schemas")
@@ -2460,6 +2548,16 @@ impl Loader {
 // ----------------------------------------------------------------------
 // Free functions and small helpers
 // ----------------------------------------------------------------------
+
+/// Renders a `#/components/schemas/<Name>` pointer as `` `Name` `` for
+/// ignored-schema diagnostics. Returns `None` for any other pointer shape,
+/// letting callers fall back to the raw `$ref`/pointer rendering.
+fn component_schema_label(tokens: &[String]) -> Option<String> {
+    if tokens.len() == 3 && tokens[0] == "components" && tokens[1] == "schemas" {
+        return Some(format!("`{}`", tokens[2]));
+    }
+    None
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatusKeyError {

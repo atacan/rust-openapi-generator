@@ -101,9 +101,64 @@ pub(crate) fn yaml_to_json(value: &Yaml) -> Result<serde_json::Value, String> {
     })
 }
 
-/// Reads the root `openapi` field and maps it onto a supported release
-/// family. Anything else is an error listing the supported versions
-/// (companion §2).
+/// Vendor extensions that mark an OpenAPI object as internal/ignored and
+/// therefore excluded from generated code.
+///
+/// Centralized policy for the `x-internal`/`x-fern-ignore` feature: every
+/// exclusion check consults this list (plus any caller-supplied extras) so
+/// new aliases are added in one place instead of scattering string matches.
+///
+/// Known aliases:
+/// - `x-internal`: honored by Redocly/Redoc/RapiDoc and `openapi-generator`.
+/// - `x-fern-ignore`: Fern's per-node ignore flag.
+/// - `x-hidden`: honored by several doc UIs/generators as "hide from public surface".
+/// - `x-exclude`: generic exclude marker used by assorted tooling.
+/// - `x-ignore`: generic ignore marker used by assorted tooling.
+///
+/// Only a boolean `true` value excludes; `false`, missing, or non-boolean
+/// values preserve current behavior, and unrelated `x-*` extensions never
+/// exclude.
+pub(crate) const EXCLUDED_EXTENSION_KEYS: &[&str] = &[
+    "x-internal",
+    "x-fern-ignore",
+    "x-hidden",
+    "x-exclude",
+    "x-ignore",
+];
+
+/// Returns the first exclusion extension set to boolean `true` in `mapping`,
+/// consulting [`EXCLUDED_EXTENSION_KEYS`] plus `extra` caller-configured
+/// keys. Returns `None` for false/missing/non-boolean values and for
+/// unrelated vendor extensions.
+#[must_use]
+pub(crate) fn excluded_extension_key(mapping: &Mapping, extra: &[String]) -> Option<String> {
+    for key in EXCLUDED_EXTENSION_KEYS {
+        if mapping
+            .get(Yaml::String((*key).to_owned()))
+            .and_then(Yaml::as_bool)
+            == Some(true)
+        {
+            return Some((*key).to_owned());
+        }
+    }
+    for key in extra {
+        if mapping
+            .get(Yaml::String(key.clone()))
+            .and_then(Yaml::as_bool)
+            == Some(true)
+        {
+            return Some(key.clone());
+        }
+    }
+    None
+}
+
+/// True when the YAML value is a mapping carrying an exclusion extension
+/// set to boolean `true` (see [`excluded_extension_key`]).
+#[must_use]
+pub(crate) fn value_is_excluded(value: &Yaml, extra: &[String]) -> bool {
+    as_mapping(value).is_some_and(|m| excluded_extension_key(m, extra).is_some())
+}
 pub(crate) fn detect_version(root: &Yaml) -> Result<(OpenApiVersion, String), String> {
     let Some(mapping) = root.as_mapping() else {
         return Err("document root must be a mapping".to_owned());
