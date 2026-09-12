@@ -531,6 +531,60 @@ pub enum ParamEnumKind {
     Integer,
 }
 
+/// Collision-safe registry for anonymous multipart JSON part types.
+///
+/// Anonymous object/enum schemas (including array items) nested inside a
+/// NAMED multipart object need nominal `models.rs` types. `models.rs`
+/// generates those as `<Parent><FieldPascal>[Item]` with companion §10
+/// numeric suffixes; the planner must reference the SAME name. This scope
+/// mirrors that naming: seeded with every reserved module name (all
+/// component types plus `<Type>Fallback`, all response enums, all synthetic
+/// body types) and assigning `<hint>` names with numeric suffixes on
+/// collision. Assigned ids are cached so a shared anonymous node reuses its
+/// first name, matching `models.rs` first-encounter reuse.
+struct MultipartScope {
+    used: BTreeSet<String>,
+    assigned: BTreeMap<u32, String>,
+}
+
+impl MultipartScope {
+    fn new(doc: &NormalizedDocument) -> Self {
+        let mut used = BTreeSet::new();
+        for schema in doc.schemas.values() {
+            used.insert(schema.rust_type.clone());
+            used.insert(format!("{}Fallback", schema.rust_type));
+        }
+        for (_, enum_name) in &doc.names.response_enums {
+            used.insert(enum_name.clone());
+        }
+        for body_name in doc.names.synthetic_body_types.values() {
+            used.insert(body_name.clone());
+        }
+        Self {
+            used,
+            assigned: BTreeMap::new(),
+        }
+    }
+
+    /// Returns the cached name for `effective`, or assigns a fresh
+    /// collision-safe name derived from `hint`.
+    fn synthesize(&mut self, effective: SchemaId, hint: &str) -> String {
+        if let Some(name) = self.assigned.get(&effective.0) {
+            return name.clone();
+        }
+        // Mirror `models.rs::unique_in`: sanitize once, then suffix.
+        let sanitized = naming::sanitize_joined(hint);
+        let mut candidate = sanitized.clone();
+        let mut counter = 1_u32;
+        while !self.used.insert(candidate.clone()) {
+            counter += 1;
+            candidate = naming::sanitize_joined(&format!("{sanitized}_{counter}"));
+        }
+        self.assigned.insert(effective.0, candidate.clone());
+        candidate
+    }
+}
+
 /// Plans the whole document with default configuration.
 ///
 /// # Errors
@@ -562,6 +616,7 @@ pub fn plan_api_with_config(
     // renders views.rs (companion §5), so planner and emitter can never
     // disagree on names, losslessness, or validators (main spec §50 test 50).
     let view_bindings = views::view_bindings(doc);
+    let mut multipart_scope = MultipartScope::new(doc);
     let mut operations = Vec::with_capacity(doc.operations.len());
     for operation in &doc.operations {
         operations.push(plan_operation(
@@ -571,6 +626,7 @@ pub fn plan_api_with_config(
             &registry,
             &analysis,
             &view_bindings,
+            &mut multipart_scope,
             &mut diags,
         ));
     }
@@ -732,6 +788,7 @@ fn plan_operation(
     registry: &[Box<dyn MediaCodecPlugin>],
     analysis: &Analysis,
     view_bindings: &BTreeMap<u32, ViewBinding>,
+    multipart_scope: &mut MultipartScope,
     diags: &mut Diagnostics,
 ) -> PlannedOperation {
     let location = operation_location(operation);
@@ -756,6 +813,7 @@ fn plan_operation(
             registry,
             analysis,
             view_bindings,
+            multipart_scope,
         );
         if request_contents.len() >= 2 {
             let stem = operation
@@ -785,6 +843,7 @@ fn plan_operation(
                 registry,
                 analysis,
                 view_bindings,
+                multipart_scope,
             );
             let headers = plan_response_headers(doc, response, &location, diags);
             let status = PlannedStatus {
@@ -994,6 +1053,7 @@ fn plan_contents(
     registry: &[Box<dyn MediaCodecPlugin>],
     analysis: &Analysis,
     view_bindings: &BTreeMap<u32, ViewBinding>,
+    multipart_scope: &mut MultipartScope,
 ) -> Vec<PlannedContent> {
     let mut planned = Vec::with_capacity(contents.len());
     let mut used_variants: BTreeSet<String> = BTreeSet::new();
@@ -1119,7 +1179,8 @@ fn plan_contents(
             }
             MediaClass::PlainText => "String".to_owned(),
             MediaClass::Multipart => {
-                multipart_spec = plan_multipart_spec(doc, entry, location, diags, analysis);
+                multipart_spec =
+                    plan_multipart_spec(doc, entry, location, diags, analysis, multipart_scope);
                 String::new()
             }
             // Binary/RawUnknown/stream classes; each emitter renders its own
@@ -1310,6 +1371,7 @@ fn plan_multipart_spec(
     location: &DocumentPath,
     diags: &mut Diagnostics,
     analysis: &Analysis,
+    scope: &mut MultipartScope,
 ) -> Option<PlannedMultipart> {
     let schema_location = location.key("content").key(entry.media_type.clone());
     let effective = doc.resolve_alias(entry.schema);
@@ -1357,6 +1419,17 @@ fn plan_multipart_spec(
     // rust_name collisions inside one body get numeric suffixes by property
     // declaration order (companion §10 rule).
     let mut used_names: BTreeMap<String, u32> = BTreeMap::new();
+    // Parent hint mirroring `models.rs` (`<Parent><FieldPascal>[Item]`):
+    // the named component behind this multipart object, or the synthesized
+    // body name when the top-level object itself is synthetic. `None` keeps
+    // the legacy stop-and-report for anonymous composites (no models.rs
+    // definition exists to reference).
+    let parent_type: Option<String> = component_name(doc, effective).or_else(|| {
+        doc.names
+            .synthetic_body_types
+            .get(&effective.0)
+            .cloned()
+    });
     let mut fields = Vec::with_capacity(properties.len());
     for property in &properties {
         let base = naming::ident(&property.wire_name, NameStyle::Snake);
@@ -1370,9 +1443,20 @@ fn plan_multipart_spec(
         let field_location = schema_location
             .key("properties")
             .key(property.wire_name.clone());
-        let Some((kind, repeated)) =
-            plan_multipart_field_kind(doc, property.schema.target, &field_location, diags)
-        else {
+        let hint: Option<String> = parent_type.as_ref().map(|parent| {
+            format!(
+                "{parent}{}",
+                naming::ident(&property.wire_name, NameStyle::Pascal)
+            )
+        });
+        let Some((kind, repeated)) = plan_multipart_field_kind(
+            doc,
+            property.schema.target,
+            &field_location,
+            diags,
+            hint.as_deref(),
+            scope,
+        ) else {
             continue;
         };
         fields.push(PlannedMultipartField {
@@ -1428,39 +1512,64 @@ fn scalar_validator_for(
 /// plus whether the schema is an array (`repeated`).
 ///
 /// Scalars follow the parameter typing table; `format: binary` streams;
-/// object/enum shapes resolve through their assigned models.rs name (an
-/// anonymous composite stops with an Error diagnostic instead of
-/// improvising one); free-form objects and unconstrained schemas decode as
-/// raw JSON targets mirroring [`scalar_target`]. Nullability wraps JSON
-/// parts in `Option<T>` (a textual scalar part has no null form on the
-/// wire). Arrays map onto repeated parts; nested arrays stop-and-report.
+/// object/enum shapes resolve through their assigned models.rs name, or —
+/// when anonymous inside a NAMED multipart object — through a synthesized
+/// `<Parent><FieldPascal>[Item]` type that `models.rs` emits (same hint and
+/// collision rules, so both sides agree); free-form objects and unconstrained
+/// schemas decode as raw JSON targets mirroring [`scalar_target`].
+/// Nullability wraps JSON parts in `Option<T>` (a textual scalar part has no
+/// null form on the wire). Arrays map onto repeated parts; nested arrays
+/// stop-and-report.
 fn plan_multipart_field_kind(
     doc: &NormalizedDocument,
     schema: SchemaId,
     location: &DocumentPath,
     diags: &mut Diagnostics,
+    hint: Option<&str>,
+    scope: &mut MultipartScope,
 ) -> Option<(PlannedMultipartFieldKind, bool)> {
     let effective = doc.resolve_alias(schema);
     let nullable = doc.resolution(effective).nullable;
     let json_part = |model: &str| Some((wrap_optional(model.to_owned(), nullable), false));
+    // Anonymous composite behind `effective` with a known parent hint:
+    // synthesize the same `<Parent><Field>[Item]` name `models.rs` emits.
+    // Without a hint (anonymous top-level multipart object) there is no
+    // models.rs definition to reference, so keep the legacy error.
+    let mut anonymous_model = |effective: SchemaId, hint: Option<&str>| -> Option<String> {
+        if component_name(doc, effective).is_some() {
+            return component_name(doc, effective);
+        }
+        if let Some(synthetic) = doc.names.synthetic_body_types.get(&effective.0) {
+            return Some(synthetic.clone());
+        }
+        let hint = hint?;
+        Some(scope.synthesize(effective, hint))
+    };
+    let mut anonymous_or_error = |effective: SchemaId,
+                              hint: Option<&str>,
+                              location: &DocumentPath,
+                              diags: &mut Diagnostics|
+     -> Option<String> {
+        if let Some(model) = anonymous_model(effective, hint) {
+            return Some(model);
+        }
+        diags.error(
+            location.clone(),
+            "client_anonymous_json_schema",
+            "multipart JSON parts reference JSON bodies through \
+             super::models; an anonymous composite schema has no models.rs \
+             type. Promote it to components/schemas under a collision-safe name \
+             (a bare `<Operation>Response` collides with the generated response enum, issue #9)",
+        );
+        None
+    };
     let resolved_kind = doc.resolution(effective).kind.clone();
     let (kind, repeated) = match resolved_kind {
         // Nominal definitions in models.rs.
         ResolvedKind::MergedObject(_) | ResolvedKind::ClosedEnum(_) => {
-            match component_name(doc, effective) {
+            match anonymous_or_error(effective, hint, location, diags) {
                 Some(model) => (wrap_optional(model, nullable), false),
-                None => {
-                    diags.error(
-                        location.clone(),
-                        "client_anonymous_json_schema",
-                        "multipart JSON parts reference JSON bodies through \
-                         super::models; this composite schema has no models.rs \
-                         type. Promote it to components/schemas under a \
-                         collision-safe name (a bare `<Operation>Response` \
-                         collides with the generated response enum, issue #9)",
-                    );
-                    return None;
-                }
+                None => return None,
             }
         }
         ResolvedKind::IntersectedScalar(scalar) => (
@@ -1476,21 +1585,9 @@ fn plan_multipart_field_kind(
         ResolvedKind::Alias(_) => unreachable!("aliases chased by resolve_alias"),
         ResolvedKind::Plain => match doc.arena.get(effective).kind.clone() {
             SchemaKind::Object { .. } | SchemaKind::Enum { .. } => {
-                match component_name(doc, effective) {
+                match anonymous_or_error(effective, hint, location, diags) {
                     Some(model) => (wrap_optional(model, nullable), false),
-                    None => {
-                        diags.error(
-                            location.clone(),
-                            "client_anonymous_json_schema",
-                            "multipart JSON parts reference JSON bodies \
-                             through super::models; an anonymous composite \
-                             schema has no models.rs type. Promote it to \
-                             components/schemas under a collision-safe name \
-                             (a bare `<Operation>Response` collides with the \
-                             generated response enum, issue #9)",
-                        );
-                        return None;
-                    }
+                    None => return None,
                 }
             }
             other => match multipart_scalar_kind(&other) {
@@ -1498,8 +1595,16 @@ fn plan_multipart_field_kind(
                 None => match other {
                     SchemaKind::Array { items } => {
                         let nested_location = location.clone();
-                        let (inner, inner_repeated) =
-                            plan_multipart_field_kind(doc, items.target, &nested_location, diags)?;
+                        let item_hint: Option<String> =
+                            hint.map(|base| format!("{base}Item"));
+                        let (inner, inner_repeated) = plan_multipart_field_kind(
+                            doc,
+                            items.target,
+                            &nested_location,
+                            diags,
+                            item_hint.as_deref(),
+                            scope,
+                        )?;
                         if inner_repeated {
                             diags.error(
                                 nested_location,
