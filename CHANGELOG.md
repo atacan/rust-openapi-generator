@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## v0.3.0 — 2026-09-12
+
+### Generator behavior
+
+- Exclude internal APIs marked by `x-*` vendor extensions from generated
+  output.
+- Support anonymous multipart array schemas with bracketed property names.
+
 ## v0.2.1 — 2026-09-12
 
 ### Distribution
