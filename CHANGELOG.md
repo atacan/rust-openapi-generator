@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v0.2.1 — 2026-09-12
+
+### Distribution
+
+- Reissued the prebuilt `oapi-to-rust` release to validate the automated
+  Homebrew formula update path.
+
 ## v0.2.0 — 2026-09-06
 
 ### Prebuilt releases and Homebrew distribution
