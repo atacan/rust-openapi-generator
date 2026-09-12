@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.3.2 — 2026-09-12
+
+### Changes
+
+- chore: verify release metadata after push
+
 ## v0.3.1 — 2026-09-12
 
 ### Changes
