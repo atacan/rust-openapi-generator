@@ -90,7 +90,7 @@ pub struct EmbeddedToolchain {
     pub bytes: &'static str,
     /// Pinned MSRV emitted as `rust-version` (`"1.85"`).
     pub msrv: &'static str,
-    /// `openapi-support` requirement matching this release (`"0.1"`,
+    /// `openapi-support` requirement matching this release (`"0.1.1"`,
     /// D-impl-crate: caret dep on the release, never a path dep).
     pub support_crate_version: &'static str,
 }
@@ -104,7 +104,7 @@ impl EmbeddedToolchain {
         http: "1",
         bytes: "1",
         msrv: "1.85",
-        support_crate_version: "0.1",
+        support_crate_version: "0.1.1",
     };
 }
 

@@ -777,9 +777,11 @@ fn headers_hoist_and_header_only_variants_are_pinned() {
     // helper whose failure takes the §34.1 fallback.
     assert!(output.contains("fn write_typed_headers("), "\n{output}");
     assert!(
-        output.contains("hook.on_encode_overflow(operation_id, variant, 0);"),
+        output.contains("hook.on_header_encode_failure(operation_id, variant, header);"),
         "header-conversion failure fires the hook:\n{output}"
     );
+    assert!(output.contains("header_encode_failure(hook, operation_id, variant, wire)"));
+    assert!(!output.contains("hook.on_encode_overflow(operation_id, variant, 0);"));
 }
 
 /// The generated router self-decodes forms through the bounded support

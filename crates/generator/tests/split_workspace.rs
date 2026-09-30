@@ -605,3 +605,39 @@ fn nested_in_crate_module_path_compiles() {
 
     ws.check(&[], "cargo check over the nested-module layout");
 }
+
+/// Exercise the generated header encoder against the real support trait.
+/// Reuse the split workspace's manifests and pinned dependencies so the proof
+/// covers compiled output without adding a second dependency-resolution path.
+#[test]
+fn generated_header_failure_hooks_preserve_fallback_and_distinguish_overflows() {
+    let document = fixtures_dir().join("10_forms_headers.yaml");
+    let document = document.to_str().expect("utf-8 fixture path");
+    let ws = ScratchWorkspace::new("split-workspace-header-hooks", "workspace.Cargo.lock");
+    ws.write("Cargo.toml", &workspace_root_manifest());
+    ws.write("api-types/Cargo.toml", &types_crate_manifest());
+    ws.write("api-types/src/lib.rs", &types_lib_rs());
+    ws.write("api-client/Cargo.toml", &client_crate_manifest());
+    ws.write("api-client/src/lib.rs", "pub mod client;\n");
+    ws.write("api-server/Cargo.toml", &server_crate_manifest());
+    ws.write(
+        "api-server/src/lib.rs",
+        include_str!("fixtures/header_encode_hooks.rs"),
+    );
+    for (generate, out_dir) in [
+        ("types", "api-types/src"),
+        ("client", "api-client/src"),
+        ("server", "api-server/src"),
+    ] {
+        let mut args = vec![document, "--generate", generate];
+        if generate != "types" {
+            args.extend(["--types-path", "api_types"]);
+        }
+        ws.generate(&args, out_dir, "header-hook fixture generation");
+    }
+    ws.check(&["--workspace"], "header-hook fixture compile proof");
+    expect_success(
+        &ws.cargo(&["test", "-p", "api-server", "--locked"]),
+        "generated header-failure hook runtime regressions",
+    );
+}

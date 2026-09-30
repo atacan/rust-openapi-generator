@@ -927,7 +927,7 @@ fn emit_header(emitter: &mut Emitter, doc: &NormalizedDocument, flags: &Flags) {
              Content-Type dispatch), streaming raw payloads (§32), typed \
              documented response headers (§15: IntoResponse converts stored \
              domain values through the well-defined internal error path of \
-             §48, firing the encode hook and emitting the fixed empty 500 on \
+             §48, firing the header-encode-failure hook and emitting the fixed empty 500 on \
              failure), pre-handler protocol rejections outside the \
              documented enums (§39), identity-only inbound content coding \
              (§30.4), and the §28 Content-Type dispatch state machine. \
@@ -6526,10 +6526,9 @@ fn emit_write_typed_headers(emitter: &mut Emitter) {
         0,
         &[
             "Appends typed documented response headers (main spec §15). A \
-             value that cannot become a `HeaderValue` fires the encode hook \
-             and emits the fixed empty 500 (§34.1 machinery; limit `0` is \
-             the recorded sentinel for non-size encode failures such as \
-             this one)."
+             value that cannot become a `HeaderValue` fires \
+             `on_header_encode_failure` with its wire name and emits the \
+             fixed empty 500 (§34.1 fallback machinery)."
                 .to_owned(),
         ],
     );
@@ -6550,7 +6549,7 @@ fn emit_write_typed_headers(emitter: &mut Emitter) {
     emitter.line(3, "Err(_) => {");
     emitter.line(
         4,
-        "return header_encode_failure(hook, operation_id, variant);",
+        "return header_encode_failure(hook, operation_id, variant, wire);",
     );
     emitter.line(3, "}");
     emitter.line(2, "}");
@@ -6575,8 +6574,12 @@ fn emit_header_encode_failure(emitter: &mut Emitter) {
     emitter.line(1, "hook: &dyn EncodeOverflowHook,");
     emitter.line(1, "operation_id: &'static str,");
     emitter.line(1, "variant: &'static str,");
+    emitter.line(1, "header: &'static str,");
     emitter.line(0, ") -> ::axum::response::Response {");
-    emitter.line(1, "hook.on_encode_overflow(operation_id, variant, 0);");
+    emitter.line(
+        1,
+        "hook.on_header_encode_failure(operation_id, variant, header);",
+    );
     emitter.line(
         1,
         "::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()",

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Report invalid response headers through `on_header_encode_failure`, including
+  the header's wire name. Existing encode hooks retain notifications through
+  default delegation; the empty-bodied 500 fallback is unchanged. Newly
+  generated crates require `openapi-support` 0.1.1 or later in the 0.1 series.
+
 ## v0.3.2 — 2026-09-12
 
 ### Changes

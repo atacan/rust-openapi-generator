@@ -106,7 +106,7 @@ dependencies its generated code genuinely uses:
 # crates/api-server/Cargo.toml (api-client mirrors it with reqwest et al.)
 [dependencies]
 api-types = { path = "../api-types" }
-openapi-support = { version = "0.1", features = ["server"] }
+openapi-support = { version = "0.1.1", features = ["server"] }
 axum = "0.8"
 async-trait = "0.1"
 bytes = "1"

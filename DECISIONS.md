@@ -157,6 +157,10 @@ Object-safe traits in `openapi-support` with no-op default implementations:
 ```rust
 pub trait EncodeOverflowHook: Send + Sync {
     fn on_encode_overflow(&self, operation_id: &str, variant: &str, limit: usize);
+
+    fn on_header_encode_failure(&self, operation_id: &str, variant: &str, _header: &str) {
+        self.on_encode_overflow(operation_id, variant, 0);
+    }
 }
 
 pub trait StreamFailureHook: Send + Sync {
@@ -169,6 +173,11 @@ Phase 3 codec error enums plug in without changing the support-crate public API.
 
 Default installation is the silent no-op; client/server builders accept custom hooks (main spec
 §34.1 step 3, §40 step 3).
+
+Header conversion failures call `on_header_encode_failure` with the wire header name, never
+the invalid value. Its default implementation retains the legacy limit-0 encode notification;
+overriding it separates header failures from size overflows without duplicate notifications.
+Zero is also a valid body-encoding limit, so the legacy callback alone cannot distinguish them.
 
 ### D-impl-oneoffallback Default fallback for unprovable `oneOf`/`anyOf` disjointness
 Companion §4.2 offers raw/value representation or generation error as configuration alternatives.
@@ -415,17 +424,18 @@ required-fallible headers.
 
 Concretely (verified against generated output): an optional documented header becomes an
 `Option<T>` domain field on the status wrapper; the emitted encoder collects present values and
-converts them through `HeaderValue::try_from` inside `write_typed_headers`, whose failure arm fires
-the encode hook and emits the fixed empty-bodied `500` (`header_encode_failure`; hook limit `0` is
-the recorded sentinel for non-size encode failures). No panic or unwrap exists on this path.
+converts them through `HeaderValue::try_from` inside `write_typed_headers`, whose failure arm calls
+`on_header_encode_failure` with the operation, variant, and wire header name, then emits the fixed
+empty-bodied `500` (`header_encode_failure`). The hook's default implementation delegates to
+`on_encode_overflow(..., 0)` for compatibility (D-impl-hooks). No panic or unwrap exists on this path.
 Required headers keep the fallible checked-constructor shape of §48 option 1
 (`CreateSession201::new(...) -> Result<_, InvalidResponseHeader>`).
 
 **Rationale.** Optionality means absence is legal, so construction cannot fail and a fallible
 constructor would force ceremony for the common case; the only remaining failure mode — a stored
-value that is not representable as a header value — surfaces at encode time, where the committed
-response cannot be changed, so it lands in the same hook-plus-fallback family as encode overflow
-(§34.1) rather than inventing a second error channel.
+value that is not representable as a header value — surfaces at encode time, before the response
+is committed. It uses the same empty-500 fallback as encode overflow (§34.1), with a dedicated
+observability callback so operators can distinguish the failure classes (issue #1).
 
 ---
 

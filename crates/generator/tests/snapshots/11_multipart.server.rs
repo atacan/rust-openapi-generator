@@ -1,6 +1,6 @@
 //! Axum server generated from the OpenAPI document (main spec §8 Output B).
 //!
-//! Mode A traits (§37), bounded JSON/form bodies (§34; axum's Form extractor is never used — routes self-decode after the §28 Content-Type dispatch), streaming raw payloads (§32), typed documented response headers (§15: IntoResponse converts stored domain values through the well-defined internal error path of §48, firing the encode hook and emitting the fixed empty 500 on failure), pre-handler protocol rejections outside the documented enums (§39), identity-only inbound content coding (§30.4), and the §28 Content-Type dispatch state machine. Recorded decision for multi-content statuses WITH documented headers: the typed fields hoist onto the status VARIANT beside the content enum. The source document declares OpenAPI 3.1.0.
+//! Mode A traits (§37), bounded JSON/form bodies (§34; axum's Form extractor is never used — routes self-decode after the §28 Content-Type dispatch), streaming raw payloads (§32), typed documented response headers (§15: IntoResponse converts stored domain values through the well-defined internal error path of §48, firing the header-encode-failure hook and emitting the fixed empty 500 on failure), pre-handler protocol rejections outside the documented enums (§39), identity-only inbound content coding (§30.4), and the §28 Content-Type dispatch state machine. Recorded decision for multi-content statuses WITH documented headers: the typed fields hoist onto the status VARIANT beside the content enum. The source document declares OpenAPI 3.1.0.
 //! Generated deterministically byte-for-byte (main spec §50 test 39); do not edit by hand.
 use super::models::{Document, DocumentMetadata};
 use ::axum::response::IntoResponse;
@@ -631,7 +631,7 @@ where
     }
 }
 
-/// Appends typed documented response headers (main spec §15). A value that cannot become a `HeaderValue` fires the encode hook and emits the fixed empty 500 (§34.1 machinery; limit `0` is the recorded sentinel for non-size encode failures such as this one).
+/// Appends typed documented response headers (main spec §15). A value that cannot become a `HeaderValue` fires `on_header_encode_failure` with its wire name and emits the fixed empty 500 (§34.1 fallback machinery).
 fn write_typed_headers(
     mut response: ::axum::response::Response,
     hook: &dyn EncodeOverflowHook,
@@ -647,7 +647,7 @@ fn write_typed_headers(
                     .insert(::http::HeaderName::from_static(wire), header);
             }
             Err(_) => {
-                return header_encode_failure(hook, operation_id, variant);
+                return header_encode_failure(hook, operation_id, variant, wire);
             }
         }
     }
@@ -659,7 +659,8 @@ fn header_encode_failure(
     hook: &dyn EncodeOverflowHook,
     operation_id: &'static str,
     variant: &'static str,
+    header: &'static str,
 ) -> ::axum::response::Response {
-    hook.on_encode_overflow(operation_id, variant, 0);
+    hook.on_header_encode_failure(operation_id, variant, header);
     ::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }

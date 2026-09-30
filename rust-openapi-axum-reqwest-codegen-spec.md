@@ -2201,6 +2201,12 @@ These helpers are used:
 2. the encoder emits the fixed protocol-safe fallback response: `500 InternalServerError` with an empty body;
 3. the configured encode-overflow hook fires with the operation id, variant, and limit, so operators can observe the condition.
 
+Documented response-header conversion failures use the same empty-bodied 500 fallback,
+but call `on_header_encode_failure` with the operation id, variant, and wire header name.
+The invalid value is omitted. Its default implementation delegates to
+`on_encode_overflow(..., 0)` to preserve existing hook implementations; overriding the
+header callback distinguishes these failures from body overflows, including a zero-byte limit.
+
 The fallback 500 may itself be undocumented by the OpenAPI operation. This is the single sanctioned deviation from "the enum describes everything on the wire", chosen deliberately over fallible handler signatures (section 48). Applications wanting explicit control can use generated checked constructors such as `try_into_response()`, which return `Err(EncodeTooLarge)` instead of producing the fallback internally.
 
 ### 34.2 Client request encode overflow

@@ -213,6 +213,7 @@ fn manifests_match_snapshots_and_double_run_is_byte_stable() {
 fn structural_invariants_hold_for_every_configuration() {
     for row in MATRIX {
         let manifest = generate_for(row);
+        assert!(manifest.contains("openapi-support = \"0.1.1\""));
         let msrv = EmbeddedToolchain::CURRENT.msrv;
 
         // Never a path dependency (§3.1/D-impl-crate).
