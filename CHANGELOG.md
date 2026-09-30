@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.4.0 — 2026-09-30
+
+### Changes
+
+- server: distinguish response header encoding failures
+
 - Report invalid response headers through `on_header_encode_failure`, including
   the header's wire name. Existing encode hooks retain notifications through
   default delegation; the empty-bodied 500 fallback is unchanged. Newly
